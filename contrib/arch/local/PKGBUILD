@@ -1,0 +1,75 @@
+# Maintainer: Jerónimo Albi <jeronimoalbi@gmail.com>
+#
+# Builds the committed HEAD of this checkout, so morlaco can be installed
+# before a release exists. Commit your changes first: uncommitted files are
+# not part of the package. Run `makepkg -si` from this directory.
+pkgname=morlaco-git
+pkgver=0.1.0.r0.g0000000
+pkgrel=1
+pkgdesc='GNOME app that tracks wallet holdings and unrealized gains'
+arch=(x86_64 aarch64)
+url='https://github.com/jeronimoalbi/morlaco'
+license=(MIT)
+depends=(
+  gcc-libs
+  glib2
+  glibc
+  gtk4
+  libadwaita
+  libsecret
+  openssl
+)
+optdepends=('gnome-keyring: keeps the key that encrypts your data')
+makedepends=(
+  cargo
+  git
+  pkgconf
+)
+provides=(morlaco)
+conflicts=(morlaco)
+# The bundled SQLCipher is C code. With makepkg's default LTO flags its objects
+# become LTO bytecode that Rust's linker cannot read, and linking fails with
+# "undefined symbol: sqlite3_errstr" and friends.
+options=(!lto)
+# The checkout is three levels up: contrib/arch/local -> repository root.
+source=("$pkgname::git+file://${startdir%/contrib/arch/local}")
+sha256sums=('SKIP')
+
+pkgver() {
+  cd "$pkgname"
+  local version
+  version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1)
+  printf '%s.r%s.g%s' "$version" "$(git rev-list --count HEAD)" "$(git rev-parse --short=7 HEAD)"
+}
+
+prepare() {
+  cd "$pkgname"
+  export RUSTUP_TOOLCHAIN=stable
+  cargo fetch --locked --target "$(rustc -vV | sed -n 's/host: //p')"
+}
+
+build() {
+  cd "$pkgname"
+  export RUSTUP_TOOLCHAIN=stable
+  export CARGO_TARGET_DIR=target
+  cargo build --frozen --release -p morlaco
+}
+
+check() {
+  cd "$pkgname"
+  export RUSTUP_TOOLCHAIN=stable
+  export CARGO_TARGET_DIR=target
+  cargo test --frozen
+}
+
+package() {
+  cd "$pkgname"
+  install -Dm755 target/release/morlaco "$pkgdir/usr/bin/morlaco"
+  install -Dm644 contrib/desktop/io.github.jeronimoalbi.Morlaco.desktop \
+    "$pkgdir/usr/share/applications/io.github.jeronimoalbi.Morlaco.desktop"
+  install -Dm644 app/data/icons/hicolor/scalable/apps/io.github.jeronimoalbi.Morlaco.svg \
+    "$pkgdir/usr/share/icons/hicolor/scalable/apps/io.github.jeronimoalbi.Morlaco.svg"
+  install -Dm644 app/data/icons/hicolor/symbolic/apps/io.github.jeronimoalbi.Morlaco-symbolic.svg \
+    "$pkgdir/usr/share/icons/hicolor/symbolic/apps/io.github.jeronimoalbi.Morlaco-symbolic.svg"
+  install -Dm644 LICENSE "$pkgdir/usr/share/licenses/morlaco/LICENSE"
+}
