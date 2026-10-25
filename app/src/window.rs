@@ -855,9 +855,48 @@ impl Ui {
                 dialog.set_response_enabled("add", valid);
             })
         };
+        // Pasting an address picks its network, unless the one already chosen
+        // fits it too (several chains may share an address format).
         let on_address = validate.clone();
-        address.connect_changed(move |_| on_address());
-        network.connect_selected_notify(move |_| validate());
+        let detect_network = {
+            let network = network.clone();
+            move |entry: &adw::EntryRow| {
+                let candidates = Chain::detect(entry.text().as_str());
+                let current = Chain::ALL.get(network.selected() as usize).copied();
+                let detected = match (candidates.first(), current) {
+                    (Some(first), Some(now)) if !candidates.contains(&now) => Some(*first),
+                    _ => None,
+                };
+                if let Some(chain) = detected
+                    && let Some(position) = Chain::ALL.iter().position(|c| *c == chain)
+                {
+                    network.set_selected(u32::try_from(position).unwrap_or(0));
+                }
+            }
+        };
+        // Say the network was detected only while the one chosen fits.
+        let sync_subtitle = {
+            let (network, address, chosen_chain) =
+                (network.clone(), address.clone(), chosen_chain.clone());
+            Rc::new(move || {
+                let fits = Chain::detect(address.text().as_str()).contains(&chosen_chain());
+                network.set_subtitle(if fits {
+                    "Detected from the address"
+                } else {
+                    ""
+                });
+            })
+        };
+        let on_address_subtitle = sync_subtitle.clone();
+        address.connect_changed(move |entry| {
+            detect_network(entry);
+            on_address_subtitle();
+            on_address();
+        });
+        network.connect_selected_notify(move |_| {
+            sync_subtitle();
+            validate();
+        });
 
         let ui = self.clone();
         dialog.connect_response(None, move |_, response| {

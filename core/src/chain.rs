@@ -101,10 +101,7 @@ impl Chain {
     /// reports addresses the network rejects as [`Error::InvalidAddress`].
     pub fn check_address(self, address: &str) -> Result<()> {
         let plausible = match self {
-            Chain::Bitcoin => {
-                (14..=90).contains(&address.len())
-                    && address.chars().all(|c| c.is_ascii_alphanumeric())
-            }
+            Chain::Bitcoin => looks_like_bitcoin(address),
             Chain::Ethereum => {
                 address.len() == 42
                     && address.starts_with("0x")
@@ -118,6 +115,19 @@ impl Chain {
         } else {
             Err(Error::InvalidAddress)
         }
+    }
+
+    /// The chains whose addresses look like `address`, ignoring spaces around
+    /// it. One chain for most addresses; several once chains that share an
+    /// address format are supported, and then the user has to choose. Empty
+    /// when it looks like no chain's address.
+    pub fn detect(address: &str) -> Vec<Chain> {
+        let address = address.trim();
+        Chain::ALL
+            .iter()
+            .copied()
+            .filter(|chain| chain.check_address(address).is_ok())
+            .collect()
     }
 
     /// Link to a transaction in a block explorer.
@@ -139,6 +149,22 @@ impl Chain {
             Chain::Fake => &FakeBackend,
         }
     }
+}
+
+/// Whether `address` has the shape of a Bitcoin mainnet address: bech32
+/// (`bc1…`, which includes taproot) or base58 (`1…` or `3…`). Only the shape
+/// is checked, not the checksum.
+fn looks_like_bitcoin(address: &str) -> bool {
+    const BASE58: &str = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
+    let bech32 = (14..=90).contains(&address.len())
+        && address
+            .get(..3)
+            .is_some_and(|p| p.eq_ignore_ascii_case("bc1"))
+        && address.chars().all(|c| c.is_ascii_alphanumeric());
+    let base58 = (25..=35).contains(&address.len())
+        && address.starts_with(['1', '3'])
+        && address.chars().all(|c| BASE58.contains(c));
+    bech32 || base58
 }
 
 /// Identifies a tracked wallet: an address on a chain.
@@ -334,5 +360,63 @@ mod tests {
         assert_eq!(mixed, lower);
         // Bitcoin addresses are case sensitive and stay as typed.
         assert_eq!(WalletId::new(Chain::Bitcoin, "AbC").address, "AbC");
+    }
+
+    const BECH32: &str = "bc1qar0srrr7xfkvy5l643lydnw9re59gtzzwf5mdq";
+    const TAPROOT: &str = "bc1p5cyxnuxmeuwuvkwfem96lqzszd02n6xdcjrs20cac6yqjjwudpxqkedrcr";
+    const LEGACY: &str = "1BvBMSEYstWetqTFn5Au4m4GFg7xJaNVN2";
+    const SCRIPT: &str = "3J98t1WpEZ73CNmQviecrnyiWrnqRhWNLy";
+    const ETHEREUM: &str = "0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045";
+
+    #[test]
+    fn bitcoin_addresses_of_every_kind_are_detected_as_bitcoin_only() {
+        for address in [
+            BECH32,
+            TAPROOT,
+            LEGACY,
+            SCRIPT,
+            &BECH32.to_ascii_uppercase(),
+        ] {
+            assert_eq!(Chain::detect(address), [Chain::Bitcoin], "{address}");
+        }
+    }
+
+    #[test]
+    fn ethereum_addresses_are_detected_as_ethereum_only() {
+        assert_eq!(Chain::detect(ETHEREUM), [Chain::Ethereum]);
+        assert_eq!(
+            Chain::detect(&ETHEREUM.to_ascii_lowercase()),
+            [Chain::Ethereum]
+        );
+        // Bitcoin's check no longer lets an Ethereum address through.
+        assert!(Chain::Bitcoin.check_address(ETHEREUM).is_err());
+    }
+
+    #[test]
+    fn spaces_around_a_pasted_address_are_ignored() {
+        assert_eq!(Chain::detect(&format!("  {ETHEREUM}\n")), [Chain::Ethereum]);
+        assert_eq!(Chain::detect(&format!("\t{BECH32} ")), [Chain::Bitcoin]);
+    }
+
+    #[test]
+    fn text_that_is_no_address_is_detected_as_nothing() {
+        let short_hex = &ETHEREUM[..41];
+        let long_hex = format!("{ETHEREUM}0");
+        for text in [
+            "",
+            "   ",
+            "bc1q",
+            "0x",
+            "not an address",
+            short_hex,
+            &long_hex,
+            "0xzzdA6BF26964aF9D7eEd9e03E53415D37aA96045",
+            // base58 has no 0, O, I or l.
+            "1BvBMSEYstWetqTFn5Au4m4GFg7xJaNVN0",
+            // a base58 address of the right length but a wrong first letter
+            "2BvBMSEYstWetqTFn5Au4m4GFg7xJaNVN2",
+        ] {
+            assert!(Chain::detect(text).is_empty(), "{text:?}");
+        }
     }
 }
