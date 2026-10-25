@@ -14,7 +14,7 @@ use libadwaita as adw;
 use adw::prelude::*;
 use morlaco_core::chain::{Chain, WalletId};
 use morlaco_core::db::Database;
-use morlaco_core::lots::Summary;
+use morlaco_core::lots::{Lot, Summary};
 use morlaco_core::paths;
 use morlaco_core::portfolio::{self, Entry, History, Portfolio};
 use morlaco_core::price::{CachedPrices, MempoolPrices, PriceSource};
@@ -265,15 +265,8 @@ pub struct Ui {
     overview_wallets: gtk::ListBox,
     overview_warning: gtk::Label,
     holdings: SummaryView,
-    lots_list: gtk::ListBox,
-    history_list: gtk::ListBox,
-    /// "Show More" under the transaction list.
-    history_more: gtk::Button,
-    /// "Showing 50 of 1234 transactions", under the list.
-    history_caption: gtk::Label,
-    /// How many transactions the list may show. Grows by `HISTORY_PAGE` with
-    /// each "Show More" and starts over when another wallet is opened.
-    history_limit: Cell<usize>,
+    lots: PagedList,
+    history: PagedList,
     state: RefCell<State>,
     /// Incremented on every load or selection so late answers are dropped.
     generation: Cell<u64>,
@@ -406,12 +399,13 @@ impl Ui {
 
         // Wallet pages
         let holdings = SummaryView::new();
-        let lots_list = boxed_list();
+        let lots = PagedList::new("lots");
         let lots_group = adw::PreferencesGroup::builder()
             .title("Lots")
             .description("Coins still held, oldest first")
             .build();
-        lots_group.add(&lots_list);
+        lots_group.add(&lots.list);
+        lots_group.add(&lots.footer);
         let holdings_box = page_box();
         holdings_box.append(&holdings.root);
         holdings_box.append(&lots_group);
@@ -420,24 +414,10 @@ impl Ui {
              this address. It is an estimate, not what you paid.",
         ));
 
-        let history_list = boxed_list();
-        let history_caption = gtk::Label::builder()
-            .css_classes(["caption", "dim-label"])
-            .build();
-        let history_more = gtk::Button::builder()
-            .label("Show More")
-            .halign(gtk::Align::Center)
-            .css_classes(["pill"])
-            .build();
-        let history_footer = gtk::Box::builder()
-            .orientation(gtk::Orientation::Vertical)
-            .spacing(12)
-            .build();
-        history_footer.append(&history_caption);
-        history_footer.append(&history_more);
+        let history = PagedList::new("transactions");
         let history_box = page_box();
-        history_box.append(&history_list);
-        history_box.append(&history_footer);
+        history_box.append(&history.list);
+        history_box.append(&history.footer);
 
         let view_stack = adw::ViewStack::new();
         view_stack.add_titled_with_icon(
@@ -595,11 +575,8 @@ impl Ui {
             overview_wallets,
             overview_warning,
             holdings,
-            lots_list,
-            history_list,
-            history_more,
-            history_caption,
-            history_limit: Cell::new(HISTORY_PAGE),
+            lots,
+            history,
             state: RefCell::new(State {
                 store,
                 keys,
@@ -631,8 +608,11 @@ impl Ui {
         self.add_action("recovery-key", |ui| ui.show_recovery_key_dialog());
         self.add_action("clear-data", |ui| ui.confirm_clear_data());
         let ui = self.clone();
-        self.history_more
+        self.history
+            .more
             .connect_clicked(move |_| ui.show_more_history());
+        let ui = self.clone();
+        self.lots.more.connect_clicked(move |_| ui.show_more_lots());
         self.add_action("toggle-sidebar", |ui| {
             ui.split.set_show_sidebar(!ui.split.shows_sidebar());
         });
@@ -1199,7 +1179,8 @@ impl Ui {
 
     fn select(self: &Rc<Self>, selection: Selection) {
         self.state.borrow_mut().selection = selection;
-        self.history_limit.set(HISTORY_PAGE);
+        self.lots.reset();
+        self.history.reset();
 
         self.sync_sidebar_selection();
         self.sync_chrome();
@@ -1525,39 +1506,47 @@ impl Ui {
             hidden,
         );
 
-        clear(&self.lots_list);
+        self.lots.fill(p.lots.len(), p.lots.iter(), |lot| {
+            lot_row(lot, p.price_now_usd, chain, hidden)
+        });
         if p.lots.is_empty() {
-            self.lots_list.append(
+            self.lots.list.append(
                 &adw::ActionRow::builder()
                     .title("No coins held")
                     .sensitive(false)
                     .build(),
             );
         }
-        for lot in &p.lots {
-            let pl = lot.unrealized_usd(p.price_now_usd);
-            let row = adw::ActionRow::builder()
-                .title(format::amount(lot.units, chain, hidden))
-                .subtitle(format!(
-                    "Acquired {} at {}",
-                    date_string(lot.time),
-                    format::usd(lot.unit_price_usd, false)
-                ))
-                .build();
-            let label = gtk::Label::builder().css_classes(["numeric"]).build();
-            label.set_label(&format::signed_usd(pl, hidden));
-            tone(&label, pl, hidden);
-            row.add_suffix(&label);
-            self.lots_list.append(&row);
-        }
-
-        clear(&self.history_list);
-        self.append_history_rows(&p.history, 0, chain, hidden);
+        self.history
+            .fill(p.history.len(), p.history.iter().rev(), |entry| {
+                history_row(entry, chain, hidden)
+            });
     }
 
-    /// Adds the next page of transactions to the list. The rows already there
-    /// stay, so the scroll position does not move.
+    /// Adds the next page of lots to the list.
+    fn show_more_lots(&self) {
+        self.with_selected_portfolio(|wallet, p, hidden| {
+            let chain = wallet.id.chain;
+            self.lots.extend(p.lots.len(), p.lots.iter(), |lot| {
+                lot_row(lot, p.price_now_usd, chain, hidden)
+            });
+        });
+    }
+
+    /// Adds the next page of transactions to the list.
     fn show_more_history(&self) {
+        self.with_selected_portfolio(|wallet, p, hidden| {
+            let chain = wallet.id.chain;
+            self.history
+                .extend(p.history.len(), p.history.iter().rev(), |entry| {
+                    history_row(entry, chain, hidden)
+                });
+        });
+    }
+
+    /// Runs `f` with the wallet that is open, its figures and whether numbers
+    /// are hidden. Does nothing if no wallet with figures is open.
+    fn with_selected_portfolio(&self, f: impl FnOnce(&Wallet, &Portfolio, bool)) {
         let state = self.state.borrow();
         let Selection::Wallet(i) = state.selection else {
             return;
@@ -1565,32 +1554,124 @@ impl Ui {
         let Some(wallet) = state.store.wallets.get(i) else {
             return;
         };
-        let Some(p) = state.portfolios.get(&wallet.id) else {
-            return;
-        };
-        let already = self.history_limit.get().min(p.history.len());
-        self.history_limit.set(already + HISTORY_PAGE);
-        self.append_history_rows(&p.history, already, wallet.id.chain, state.store.hidden);
-    }
-
-    /// Appends rows for the newest transactions, newest first, starting after
-    /// the `skip` newest, up to the current limit, then updates the footer.
-    fn append_history_rows(&self, history: &[Entry], skip: usize, chain: Chain, hidden: bool) {
-        let shown = self.history_limit.get().min(history.len());
-        for entry in history.iter().rev().skip(skip).take(shown - skip) {
-            self.history_list.append(&history_row(entry, chain, hidden));
+        if let Some(p) = state.portfolios.get(&wallet.id) {
+            f(wallet, p, state.store.hidden);
         }
-        let more = shown < history.len();
-        self.history_more.set_visible(more);
-        self.history_caption.set_visible(more);
-        self.history_caption
-            .set_label(&format::showing_of(shown, history.len()));
     }
 }
 
-/// How many transactions the list shows at first, and adds with each
-/// "Show More". A busy wallet has thousands, and a row is a whole widget.
-const HISTORY_PAGE: usize = 50;
+/// A list that shows its rows a page at a time, with a caption and a "Show
+/// More" button under it. A busy wallet has thousands of lots and
+/// transactions, and a row is a whole widget.
+struct PagedList {
+    list: gtk::ListBox,
+    /// The caption and the button.
+    footer: gtk::Box,
+    more: gtk::Button,
+    caption: gtk::Label,
+    /// How many rows the list may show. Grows by `LIST_PAGE` with each "Show
+    /// More" and starts over when another wallet is opened.
+    limit: Cell<usize>,
+    /// What the rows are, for the caption.
+    noun: &'static str,
+}
+
+/// How many rows a list shows at first, and adds with each "Show More".
+const LIST_PAGE: usize = 50;
+
+impl PagedList {
+    fn new(noun: &'static str) -> Self {
+        let caption = gtk::Label::builder()
+            .css_classes(["caption", "dim-label"])
+            .build();
+        let more = gtk::Button::builder()
+            .label("Show More")
+            .halign(gtk::Align::Center)
+            .css_classes(["pill"])
+            .build();
+        let footer = gtk::Box::builder()
+            .orientation(gtk::Orientation::Vertical)
+            .spacing(12)
+            .margin_top(12)
+            .build();
+        footer.append(&caption);
+        footer.append(&more);
+        Self {
+            list: boxed_list(),
+            footer,
+            more,
+            caption,
+            limit: Cell::new(LIST_PAGE),
+            noun,
+        }
+    }
+
+    /// Goes back to the first page.
+    fn reset(&self) {
+        self.limit.set(LIST_PAGE);
+    }
+
+    /// Replaces the rows with the first `limit` of `items`, which are in the
+    /// order they are shown and `total` long.
+    fn fill<T>(
+        &self,
+        total: usize,
+        items: impl Iterator<Item = T>,
+        row: impl Fn(T) -> adw::ActionRow,
+    ) {
+        clear(&self.list);
+        self.append(total, 0, items, row);
+    }
+
+    /// Adds one more page after the rows already shown. They stay, so the
+    /// scroll position does not move.
+    fn extend<T>(
+        &self,
+        total: usize,
+        items: impl Iterator<Item = T>,
+        row: impl Fn(T) -> adw::ActionRow,
+    ) {
+        let already = self.limit.get().min(total);
+        self.limit.set(already + LIST_PAGE);
+        self.append(total, already, items, row);
+    }
+
+    /// Adds the rows after the first `skip`, up to the limit, and updates the
+    /// footer.
+    fn append<T>(
+        &self,
+        total: usize,
+        skip: usize,
+        items: impl Iterator<Item = T>,
+        row: impl Fn(T) -> adw::ActionRow,
+    ) {
+        let shown = self.limit.get().min(total);
+        for item in items.skip(skip).take(shown - skip) {
+            self.list.append(&row(item));
+        }
+        self.footer.set_visible(shown < total);
+        self.caption
+            .set_label(&format::showing_of(shown, total, self.noun));
+    }
+}
+
+/// One lot as a row: what is left of it and what that is worth against its cost.
+fn lot_row(lot: &Lot, price_now_usd: f64, chain: Chain, hidden: bool) -> adw::ActionRow {
+    let pl = lot.unrealized_usd(price_now_usd);
+    let row = adw::ActionRow::builder()
+        .title(format::amount(lot.units, chain, hidden))
+        .subtitle(format!(
+            "Acquired {} at {}",
+            date_string(lot.time),
+            format::usd(lot.unit_price_usd, false)
+        ))
+        .build();
+    let label = gtk::Label::builder().css_classes(["numeric"]).build();
+    label.set_label(&format::signed_usd(pl, hidden));
+    tone(&label, pl, hidden);
+    row.add_suffix(&label);
+    row
+}
 
 /// One transaction as a row that opens it in the block explorer.
 fn history_row(entry: &Entry, chain: Chain, hidden: bool) -> adw::ActionRow {

@@ -102,8 +102,9 @@ pub fn short_address(address: &str) -> String {
 }
 
 /// "Showing 50 of 1234 transactions", for a list that shows part of its rows.
-pub fn showing_of(shown: usize, total: usize) -> String {
-    format!("Showing {shown} of {total} transactions")
+/// `noun` is what the rows are, in the plural.
+pub fn showing_of(shown: usize, total: usize, noun: &str) -> String {
+    format!("Showing {shown} of {total} {noun}")
 }
 
 #[cfg(test)]
@@ -162,6 +163,10 @@ mod tests {
 
     #[test]
     fn says_how_many_transactions_are_shown() {
-        assert_eq!(showing_of(50, 1234), "Showing 50 of 1234 transactions");
+        assert_eq!(
+            showing_of(50, 1234, "transactions"),
+            "Showing 50 of 1234 transactions"
+        );
+        assert_eq!(showing_of(50, 120, "lots"), "Showing 50 of 120 lots");
     }
 }
