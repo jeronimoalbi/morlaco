@@ -28,6 +28,10 @@ use crate::unlock;
 
 const EXPLORER_TX_URL: &str = "https://mempool.space/tx/";
 
+/// The app's own symbolic wallet icon, which the Adwaita theme lacks.
+/// See `app/data/icons`.
+const WALLET_ICON: &str = "morlaco-wallet-symbolic";
+
 /// What the content area is showing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Selection {
@@ -364,7 +368,7 @@ impl Ui {
 
         // Page states: empty, loading, error, overview, data
         let empty_page = adw::StatusPage::builder()
-            .icon_name("list-add-symbolic")
+            .icon_name(WALLET_ICON)
             .title("No Wallets Yet")
             .description("Add a Bitcoin address to see its holdings and estimated gains.")
             .child(
