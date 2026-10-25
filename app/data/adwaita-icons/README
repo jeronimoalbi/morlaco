@@ -1,0 +1,5 @@
+These symbolic icons are copied unchanged from the GNOME Adwaita icon theme
+(adwaita-icon-theme 51.0, https://gitlab.gnome.org/GNOME/adwaita-icon-theme),
+licensed CC-BY-SA-3.0 OR LGPL-3.0-only. See COPYING, COPYING_CCBYSA3 and
+COPYING_LGPL here. Morlaco embeds them so it shows its icons on systems that
+have no Adwaita icon theme, such as macOS.

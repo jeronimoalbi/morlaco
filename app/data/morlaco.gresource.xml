@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<gresources>
+  <gresource prefix="/io/github/jeronimoalbi/Morlaco/icons">
+    <file alias="scalable/status/dialog-error-symbolic.svg">adwaita-icons/status/dialog-error-symbolic.svg</file>
+    <file alias="scalable/status/dialog-password-symbolic.svg">adwaita-icons/status/dialog-password-symbolic.svg</file>
+    <file alias="scalable/actions/document-edit-symbolic.svg">adwaita-icons/actions/document-edit-symbolic.svg</file>
+    <file alias="scalable/actions/go-home-symbolic.svg">adwaita-icons/actions/go-home-symbolic.svg</file>
+    <file alias="scalable/actions/go-next-symbolic.svg">adwaita-icons/actions/go-next-symbolic.svg</file>
+    <file alias="scalable/actions/list-add-symbolic.svg">adwaita-icons/actions/list-add-symbolic.svg</file>
+    <file alias="scalable/actions/open-menu-symbolic.svg">adwaita-icons/actions/open-menu-symbolic.svg</file>
+    <file alias="scalable/actions/sidebar-show-symbolic.svg">adwaita-icons/actions/sidebar-show-symbolic.svg</file>
+    <file alias="scalable/places/user-trash-symbolic.svg">adwaita-icons/places/user-trash-symbolic.svg</file>
+    <file alias="scalable/actions/view-conceal-symbolic.svg">adwaita-icons/actions/view-conceal-symbolic.svg</file>
+    <file alias="scalable/actions/view-list-symbolic.svg">adwaita-icons/actions/view-list-symbolic.svg</file>
+    <file alias="scalable/actions/view-more-symbolic.svg">adwaita-icons/actions/view-more-symbolic.svg</file>
+    <file alias="scalable/actions/view-refresh-symbolic.svg">adwaita-icons/actions/view-refresh-symbolic.svg</file>
+    <file alias="scalable/actions/view-reveal-symbolic.svg">adwaita-icons/actions/view-reveal-symbolic.svg</file>
+    <file alias="scalable/actions/view-sort-descending-symbolic.svg">adwaita-icons/actions/view-sort-descending-symbolic.svg</file>
+    <file alias="scalable/apps/io.github.jeronimoalbi.Morlaco-symbolic.svg">icons/hicolor/symbolic/apps/io.github.jeronimoalbi.Morlaco-symbolic.svg</file>
+    <file alias="scalable/apps/io.github.jeronimoalbi.Morlaco.svg">icons/hicolor/scalable/apps/io.github.jeronimoalbi.Morlaco.svg</file>
+  </gresource>
+</gresources>

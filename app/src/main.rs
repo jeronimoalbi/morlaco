@@ -3,6 +3,7 @@
 mod encryption;
 mod format;
 mod gate;
+mod icons;
 mod keys;
 mod migrate;
 mod store;
@@ -27,23 +28,11 @@ const SYMBOLIC_ICON: &str = "io.github.jeronimoalbi.Morlaco-symbolic";
 fn main() -> glib::ExitCode {
     let app = adw::Application::builder().application_id(APP_ID).build();
     app.connect_startup(|_| {
-        register_icons();
+        icons::register();
         gtk4::Window::set_default_icon_name(APP_ID);
     });
     app.connect_activate(window::present);
     app.run()
-}
-
-/// Lets GTK find the icons shipped in `app/data/icons` when running from a
-/// source checkout. Only debug builds do this: a release build is meant to
-/// be installed, where the icons are in the system icon theme, and must not
-/// contain the build machine's source path.
-fn register_icons() {
-    #[cfg(debug_assertions)]
-    if let Some(display) = gtk4::gdk::Display::default() {
-        gtk4::IconTheme::for_display(&display)
-            .add_search_path(concat!(env!("CARGO_MANIFEST_DIR"), "/data/icons"));
-    }
 }
 
 #[cfg(test)]

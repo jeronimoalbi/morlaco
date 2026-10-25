@@ -118,3 +118,6 @@ cargo run --example screenshot # redraw docs/screenshots/overview.png (example d
 ## License
 
 MIT. See `LICENSE`.
+
+The symbolic icons in `app/data/adwaita-icons` come from the GNOME Adwaita icon
+theme (CC-BY-SA-3.0 or LGPL-3.0-only). Their licences are in that folder.

@@ -19,6 +19,8 @@ mod encryption;
 mod format;
 #[path = "../src/gate.rs"]
 mod gate;
+#[path = "../src/icons.rs"]
+mod icons;
 #[path = "../src/keys.rs"]
 mod keys;
 #[path = "../src/migrate.rs"]
@@ -185,10 +187,7 @@ fn main() -> glib::ExitCode {
         .application_id(EXAMPLE_APP_ID)
         .build();
     app.connect_startup(|_| {
-        if let Some(display) = gtk::gdk::Display::default() {
-            gtk::IconTheme::for_display(&display)
-                .add_search_path(concat!(env!("CARGO_MANIFEST_DIR"), "/data/icons"));
-        }
+        icons::register();
         // The same look every time, whatever the desktop is set to.
         adw::StyleManager::default().set_color_scheme(adw::ColorScheme::ForceLight);
     });
