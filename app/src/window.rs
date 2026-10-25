@@ -16,7 +16,7 @@ use morlaco_core::chain::{Chain, WalletId};
 use morlaco_core::db::Database;
 use morlaco_core::lots::Summary;
 use morlaco_core::paths;
-use morlaco_core::portfolio::{self, History, Portfolio};
+use morlaco_core::portfolio::{self, Entry, History, Portfolio};
 use morlaco_core::price::{CachedPrices, MempoolPrices, PriceSource};
 use morlaco_core::util::date_string;
 
@@ -267,6 +267,13 @@ pub struct Ui {
     holdings: SummaryView,
     lots_list: gtk::ListBox,
     history_list: gtk::ListBox,
+    /// "Show More" under the transaction list.
+    history_more: gtk::Button,
+    /// "Showing 50 of 1234 transactions", under the list.
+    history_caption: gtk::Label,
+    /// How many transactions the list may show. Grows by `HISTORY_PAGE` with
+    /// each "Show More" and starts over when another wallet is opened.
+    history_limit: Cell<usize>,
     state: RefCell<State>,
     /// Incremented on every load or selection so late answers are dropped.
     generation: Cell<u64>,
@@ -414,8 +421,23 @@ impl Ui {
         ));
 
         let history_list = boxed_list();
+        let history_caption = gtk::Label::builder()
+            .css_classes(["caption", "dim-label"])
+            .build();
+        let history_more = gtk::Button::builder()
+            .label("Show More")
+            .halign(gtk::Align::Center)
+            .css_classes(["pill"])
+            .build();
+        let history_footer = gtk::Box::builder()
+            .orientation(gtk::Orientation::Vertical)
+            .spacing(12)
+            .build();
+        history_footer.append(&history_caption);
+        history_footer.append(&history_more);
         let history_box = page_box();
         history_box.append(&history_list);
+        history_box.append(&history_footer);
 
         let view_stack = adw::ViewStack::new();
         view_stack.add_titled_with_icon(
@@ -575,6 +597,9 @@ impl Ui {
             holdings,
             lots_list,
             history_list,
+            history_more,
+            history_caption,
+            history_limit: Cell::new(HISTORY_PAGE),
             state: RefCell::new(State {
                 store,
                 keys,
@@ -605,6 +630,9 @@ impl Ui {
         self.add_action("encryption", |ui| ui.show_encryption_dialog());
         self.add_action("recovery-key", |ui| ui.show_recovery_key_dialog());
         self.add_action("clear-data", |ui| ui.confirm_clear_data());
+        let ui = self.clone();
+        self.history_more
+            .connect_clicked(move |_| ui.show_more_history());
         self.add_action("toggle-sidebar", |ui| {
             ui.split.set_show_sidebar(!ui.split.shows_sidebar());
         });
@@ -1171,6 +1199,7 @@ impl Ui {
 
     fn select(self: &Rc<Self>, selection: Selection) {
         self.state.borrow_mut().selection = selection;
+        self.history_limit.set(HISTORY_PAGE);
 
         self.sync_sidebar_selection();
         self.sync_chrome();
@@ -1523,39 +1552,78 @@ impl Ui {
         }
 
         clear(&self.history_list);
-        for entry in p.history.iter().rev() {
-            let activity = &entry.activity;
-            let kind = if entry.internal_units > 0 {
-                "Transfer between your wallets · "
-            } else {
-                ""
-            };
-            let row = adw::ActionRow::builder()
-                .title(date_string(activity.time))
-                .subtitle(format!(
-                    "{kind}{} · {} at {}",
-                    format::short_address(&activity.txid),
-                    chain.symbol(),
-                    format::usd(entry.price_usd, false)
-                ))
-                .use_markup(false)
-                .activatable(true)
-                .build();
-            let label = gtk::Label::builder().css_classes(["numeric"]).build();
-            // What the balance changed by, which includes the fee.
-            let change = activity.amount - activity.fee as i128;
-            label.set_label(&format::signed_amount(change, chain, hidden));
-            tone(&label, change as f64, hidden);
-            row.add_suffix(&label);
-
-            let uri = chain.explorer_tx_url(&activity.txid);
-            row.connect_activated(move |_| {
-                // Opening a browser can fail on a headless system; nothing to recover.
-                let _ = gio::AppInfo::launch_default_for_uri(&uri, None::<&gio::AppLaunchContext>);
-            });
-            self.history_list.append(&row);
-        }
+        self.append_history_rows(&p.history, 0, chain, hidden);
     }
+
+    /// Adds the next page of transactions to the list. The rows already there
+    /// stay, so the scroll position does not move.
+    fn show_more_history(&self) {
+        let state = self.state.borrow();
+        let Selection::Wallet(i) = state.selection else {
+            return;
+        };
+        let Some(wallet) = state.store.wallets.get(i) else {
+            return;
+        };
+        let Some(p) = state.portfolios.get(&wallet.id) else {
+            return;
+        };
+        let already = self.history_limit.get().min(p.history.len());
+        self.history_limit.set(already + HISTORY_PAGE);
+        self.append_history_rows(&p.history, already, wallet.id.chain, state.store.hidden);
+    }
+
+    /// Appends rows for the newest transactions, newest first, starting after
+    /// the `skip` newest, up to the current limit, then updates the footer.
+    fn append_history_rows(&self, history: &[Entry], skip: usize, chain: Chain, hidden: bool) {
+        let shown = self.history_limit.get().min(history.len());
+        for entry in history.iter().rev().skip(skip).take(shown - skip) {
+            self.history_list.append(&history_row(entry, chain, hidden));
+        }
+        let more = shown < history.len();
+        self.history_more.set_visible(more);
+        self.history_caption.set_visible(more);
+        self.history_caption
+            .set_label(&format::showing_of(shown, history.len()));
+    }
+}
+
+/// How many transactions the list shows at first, and adds with each
+/// "Show More". A busy wallet has thousands, and a row is a whole widget.
+const HISTORY_PAGE: usize = 50;
+
+/// One transaction as a row that opens it in the block explorer.
+fn history_row(entry: &Entry, chain: Chain, hidden: bool) -> adw::ActionRow {
+    let activity = &entry.activity;
+    let kind = if entry.internal_units > 0 {
+        "Transfer between your wallets · "
+    } else {
+        ""
+    };
+    let row = adw::ActionRow::builder()
+        .title(date_string(activity.time))
+        .subtitle(format!(
+            "{kind}{} · {} at {}",
+            format::short_address(&activity.txid),
+            chain.symbol(),
+            format::usd(entry.price_usd, false)
+        ))
+        .use_markup(false)
+        .activatable(true)
+        .build();
+    let label = gtk::Label::builder().css_classes(["numeric"]).build();
+    // What the balance changed by, which includes the fee.
+    let change = activity.amount - activity.fee as i128;
+    label.set_label(&format::signed_amount(change, chain, hidden));
+    tone(&label, change as f64, hidden);
+    row.add_suffix(&label);
+
+    let uri = chain.explorer_tx_url(&activity.txid);
+    row.connect_activated(move |_| {
+        // Opening a browser can fail on a headless system; nothing to recover.
+        let _ = gio::AppInfo::launch_default_for_uri(&uri, None::<&gio::AppLaunchContext>);
+    });
+    row
 }
 
 /// One wallet's outcome from the worker thread.
