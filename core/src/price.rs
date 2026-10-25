@@ -2,7 +2,7 @@
 
 use serde::Deserialize;
 
-use crate::cache::Cache;
+use crate::db::Database;
 use crate::{Error, Result};
 
 const BASE_URL: &str = "https://mempool.space/api/v1";
@@ -61,12 +61,12 @@ impl PriceSource for MempoolPrices {
 /// estimate. The current price is never cached.
 pub struct CachedPrices<'a, S> {
     source: S,
-    cache: &'a Cache,
+    cache: &'a Database,
 }
 
 impl<'a, S: PriceSource> CachedPrices<'a, S> {
     /// Combines a price `source` with a `cache`.
-    pub fn new(source: S, cache: &'a Cache) -> Self {
+    pub fn new(source: S, cache: &'a Database) -> Self {
         Self { source, cache }
     }
 }
@@ -110,7 +110,7 @@ mod tests {
     #[test]
     fn same_day_hits_the_source_once() {
         let source = Counting(Cell::new(0));
-        let cache = Cache::in_memory().expect("in-memory db opens");
+        let cache = Database::in_memory().expect("in-memory db opens");
         let prices = CachedPrices::new(&source, &cache);
 
         let morning = 1_700_000_000;

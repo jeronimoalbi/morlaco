@@ -12,8 +12,8 @@ use gtk4 as gtk;
 use libadwaita as adw;
 
 use adw::prelude::*;
-use morlaco_core::cache::Cache;
 use morlaco_core::chain;
+use morlaco_core::db::Database;
 use morlaco_core::lots::Summary;
 use morlaco_core::paths;
 use morlaco_core::portfolio::{self, History, Portfolio};
@@ -21,6 +21,7 @@ use morlaco_core::price::{CachedPrices, MempoolPrices, PriceSource};
 use morlaco_core::util::date_string;
 
 use crate::format;
+use crate::migrate;
 use crate::store::{Store, Wallet};
 
 const EXPLORER_TX_URL: &str = "https://mempool.space/tx/";
@@ -227,16 +228,55 @@ pub fn present(app: &adw::Application) {
         window.present();
         return;
     }
-    let ui = Ui::new(app);
-    ui.connect_signals();
-    ui.rebuild_sidebar();
-    ui.select(Selection::Overview);
-    ui.window.present();
+    match open_store() {
+        Ok(store) => {
+            let ui = Ui::new(app, store);
+            ui.connect_signals();
+            ui.rebuild_sidebar();
+            ui.select(Selection::Overview);
+            ui.window.present();
+        }
+        Err(message) => show_startup_error(app, &message),
+    }
+}
+
+/// Opens the database and loads the saved wallets and settings.
+fn open_store() -> Result<Store, String> {
+    let path = paths::data_file().ok_or("no data directory available")?;
+    let db = Database::open(&path).map_err(|e| e.to_string())?;
+    let mut store = Store::open(db).map_err(|e| e.to_string())?;
+
+    // A failed import is not fatal: the old files are kept and tried again
+    // on the next start.
+    if let Err(err) = migrate::import_legacy_data(&mut store) {
+        glib::g_warning!("morlaco", "could not import earlier data: {err}");
+    }
+    Ok(store)
+}
+
+/// Shown instead of the main window when the database cannot be opened.
+fn show_startup_error(app: &adw::Application, message: &str) {
+    let toolbar = adw::ToolbarView::new();
+    toolbar.add_top_bar(&adw::HeaderBar::new());
+    toolbar.set_content(Some(
+        &adw::StatusPage::builder()
+            .icon_name("dialog-error-symbolic")
+            .title("Couldn’t Open Your Data")
+            .description(message)
+            .build(),
+    ));
+    adw::ApplicationWindow::builder()
+        .application(app)
+        .title("Morlaco")
+        .default_width(480)
+        .default_height(360)
+        .content(&toolbar)
+        .build()
+        .present();
 }
 
 impl Ui {
-    fn new(app: &adw::Application) -> Rc<Self> {
-        let store = Store::load();
+    fn new(app: &adw::Application, store: Store) -> Rc<Self> {
         let hidden = store.hidden;
 
         // Sidebar
@@ -502,13 +542,11 @@ impl Ui {
         let ui = self.clone();
         self.hide_btn.connect_toggled(move |btn| {
             sync_hide_button(btn);
-            {
-                let mut state = ui.state.borrow_mut();
-                state.store.hidden = btn.is_active();
-                if let Err(err) = state.store.save() {
-                    drop(state);
-                    ui.toast(&format!("Couldn’t save settings: {err}"));
-                }
+            let saved = ui.state.borrow_mut().store.set_hidden(btn.is_active());
+            if let Err(err) = saved {
+                // Still apply it for this session.
+                ui.state.borrow_mut().store.hidden = btn.is_active();
+                ui.toast(&format!("Couldn’t save the setting: {err}"));
             }
             ui.render();
         });
@@ -659,36 +697,33 @@ impl Ui {
     }
 
     fn rename_wallet(self: &Rc<Self>, index: usize, label: &str) {
-        {
-            let mut state = self.state.borrow_mut();
-            state.store.rename(index, label);
-            if let Err(err) = state.store.save() {
-                drop(state);
-                self.toast(&format!("Couldn’t save wallets: {err}"));
-            }
+        let saved = self.state.borrow_mut().store.rename(index, label);
+        if let Err(err) = saved {
+            self.toast(&format!("Couldn’t rename the wallet: {err}"));
+            return;
         }
         self.rebuild_sidebar();
         self.render();
     }
 
     fn add_wallet(self: &Rc<Self>, address: &str, label: &str) {
-        let (index, existed) = {
-            let mut state = self.state.borrow_mut();
-            match state.store.position(address) {
-                Some(i) => (i, true),
-                None => {
-                    let i = state.store.add(address, label);
-                    if let Err(err) = state.store.save() {
-                        drop(state);
-                        self.toast(&format!("Couldn’t save wallets: {err}"));
+        let existing = self.state.borrow().store.position(address);
+        let index = match existing {
+            Some(i) => {
+                self.toast("This wallet is already tracked");
+                i
+            }
+            None => {
+                let added = self.state.borrow_mut().store.add(address, label);
+                match added {
+                    Ok(i) => i,
+                    Err(err) => {
+                        self.toast(&format!("Couldn’t add the wallet: {err}"));
+                        return;
                     }
-                    (i, false)
                 }
             }
         };
-        if existed {
-            self.toast("This wallet is already tracked");
-        }
         self.rebuild_sidebar();
         self.select(Selection::Wallet(index));
     }
@@ -696,20 +731,19 @@ impl Ui {
     fn remove_wallet(self: &Rc<Self>, index: usize) {
         let selection = {
             let mut state = self.state.borrow_mut();
-            if let Some(wallet) = state.store.wallets.get(index) {
-                let address = wallet.address.clone();
+            let address = state.store.wallets.get(index).map(|w| w.address.clone());
+            if let Err(err) = state.store.remove(index) {
+                drop(state);
+                self.toast(&format!("Couldn’t remove the wallet: {err}"));
+                return;
+            }
+            if let Some(address) = address {
                 state.histories.remove(&address);
                 state.errors.remove(&address);
             }
-            state.store.remove(index);
             // Wallets that were linked to the removed one now see its
             // transfers as sales and purchases.
             state.recompute();
-            if let Err(err) = state.store.save() {
-                drop(state);
-                self.toast(&format!("Couldn’t save wallets: {err}"));
-                state = self.state.borrow_mut();
-            }
             match state.selection {
                 Selection::Wallet(s) if s == index => Selection::Overview,
                 Selection::Wallet(s) if s > index => Selection::Wallet(s - 1),
@@ -1064,7 +1098,7 @@ impl Fetched {
 /// `done` counts finished wallets and `txs` the transactions fetched so far
 /// for the current one.
 fn fetch_all(addresses: Vec<String>, done: &AtomicUsize, txs: &AtomicUsize) -> Fetched {
-    let cache = match open_cache() {
+    let cache = match open_database() {
         Ok(cache) => cache,
         Err(message) => return Fetched::failed(addresses, &message),
     };
@@ -1091,12 +1125,10 @@ fn fetch_all(addresses: Vec<String>, done: &AtomicUsize, txs: &AtomicUsize) -> F
     }
 }
 
-fn open_cache() -> Result<Cache, String> {
-    let path = paths::cache_file().ok_or("no cache directory available")?;
-    if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
-    }
-    Cache::open(&path).map_err(|e| e.to_string())
+/// Opens a connection for the worker thread; the main thread keeps its own.
+fn open_database() -> Result<Database, String> {
+    let path = paths::data_file().ok_or("no data directory available")?;
+    Database::open(&path).map_err(|e| e.to_string())
 }
 
 fn boxed_list() -> gtk::ListBox {

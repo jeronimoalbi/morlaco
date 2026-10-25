@@ -1,14 +1,13 @@
-//! Saved wallets and settings, kept in a small tab-separated text file.
+//! Saved wallets and settings, kept in the database.
 //!
-//! ```text
-//! hidden<TAB>1
-//! wallet<TAB>bc1q...<TAB>Cold storage
-//! ```
+//! The store holds a copy in memory for the UI and writes every change
+//! through to the database first, so a failed write never leaves the screen
+//! showing something that was not saved.
 
-use std::io;
-use std::path::{Path, PathBuf};
+use morlaco_core::Result;
+use morlaco_core::db::Database;
 
-use morlaco_core::paths;
+const HIDDEN_KEY: &str = "hidden";
 
 /// A tracked address with an optional user label.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -31,64 +30,37 @@ impl Wallet {
 }
 
 /// Everything the app remembers between runs.
-#[derive(Debug, Default)]
 pub struct Store {
     /// Tracked wallets in the order they were added.
     pub wallets: Vec<Wallet>,
     /// Whether amounts are masked.
     pub hidden: bool,
-    path: Option<PathBuf>,
+    db: Database,
 }
 
 impl Store {
-    /// Loads the store from the config directory. A missing or unreadable
-    /// file yields an empty store; the file is replaced on the next save.
-    pub fn load() -> Self {
-        let path = paths::config_dir().map(|d| d.join("wallets.tsv"));
-        let mut store = path
-            .as_deref()
-            .and_then(|p| std::fs::read_to_string(p).ok())
-            .map(|text| Self::parse(&text))
-            .unwrap_or_default();
-        store.path = path;
-        store
+    /// Reads wallets and settings from `db`.
+    pub fn open(db: Database) -> Result<Self> {
+        let wallets = db
+            .wallets()?
+            .into_iter()
+            .map(|w| Wallet {
+                address: w.address,
+                label: w.label,
+            })
+            .collect();
+        let hidden = db.setting(HIDDEN_KEY)?.as_deref() == Some("1");
+        Ok(Self {
+            wallets,
+            hidden,
+            db,
+        })
     }
 
-    fn parse(text: &str) -> Self {
-        let mut store = Self::default();
-        for line in text.lines() {
-            let mut fields = line.split('\t');
-            match (fields.next(), fields.next(), fields.next()) {
-                (Some("hidden"), Some(v), _) => store.hidden = v == "1",
-                (Some("wallet"), Some(address), label) if !address.is_empty() => {
-                    store.wallets.push(Wallet {
-                        address: address.to_owned(),
-                        label: label.unwrap_or_default().to_owned(),
-                    });
-                }
-                _ => {}
-            }
-        }
-        store
-    }
-
-    fn serialize(&self) -> String {
-        let mut out = format!("hidden\t{}\n", u8::from(self.hidden));
-        for w in &self.wallets {
-            out.push_str(&format!("wallet\t{}\t{}\n", w.address, w.label));
-        }
-        out
-    }
-
-    /// Writes the store to disk.
-    pub fn save(&self) -> io::Result<()> {
-        let Some(path) = &self.path else {
-            return Err(io::Error::other("no config directory"));
-        };
-        if let Some(dir) = path.parent() {
-            std::fs::create_dir_all(dir)?;
-        }
-        write_atomic(path, &self.serialize())
+    /// The underlying database, to check what was written in tests.
+    #[cfg(test)]
+    pub fn database(&self) -> &Database {
+        &self.db
     }
 
     /// Index of the wallet with this address.
@@ -97,33 +69,48 @@ impl Store {
     }
 
     /// Adds a wallet and returns its index. Control characters in the label
-    /// are replaced so they cannot break the file format.
-    pub fn add(&mut self, address: &str, label: &str) -> usize {
+    /// are replaced with spaces.
+    pub fn add(&mut self, address: &str, label: &str) -> Result<usize> {
+        let label = clean_label(label);
+        self.db.add_wallet(address, &label)?;
         self.wallets.push(Wallet {
             address: address.to_owned(),
-            label: clean_label(label),
+            label,
         });
-        self.wallets.len() - 1
+        Ok(self.wallets.len() - 1)
     }
 
     /// Changes the label of the wallet at `index`, if it exists. An empty
     /// label makes the wallet display its address again.
-    pub fn rename(&mut self, index: usize, label: &str) {
+    pub fn rename(&mut self, index: usize, label: &str) -> Result<()> {
+        let label = clean_label(label);
         if let Some(wallet) = self.wallets.get_mut(index) {
-            wallet.label = clean_label(label);
+            self.db.rename_wallet(&wallet.address, &label)?;
+            wallet.label = label;
         }
+        Ok(())
     }
 
     /// Removes the wallet at `index`, if it exists.
-    pub fn remove(&mut self, index: usize) {
-        if index < self.wallets.len() {
+    pub fn remove(&mut self, index: usize) -> Result<()> {
+        if let Some(wallet) = self.wallets.get(index) {
+            self.db.remove_wallet(&wallet.address)?;
             self.wallets.remove(index);
         }
+        Ok(())
+    }
+
+    /// Turns amount masking on or off.
+    pub fn set_hidden(&mut self, hidden: bool) -> Result<()> {
+        self.db
+            .set_setting(HIDDEN_KEY, if hidden { "1" } else { "0" })?;
+        self.hidden = hidden;
+        Ok(())
     }
 }
 
-/// Trims a label and replaces control characters so they cannot break the
-/// file format.
+/// Trims a label and replaces control characters so they cannot garble the
+/// display.
 fn clean_label(label: &str) -> String {
     label
         .trim()
@@ -132,71 +119,90 @@ fn clean_label(label: &str) -> String {
         .collect()
 }
 
-/// Writes via a temporary file so a crash cannot leave a half-written store.
-fn write_atomic(path: &Path, contents: &str) -> io::Result<()> {
-    let tmp = path.with_extension("tmp");
-    std::fs::write(&tmp, contents)?;
-    std::fs::rename(&tmp, path)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn round_trip() {
-        let mut store = Store {
-            hidden: true,
-            ..Store::default()
-        };
-        store.add("bc1qaaaaaaaaaaaaaaaa", "Cold storage");
-        store.add("bc1qbbbbbbbbbbbbbbbb", "");
-
-        let back = Store::parse(&store.serialize());
-        assert!(back.hidden);
-        assert_eq!(back.wallets, store.wallets);
+    fn store() -> Store {
+        Store::open(Database::in_memory().expect("in-memory db opens")).expect("store opens")
     }
 
     #[test]
-    fn labels_cannot_break_the_format() {
-        let mut store = Store::default();
-        store.add("bc1qaaaaaaaaaaaaaaaa", "  evil\tlabel\nwallet\tbc1qother ");
-        let back = Store::parse(&store.serialize());
-        assert_eq!(back.wallets.len(), 1);
-        assert_eq!(back.wallets[0].label, "evil label wallet bc1qother");
+    fn changes_are_written_through_to_the_database() {
+        let mut store = store();
+        store
+            .add("bc1qaaaaaaaaaaaaaaaa", "Cold storage")
+            .expect("add");
+        store.add("bc1qbbbbbbbbbbbbbbbb", "").expect("add");
+        store.set_hidden(true).expect("set");
+
+        let stored = store.database().wallets().expect("list");
+        assert_eq!(stored.len(), 2);
+        assert_eq!(stored[0].label, "Cold storage");
+        assert_eq!(
+            store.database().setting("hidden").expect("read"),
+            Some("1".into())
+        );
+    }
+
+    #[test]
+    fn labels_are_cleaned() {
+        let mut store = store();
+        store
+            .add("bc1qaaaaaaaaaaaaaaaa", "  evil\tlabel\nname ")
+            .expect("add");
+        assert_eq!(store.wallets[0].label, "evil label name");
     }
 
     #[test]
     fn rename_sets_and_clears_the_label() {
-        let mut store = Store::default();
-        store.add("bc1qaaaaaaaaaaaaaaaa", "Old");
+        let mut store = store();
+        store.add("bc1qaaaaaaaaaaaaaaaa", "Old").expect("add");
 
-        store.rename(0, "  New\tname ");
+        store.rename(0, "  New\tname ").expect("rename");
         assert_eq!(store.wallets[0].label, "New name");
-        assert_eq!(store.wallets[0].display_name(), "New name");
+        assert_eq!(
+            store.database().wallets().expect("list")[0].label,
+            "New name"
+        );
 
-        store.rename(0, "");
+        store.rename(0, "").expect("rename");
         assert_eq!(store.wallets[0].display_name(), "bc1qaaaa…aaaaaa");
 
-        store.rename(9, "ignored");
+        store
+            .rename(9, "ignored")
+            .expect("out of range is not an error");
         assert_eq!(store.wallets.len(), 1);
     }
 
     #[test]
-    fn garbage_lines_are_ignored() {
-        let store = Store::parse("nonsense\nwallet\t\nhidden\n\nwallet\tbc1qok\n");
+    fn a_failed_write_leaves_memory_unchanged() {
+        let mut store = store();
+        store.add("bc1qaaaaaaaaaaaaaaaa", "").expect("add");
+        assert!(store.add("bc1qaaaaaaaaaaaaaaaa", "dup").is_err());
         assert_eq!(store.wallets.len(), 1);
-        assert_eq!(store.wallets[0].address, "bc1qok");
-        assert!(!store.hidden);
     }
 
     #[test]
     fn remove_ignores_out_of_range() {
-        let mut store = Store::default();
-        store.add("bc1qaaaaaaaaaaaaaaaa", "");
-        store.remove(5);
+        let mut store = store();
+        store.add("bc1qaaaaaaaaaaaaaaaa", "").expect("add");
+        store.remove(5).expect("out of range is not an error");
         assert_eq!(store.wallets.len(), 1);
-        store.remove(0);
+
+        store.remove(0).expect("remove");
         assert!(store.wallets.is_empty());
+        assert!(store.database().wallets().expect("list").is_empty());
+    }
+
+    #[test]
+    fn a_reopened_store_sees_earlier_changes() {
+        let db = Database::in_memory().expect("in-memory db opens");
+        db.add_wallet("bc1qaaaaaaaaaaaaaaaa", "Saved").expect("add");
+        db.set_setting("hidden", "1").expect("set");
+
+        let store = Store::open(db).expect("store opens");
+        assert_eq!(store.wallets[0].label, "Saved");
+        assert!(store.hidden);
     }
 }

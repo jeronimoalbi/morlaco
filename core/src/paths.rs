@@ -11,12 +11,17 @@ fn app_dir(var: &str, fallback: &str) -> Option<PathBuf> {
     Some(base.join("morlaco"))
 }
 
-/// Directory for user settings and saved wallets (`~/.config/morlaco`).
-pub fn config_dir() -> Option<PathBuf> {
-    app_dir("XDG_CONFIG_HOME", ".config")
+/// Path of the database (`~/.local/share/morlaco/morlaco.db`).
+pub fn data_file() -> Option<PathBuf> {
+    app_dir("XDG_DATA_HOME", ".local/share").map(|d| d.join("morlaco.db"))
 }
 
-/// Path of the price cache database (`~/.cache/morlaco/cache.sqlite3`).
-pub fn cache_file() -> Option<PathBuf> {
+/// Where earlier versions kept the wallet list (`~/.config/morlaco/wallets.tsv`).
+pub fn legacy_wallets_file() -> Option<PathBuf> {
+    app_dir("XDG_CONFIG_HOME", ".config").map(|d| d.join("wallets.tsv"))
+}
+
+/// Where earlier versions kept cached prices (`~/.cache/morlaco/cache.sqlite3`).
+pub fn legacy_cache_file() -> Option<PathBuf> {
     app_dir("XDG_CACHE_HOME", ".cache").map(|d| d.join("cache.sqlite3"))
 }

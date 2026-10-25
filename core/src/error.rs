@@ -13,9 +13,12 @@ pub enum Error {
     /// The price API returned no price for the requested time.
     #[error("no price available for timestamp {0}")]
     NoPrice(i64),
-    /// The local cache failed.
-    #[error("cache error: {0}")]
-    Cache(#[from] rusqlite::Error),
+    /// The local database failed.
+    #[error("database error: {0}")]
+    Database(#[from] rusqlite::Error),
+    /// Creating the data directory or setting permissions failed.
+    #[error("file error: {0}")]
+    Io(#[from] std::io::Error),
 }
 
 impl From<ureq::Error> for Error {
