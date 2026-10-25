@@ -1,0 +1,29 @@
+name: macOS
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build and test
+    runs-on: macos-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install libraries
+        run: brew install gtk4 libadwaita pkgconf openssl@3
+      - name: Build and test
+        run: |
+          export OPENSSL_DIR="$(brew --prefix openssl@3)"
+          cargo build --locked
+          cargo test --locked

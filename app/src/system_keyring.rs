@@ -10,7 +10,10 @@ use crate::keys::Keyring;
 #[cfg(target_os = "linux")]
 pub use secret_service::PlatformKeyring;
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(target_os = "macos")]
+pub use keychain::PlatformKeyring;
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 pub use missing::PlatformKeyring;
 
 /// The login keyring, through the Secret Service (libsecret).
@@ -70,8 +73,49 @@ mod secret_service {
     }
 }
 
+/// The login keychain of macOS.
+#[cfg(target_os = "macos")]
+mod keychain {
+    use security_framework::passwords::{
+        delete_generic_password, get_generic_password, set_generic_password,
+    };
+
+    use super::Keyring;
+
+    const SERVICE: &str = "io.github.jeronimoalbi.Morlaco";
+    const ACCOUNT: &str = "database-key";
+    /// The code the Keychain gives when there is no such item.
+    const ITEM_NOT_FOUND: i32 = -25300;
+
+    /// The login keychain, through Security.framework.
+    pub struct PlatformKeyring;
+
+    impl Keyring for PlatformKeyring {
+        fn lookup(&self) -> Result<Option<String>, String> {
+            match get_generic_password(SERVICE, ACCOUNT) {
+                Ok(bytes) => String::from_utf8(bytes)
+                    .map(Some)
+                    .map_err(|_| "the stored key is not text".to_owned()),
+                Err(e) if e.code() == ITEM_NOT_FOUND => Ok(None),
+                Err(e) => Err(e.to_string()),
+            }
+        }
+
+        fn store(&self, secret: &str) -> Result<(), String> {
+            set_generic_password(SERVICE, ACCOUNT, secret.as_bytes()).map_err(|e| e.to_string())
+        }
+
+        fn clear(&self) -> Result<(), String> {
+            match delete_generic_password(SERVICE, ACCOUNT) {
+                Err(e) if e.code() != ITEM_NOT_FOUND => Err(e.to_string()),
+                _ => Ok(()),
+            }
+        }
+    }
+}
+
 /// For systems without a supported keyring: it can never be reached.
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 mod missing {
     use super::Keyring;
 

@@ -29,7 +29,7 @@ loss.
 ## Install
 
 It requires Rust 1.92 or newer, GTK 4, libadwaita 1.5 or newer, libsecret,
-OpenSSL, a C compiler and pkgconf.
+OpenSSL, a C compiler and pkgconf. libsecret is only needed on Linux.
 
 **Arch Linux:**
 
@@ -56,6 +56,16 @@ sudo install -Dm644 contrib/desktop/io.github.jeronimoalbi.Morlaco.desktop /usr/
 sudo install -Dm644 app/data/icons/hicolor/scalable/apps/io.github.jeronimoalbi.Morlaco.svg /usr/share/icons/hicolor/scalable/apps/io.github.jeronimoalbi.Morlaco.svg
 sudo install -Dm644 app/data/icons/hicolor/symbolic/apps/io.github.jeronimoalbi.Morlaco-symbolic.svg /usr/share/icons/hicolor/symbolic/apps/io.github.jeronimoalbi.Morlaco-symbolic.svg
 ```
+
+**macOS:** install the libraries with [Homebrew](https://brew.sh), then build:
+
+```sh
+brew install gtk4 libadwaita pkgconf openssl@3
+OPENSSL_DIR="$(brew --prefix openssl@3)" cargo run --release
+```
+
+Your database key is kept in the Keychain, which may ask for permission the
+first time. This is new and has only been built in CI so far.
 
 Just want to try it? `cargo run` works from the checkout, no install needed.
 
