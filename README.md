@@ -4,9 +4,6 @@
 [![Audit](https://github.com/jeronimoalbi/morlaco/actions/workflows/audit.yml/badge.svg?branch=main)](https://github.com/jeronimoalbi/morlaco/actions/workflows/audit.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-Add a wallet address and see what's in it, what it's worth, and whether
-you're up or down.
-
 Morlaco is a small GNOME app. It reads the public blockchain, looks up what
 the coin cost on the days your coins arrived, and shows your estimated gain or
 loss. Your saved data is encrypted on your computer. Bitcoin works today, and
@@ -84,17 +81,6 @@ Use the pencil and trash buttons next to a wallet to rename or remove it.
   Bitcoin that's [mempool.space](https://mempool.space). So that site sees
   which addresses you look up, along with the usual things any website sees,
   like your IP address.
-
-## Good to know
-
-- Bitcoin is the only coin so far. The code is ready for others, but they
-  aren't there yet.
-- The gain or loss is an estimate. A coin's "cost" is its price on the day it
-  arrived at the address, which isn't always what you paid. If you bought on an
-  exchange and withdrew later, those can differ.
-- Payments that haven't been confirmed yet are left out until they are.
-- These are rough numbers to help you understand your wallets, not tax or
-  financial advice.
 
 ## Development
 
