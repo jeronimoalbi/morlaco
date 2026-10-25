@@ -8,9 +8,6 @@ Morlaco is a small GNOME app. It reads the public blockchain, looks up what
 the coin cost on the days your coins arrived, and shows your estimated gain or
 loss.
 
-
-> Bitcoin works today, and other coins are planned
-
 <p align="center">
   <img src="docs/screenshots/overview.png" alt="Morlaco overview with two example wallets" width="70%">
 </p>
