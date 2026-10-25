@@ -17,6 +17,7 @@ use morlaco_core::db::Database;
 use morlaco_core::paths;
 
 use crate::encryption::{self, PassphraseProblem};
+use crate::gate::{self, GatePage, PromptLayout, SetupLayout, WINDOW_WIDTH, boxed_fields};
 use crate::keys::{self, Keyring, Keys, MIN_PASSPHRASE_ONLY_CHARS, SecretService};
 
 /// An open database and what happened while opening it.
@@ -288,46 +289,25 @@ fn open_with_secret(
 
 // --- Windows ---------------------------------------------------------------
 
-/// A window that holds one status page. The compact style and the size leave
-/// room for the longest page (the passphrase setup with an error message)
-/// including its buttons, which measured about 565 pixels with the header bar.
-fn gate_window(app: &adw::Application, page: &adw::StatusPage) -> adw::ApplicationWindow {
-    page.add_css_class("compact");
+/// A window that holds one page. It is not resizable and has no fixed height,
+/// so it always gets the natural size of its content and nothing is cut off,
+/// at any text size. See the `gate` module for why.
+fn gate_window(app: &adw::Application, page: &GatePage) -> adw::ApplicationWindow {
     let toolbar = adw::ToolbarView::new();
     toolbar.add_top_bar(&adw::HeaderBar::new());
-    toolbar.set_content(Some(page));
+    toolbar.set_content(Some(&page.root));
     adw::ApplicationWindow::builder()
         .application(app)
         .title("Morlaco")
-        .default_width(520)
-        .default_height(620)
+        .resizable(false)
+        .default_width(WINDOW_WIDTH)
         .content(&toolbar)
         .build()
 }
 
 /// Shows a message instead of the app.
 pub fn show_error(app: &adw::Application, title: &str, message: &str) {
-    let page = adw::StatusPage::builder()
-        .icon_name("dialog-error-symbolic")
-        .title(title)
-        .description(message)
-        .build();
-    gate_window(app, &page).present();
-}
-
-fn boxed_fields() -> gtk::ListBox {
-    gtk::ListBox::builder()
-        .selection_mode(gtk::SelectionMode::None)
-        .css_classes(["boxed-list"])
-        .build()
-}
-
-fn pill_button(label: &str, class: &str) -> gtk::Button {
-    gtk::Button::builder()
-        .label(label)
-        .halign(gtk::Align::Center)
-        .css_classes([class, "pill"])
-        .build()
+    gate_window(app, &gate::error_layout(title, message)).present();
 }
 
 /// The setup page for a machine without a usable keyring: the user chooses
@@ -339,42 +319,21 @@ fn show_setup(
     reason: Option<String>,
     ready: Ready,
 ) {
-    let new = adw::PasswordEntryRow::builder().title("Passphrase").build();
-    let confirm = adw::PasswordEntryRow::builder()
-        .title("Confirm passphrase")
-        .build();
-    let fields = boxed_fields();
-    fields.append(&new);
-    fields.append(&confirm);
-    let problem = gtk::Label::builder()
-        .css_classes(["dim-label", "caption"])
-        .xalign(0.0)
-        .build();
-    let create = pill_button("Create", "suggested-action");
-    create.set_sensitive(false);
-
-    let content = gtk::Box::builder()
-        .orientation(gtk::Orientation::Vertical)
-        .spacing(18)
-        .build();
-    content.append(&fields);
-    content.append(&problem);
-    content.append(&create);
-
     let intro = match &reason {
         Some(reason) => format!("The keyring couldn’t be used ({reason}). "),
         None => "No keyring was found. ".to_owned(),
     };
-    let page = adw::StatusPage::builder()
-        .icon_name("dialog-password-symbolic")
-        .title("Choose a Passphrase")
-        .description(format!(
-            "{intro}Your passphrase will be the only thing protecting your data, so use \
-             at least {MIN_PASSPHRASE_ONLY_CHARS} characters. If you forget it, your data \
-             can’t be recovered."
-        ))
-        .child(&content)
-        .build();
+    let SetupLayout {
+        page,
+        new,
+        confirm,
+        problem,
+        create,
+    } = gate::setup_layout(&format!(
+        "{intro}Your passphrase will be the only thing protecting your data, so use \
+         at least {MIN_PASSPHRASE_ONLY_CHARS} characters. If you forget it, your data \
+         can’t be recovered."
+    ));
     let window = gate_window(app, &page);
 
     // Saying what is wrong only once the user has typed something.
@@ -449,41 +408,6 @@ fn show_passphrase_prompt(
     keyring_reachable: bool,
     ready: Ready,
 ) {
-    let entry = adw::PasswordEntryRow::builder().title("Passphrase").build();
-    let fields = boxed_fields();
-    fields.append(&entry);
-    let unlock = pill_button("Unlock", "suggested-action");
-
-    let try_again = gtk::Button::builder()
-        .label("Try Again")
-        .css_classes(["flat"])
-        .visible(!keyring_reachable)
-        .build();
-    let recovery = gtk::Button::builder()
-        .label("Use Recovery Key")
-        .css_classes(["flat"])
-        .build();
-    let start_over = gtk::Button::builder()
-        .label("Start Over")
-        .css_classes(["flat"])
-        .build();
-    let more = gtk::Box::builder()
-        .orientation(gtk::Orientation::Horizontal)
-        .halign(gtk::Align::Center)
-        .spacing(12)
-        .build();
-    more.append(&try_again);
-    more.append(&recovery);
-    more.append(&start_over);
-
-    let content = gtk::Box::builder()
-        .orientation(gtk::Orientation::Vertical)
-        .spacing(18)
-        .build();
-    content.append(&fields);
-    content.append(&unlock);
-    content.append(&more);
-
     let description = match (&secret, keyring_reachable) {
         (Some(_), _) => "Enter your passphrase to open your data.",
         (None, true) => {
@@ -495,12 +419,15 @@ fn show_passphrase_prompt(
              Otherwise unlock your keyring and press Try Again."
         }
     };
-    let page = adw::StatusPage::builder()
-        .icon_name("dialog-password-symbolic")
-        .title("Unlock Morlaco")
-        .description(description)
-        .child(&content)
-        .build();
+    let PromptLayout {
+        page,
+        entry,
+        unlock,
+        try_again,
+        recovery,
+        start_over,
+    } = gate::prompt_layout(description, !keyring_reachable);
+    let page = Rc::new(page);
     let window = gate_window(app, &page);
 
     let attempt = {
@@ -523,9 +450,9 @@ fn show_passphrase_prompt(
                 Err(Error::WrongKey) => {
                     entry.add_css_class("error");
                     entry.set_text("");
-                    page.set_description(Some("That passphrase is wrong. Try again."));
+                    page.set_description("That passphrase is wrong. Try again.");
                 }
-                Err(err) => page.set_description(Some(&err.to_string())),
+                Err(err) => page.set_description(&err.to_string()),
             }
         })
     };
@@ -562,7 +489,7 @@ fn show_passphrase_prompt(
 /// data with it. A problem is shown on the unlock page.
 fn show_recovery_dialog(
     parent: &adw::ApplicationWindow,
-    page: &adw::StatusPage,
+    page: &Rc<GatePage>,
     path: PathBuf,
     ready: Ready,
 ) {
@@ -607,7 +534,7 @@ fn show_recovery_dialog(
                 });
                 window.close();
             }
-            Err(problem) => page.set_description(Some(&problem.to_string())),
+            Err(problem) => page.set_description(&problem.to_string()),
         }
     });
     dialog.present(Some(parent));

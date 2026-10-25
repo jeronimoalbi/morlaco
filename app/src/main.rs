@@ -2,6 +2,7 @@
 
 mod encryption;
 mod format;
+mod gate;
 mod keys;
 mod migrate;
 mod store;

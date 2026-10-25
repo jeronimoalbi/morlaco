@@ -100,13 +100,15 @@ Use the pencil and trash buttons next to a wallet to rename or remove it.
 ## Development
 
 ```sh
-just check    # format, lints, tests and the dependency checks
-cargo run     # run the app from the checkout
+just check                   # format, lints, tests and the dependency checks
+cargo run                    # run the app from the checkout
+cargo run --example gate_fit # check that the unlock pages show all their content
 ```
 
 `just check` needs [`just`](https://github.com/casey/just) and
-[`cargo-deny`](https://embarkstudios.github.io/cargo-deny/). The packaging
-files are in `contrib/`.
+[`cargo-deny`](https://embarkstudios.github.io/cargo-deny/). The `gate_fit`
+example opens real windows, so it needs a display and doesn't run in CI. The
+packaging files are in `contrib/`.
 
 ## License
 
