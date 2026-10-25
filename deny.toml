@@ -1,0 +1,48 @@
+# Rules for `cargo deny check`, run by CI and worth running before a release.
+# https://embarkstudios.github.io/cargo-deny/
+
+[graph]
+# Only what is built for Linux, the platforms of the Arch package. The Windows
+# and WASI crates in Cargo.lock are never compiled here.
+targets = ["x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu"]
+
+[advisories]
+# A known vulnerability, an unmaintained crate or a yanked version fails the
+# check. To accept one, list it here with the reason, after reviewing it.
+unmaintained = "all"
+yanked = "deny"
+ignore = []
+
+[licenses]
+# Every license in the dependency tree today. All are permissive and
+# compatible with this project's MIT license.
+allow = [
+  "MIT",
+  "Apache-2.0",
+  "Apache-2.0 WITH LLVM-exception",
+  "BSD-3-Clause",
+  "ISC",
+  "Unicode-3.0",
+  "Zlib",
+  "0BSD",
+  "Unlicense",
+  "CDLA-Permissive-2.0",
+  # sqlcipher-src, which bundles the encrypted database engine, carries the
+  # SQLite blessing and libtomcrypt's WTFPL notice. Both are permissive.
+  "blessing",
+  "WTFPL",
+]
+confidence-threshold = 0.8
+
+[bans]
+# GTK's build tooling pulls in `system-deps` in two versions. That costs build
+# time, not security, so it only warns.
+multiple-versions = "warn"
+wildcards = "deny"
+
+[sources]
+# Code may only come from crates.io. Anything else fails.
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []
