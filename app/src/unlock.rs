@@ -7,7 +7,7 @@
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
-use gtk::glib;
+use gtk::{gio, glib};
 use gtk4 as gtk;
 use libadwaita as adw;
 
@@ -401,6 +401,9 @@ fn show_setup(
 /// Asks for the passphrase. With a `secret` the keyring had a key that did
 /// not open the file alone; without one the file is either passphrase-only or
 /// its keyring entry is missing.
+///
+/// Try Again, Use Recovery Key and Start Over are window actions, reached
+/// from the "⋮" menu next to Unlock.
 fn show_passphrase_prompt(
     app: &adw::Application,
     path: PathBuf,
@@ -412,20 +415,19 @@ fn show_passphrase_prompt(
         (Some(_), _) => "Enter your passphrase to open your data.",
         (None, true) => {
             "Enter your passphrase to open your data. If you never set one, the key \
-             for your data is missing from the keyring."
+             for your data is missing from the keyring. You can use your recovery key \
+             from the ⋮ menu."
         }
         (None, false) => {
             "The keyring can’t be reached. If you use a passphrase, enter it. \
-             Otherwise unlock your keyring and press Try Again."
+             Otherwise unlock your keyring and choose Try Again from the ⋮ menu."
         }
     };
     let PromptLayout {
         page,
         entry,
         unlock,
-        try_again,
-        recovery,
-        start_over,
+        more: _,
     } = gate::prompt_layout(description, !keyring_reachable);
     let page = Rc::new(page);
     let window = gate_window(app, &page);
@@ -461,14 +463,22 @@ fn show_passphrase_prompt(
     unlock.connect_clicked(move |_| attempt());
     entry.connect_changed(|entry| entry.remove_css_class("error"));
 
-    let (retry_app, retry_ready, retry_window) = (app.clone(), ready.clone(), window.clone());
-    try_again.connect_clicked(move |_| {
-        start(&retry_app, retry_ready.clone());
-        retry_window.close();
-    });
+    // The actions behind the "⋮" menu. Try Again is in the menu only when the
+    // keyring could not be reached, so it is registered only then.
+    if !keyring_reachable {
+        let (retry_app, retry_ready, retry_window) = (app.clone(), ready.clone(), window.clone());
+        let try_again = gio::SimpleAction::new(gate::ACTION_TRY_AGAIN, None);
+        try_again.connect_activate(move |_, _| {
+            start(&retry_app, retry_ready.clone());
+            retry_window.close();
+        });
+        window.add_action(&try_again);
+    }
+
     let (recover_path, recover_ready) = (path.clone(), ready.clone());
     let (recover_window, recover_page) = (window.clone(), page.clone());
-    recovery.connect_clicked(move |_| {
+    let use_recovery_key = gio::SimpleAction::new(gate::ACTION_USE_RECOVERY_KEY, None);
+    use_recovery_key.connect_activate(move |_, _| {
         show_recovery_dialog(
             &recover_window,
             &recover_page,
@@ -476,10 +486,14 @@ fn show_passphrase_prompt(
             recover_ready.clone(),
         );
     });
+    window.add_action(&use_recovery_key);
+
     let (over_app, over_window) = (app.clone(), window.clone());
-    start_over.connect_clicked(move |_| {
+    let start_over = gio::SimpleAction::new(gate::ACTION_START_OVER, None);
+    start_over.connect_activate(move |_, _| {
         confirm_start_over(&over_app, path.clone(), ready.clone(), &over_window);
     });
+    window.add_action(&start_over);
 
     window.present();
     entry.grab_focus();

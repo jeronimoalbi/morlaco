@@ -21,6 +21,7 @@
 //! screen is shorter than a page, the content is still reachable instead of
 //! being cut off.
 
+use gtk::gio;
 use gtk4 as gtk;
 use libadwaita as adw;
 
@@ -33,6 +34,15 @@ use adw::prelude::*;
 /// and with no height; `examples/gate_fit.rs` repeats exactly that sizing to
 /// check it, so change them together.
 pub const WINDOW_WIDTH: i32 = 480;
+
+/// Names of the window actions behind the "⋮" menu on the unlock page, without
+/// the `win.` prefix. The menu and the code that registers the actions both
+/// use these, so a typo cannot silently disable a menu item.
+pub const ACTION_TRY_AGAIN: &str = "try-again";
+/// Opens the recovery key dialog.
+pub const ACTION_USE_RECOVERY_KEY: &str = "use-recovery-key";
+/// Offers to delete the saved data.
+pub const ACTION_START_OVER: &str = "start-over";
 
 /// One page: a status page with a body for the page's own widgets.
 pub struct GatePage {
@@ -83,6 +93,10 @@ pub fn pill_button(label: &str, class: &str) -> gtk::Button {
 }
 
 /// The unlock prompt and the widgets its behaviour needs.
+///
+/// The secondary actions are not on the page. They sit in the menu of the
+/// "⋮" button next to Unlock, as window actions (see the `ACTION_*` names),
+/// and appear only when that button is used.
 pub struct PromptLayout {
     /// The page.
     pub page: GatePage,
@@ -90,13 +104,36 @@ pub struct PromptLayout {
     pub entry: adw::PasswordEntryRow,
     /// Opens the data.
     pub unlock: gtk::Button,
-    /// Starts over from the keyring check. Hidden unless the keyring could
-    /// not be reached.
-    pub try_again: gtk::Button,
-    /// Opens the recovery key dialog.
-    pub recovery: gtk::Button,
-    /// Offers to delete the saved data.
-    pub start_over: gtk::Button,
+    /// The "⋮" button that opens the menu of secondary actions. The app does
+    /// not need the handle (the menu works through window actions);
+    /// `examples/gate_fit.rs` uses it to check the button is visible.
+    #[allow(dead_code)]
+    pub more: gtk::MenuButton,
+}
+
+/// The menu behind the "⋮" button. "Try Again" is only offered when the
+/// keyring could not be reached, and "Start Over" has a section to itself
+/// because it deletes data.
+fn more_menu(show_try_again: bool) -> gio::Menu {
+    let menu = gio::Menu::new();
+
+    let common = gio::Menu::new();
+    if show_try_again {
+        common.append(Some("Try Again"), Some(&format!("win.{ACTION_TRY_AGAIN}")));
+    }
+    common.append(
+        Some("Use Recovery Key"),
+        Some(&format!("win.{ACTION_USE_RECOVERY_KEY}")),
+    );
+    menu.append_section(None, &common);
+
+    let destructive = gio::Menu::new();
+    destructive.append(
+        Some("Start Over"),
+        Some(&format!("win.{ACTION_START_OVER}")),
+    );
+    menu.append_section(None, &destructive);
+    menu
 }
 
 /// Builds the unlock prompt.
@@ -108,36 +145,32 @@ pub fn prompt_layout(description: &str, show_try_again: bool) -> PromptLayout {
     fields.append(&entry);
     let unlock = pill_button("Unlock", "suggested-action");
 
-    let flat = |label: &str| {
-        gtk::Button::builder()
-            .label(label)
-            .css_classes(["flat"])
-            .build()
-    };
-    let try_again = flat("Try Again");
-    try_again.set_visible(show_try_again);
-    let recovery = flat("Use Recovery Key");
-    let start_over = flat("Start Over");
-    let more = gtk::Box::builder()
+    let more = gtk::MenuButton::builder()
+        .icon_name("view-more-symbolic")
+        .menu_model(&more_menu(show_try_again))
+        .tooltip_text("More Options")
+        .valign(gtk::Align::Center)
+        .css_classes(["circular"])
+        .build();
+    // An icon alone gives a screen reader nothing to say.
+    more.update_property(&[gtk::accessible::Property::Label("More options")]);
+
+    let row = gtk::Box::builder()
         .orientation(gtk::Orientation::Horizontal)
         .halign(gtk::Align::Center)
-        .spacing(12)
+        .spacing(6)
         .build();
-    more.append(&try_again);
-    more.append(&recovery);
-    more.append(&start_over);
+    row.append(&unlock);
+    row.append(&more);
 
     page.body.append(&fields);
-    page.body.append(&unlock);
-    page.body.append(&more);
+    page.body.append(&row);
 
     PromptLayout {
         page,
         entry,
         unlock,
-        try_again,
-        recovery,
-        start_over,
+        more,
     }
 }
 

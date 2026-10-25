@@ -53,11 +53,12 @@ impl Sizing {
     }
 }
 
-/// A page to check and the lowest widget on it that a person has to reach.
+/// A page to check and the widgets on it that a person has to reach, which
+/// must all be visible in the window.
 struct Case {
     name: &'static str,
     page: adw::StatusPage,
-    lowest: Option<gtk::Widget>,
+    reachable: Vec<gtk::Widget>,
 }
 
 fn cases() -> Vec<Case> {
@@ -88,27 +89,33 @@ fn cases() -> Vec<Case> {
     vec![
         Case {
             name: "prompt, keyring reachable",
-            lowest: Some(prompt_a.start_over.clone().upcast()),
+            reachable: vec![
+                prompt_a.unlock.clone().upcast(),
+                prompt_a.more.clone().upcast(),
+            ],
             page: prompt_a.page.root,
         },
         Case {
             name: "prompt, keyring unreachable",
-            lowest: Some(prompt_b.start_over.clone().upcast()),
+            reachable: vec![
+                prompt_b.unlock.clone().upcast(),
+                prompt_b.more.clone().upcast(),
+            ],
             page: prompt_b.page.root,
         },
         Case {
             name: "setup, no keyring found",
-            lowest: Some(setup_a.create.clone().upcast()),
+            reachable: vec![setup_a.create.clone().upcast()],
             page: setup_a.page.root,
         },
         Case {
             name: "setup, keyring error and a problem",
-            lowest: Some(setup_b.create.clone().upcast()),
+            reachable: vec![setup_b.create.clone().upcast()],
             page: setup_b.page.root,
         },
         Case {
             name: "error, long message",
-            lowest: None,
+            reachable: Vec::new(),
             page: error.root,
         },
     ]
@@ -158,7 +165,7 @@ struct Outcome {
     window: (i32, i32),
     page_height: i32,
     needed_height: i32,
-    /// Bottom edge of the lowest widget, within the window, if there is one.
+    /// Bottom edge of the lowest reachable widget, within the window, if any.
     lowest_bottom: Option<i32>,
     visible: bool,
 }
@@ -169,23 +176,28 @@ fn inspect(window: &adw::Window, case: &Case) -> Outcome {
     let needed_height = page.measure(gtk::Orientation::Vertical, page.width()).1;
     let squeezed = page.height() < needed_height;
 
-    let lowest_bottom = case.lowest.as_ref().and_then(|widget| {
-        widget
-            .compute_bounds(window)
-            .map(|bounds| (bounds.y() + bounds.height()).ceil() as i32)
-    });
-    let lowest_visible = match (&case.lowest, lowest_bottom) {
-        (None, _) => true,
-        (Some(_), Some(bottom)) => bottom <= window.height(),
-        (Some(_), None) => false,
-    };
+    // Where each widget a person must reach ends, within the window. A widget
+    // whose position cannot be worked out counts as not visible.
+    let bottoms: Vec<Option<i32>> = case
+        .reachable
+        .iter()
+        .map(|widget| {
+            widget
+                .compute_bounds(window)
+                .map(|bounds| (bounds.y() + bounds.height()).ceil() as i32)
+        })
+        .collect();
+    let lowest_bottom = bottoms.iter().flatten().max().copied();
+    let all_visible = bottoms
+        .iter()
+        .all(|bottom| bottom.is_some_and(|b| b <= window.height()));
 
     Outcome {
         window: (window.width(), window.height()),
         page_height: page.height(),
         needed_height,
         lowest_bottom,
-        visible: !squeezed && lowest_visible,
+        visible: !squeezed && all_visible,
     }
 }
 

@@ -87,7 +87,7 @@ Use the pencil and trash buttons next to a wallet to rename or remove it.
 - **Recovery key:** if you use the keyring, **Recovery Key…** in the main menu
   shows the key Morlaco keeps there. Save it somewhere safe, like a password
   manager. If your keyring is ever reset, or you move to a new computer, choose
-  **Use Recovery Key** on the unlock screen to open your data again (add your
+  **Use Recovery Key** from the ⋮ menu on the unlock screen to open your data again (add your
   passphrase too, if you set one). Anyone who has that key and your data file
   can open your data, so keep it private. With a passphrase only, there's no
   recovery key: the passphrase is the key.
