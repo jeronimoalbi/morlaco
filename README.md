@@ -84,6 +84,13 @@ Use the pencil and trash buttons next to a wallet to rename or remove it.
 - No keyring on your computer? Morlaco asks you to choose a passphrase the
   first time you start it.
 - If you forget a passphrase, your saved data can't be recovered.
+- **Recovery key:** if you use the keyring, **Recovery Key…** in the main menu
+  shows the key Morlaco keeps there. Save it somewhere safe, like a password
+  manager. If your keyring is ever reset, or you move to a new computer, choose
+  **Use Recovery Key…** on the unlock screen to open your data again (add your
+  passphrase too, if you set one). Anyone who has that key and your data file
+  can open your data, so keep it private. With a passphrase only, there's no
+  recovery key: the passphrase is the key.
 - **Clear Local Data…** in the same menu deletes the file and the key.
 - To read the blockchain and coin prices, Morlaco asks public websites. For
   Bitcoin that's [mempool.space](https://mempool.space). So that site sees

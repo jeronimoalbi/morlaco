@@ -28,6 +28,12 @@ pub struct Unlocked {
     /// Where an older database was moved to, if there was one that this
     /// version cannot read. The new database then starts empty.
     pub set_aside: Option<PathBuf>,
+    /// Whether a new keyring secret was just made, so the user should be
+    /// encouraged to save their recovery key.
+    pub created_new_secret: bool,
+    /// Something to tell the user, such as what happened when a recovered key
+    /// was saved in the keyring again.
+    pub notice: Option<String>,
 }
 
 /// Called once the database is open.
@@ -136,6 +142,83 @@ fn open_with_candidates(
     Err(Error::WrongKey)
 }
 
+/// Why a recovery key could not be used.
+#[derive(Debug, PartialEq, Eq)]
+enum RecoveryProblem {
+    /// It is not 64 hexadecimal digits.
+    Malformed,
+    /// It does not open the data, alone or with the passphrase that was given.
+    NoMatch {
+        /// Whether a passphrase was part of the attempt.
+        tried_passphrase: bool,
+    },
+    /// Something else went wrong while opening the file.
+    Other(String),
+}
+
+impl std::fmt::Display for RecoveryProblem {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            RecoveryProblem::Malformed => write!(
+                f,
+                "That doesn’t look like a recovery key. It has 64 letters and digits \
+                 (0–9 and a–f), usually in groups separated by dashes."
+            ),
+            RecoveryProblem::NoMatch {
+                tried_passphrase: false,
+            } => write!(
+                f,
+                "That key doesn’t open your data. If you also set a passphrase, enter \
+                 it too."
+            ),
+            RecoveryProblem::NoMatch {
+                tried_passphrase: true,
+            } => write!(f, "The recovery key or the passphrase is wrong."),
+            RecoveryProblem::Other(message) => write!(f, "{message}"),
+        }
+    }
+}
+
+/// Opens the data with a recovery key, and with the passphrase too if one was
+/// given. The recovery key is the keyring secret, so the result is a keyring
+/// mode, with or without a passphrase.
+fn recover(
+    path: &Path,
+    recovery_key: &str,
+    passphrase: &str,
+) -> Result<(Database, Keys, Option<PathBuf>), RecoveryProblem> {
+    let secret = keys::parse_recovery_key(recovery_key).ok_or(RecoveryProblem::Malformed)?;
+    let tried_passphrase = !passphrase.is_empty();
+
+    let mut candidates = vec![Keys::Keyring {
+        secret: secret.clone(),
+    }];
+    if tried_passphrase {
+        candidates.push(Keys::KeyringAndPassphrase {
+            secret,
+            passphrase: passphrase.to_owned(),
+        });
+    }
+    match open_with_candidates(path, candidates) {
+        Ok(opened) => Ok(opened),
+        Err(Error::WrongKey) => Err(RecoveryProblem::NoMatch { tried_passphrase }),
+        Err(other) => Err(RecoveryProblem::Other(other.to_string())),
+    }
+}
+
+/// Saves a recovered secret in the keyring again, and says what happened.
+/// `None` when the keys have no secret to save.
+fn restore_secret(keyring: &dyn Keyring, keys: &Keys) -> Option<String> {
+    let secret = keys.secret()?;
+    Some(match keyring.store(secret) {
+        Ok(()) => "Your key was saved in the keyring again.".to_owned(),
+        Err(err) => format!(
+            "Your data is open, but the key couldn’t be saved in the keyring ({err}). \
+             You’ll need your recovery key again next time."
+        ),
+    })
+}
+
 // --- Flow ------------------------------------------------------------------
 
 /// Opens the database and calls `ready`, possibly after the user has
@@ -154,7 +237,7 @@ pub fn start(app: &adw::Application, ready: Ready) {
     };
 
     match plan(&SecretService.lookup(), file) {
-        Next::OpenWithSecret(secret) => open_with_secret(app, path, secret, ready),
+        Next::OpenWithSecret(secret) => open_with_secret(app, path, secret, false, ready),
         Next::CreateSecret => create_secret(app, path, file, ready),
         Next::Prompt { keyring_reachable } => {
             show_passphrase_prompt(app, path, None, keyring_reachable, ready);
@@ -175,10 +258,16 @@ fn create_secret(app: &adw::Application, path: PathBuf, file: FileState, ready: 
     if let Err(message) = SecretService.store(&secret) {
         return show_setup(app, path, file, Some(message), ready);
     }
-    open_with_secret(app, path, secret, ready);
+    open_with_secret(app, path, secret, true, ready);
 }
 
-fn open_with_secret(app: &adw::Application, path: PathBuf, secret: String, ready: Ready) {
+fn open_with_secret(
+    app: &adw::Application,
+    path: PathBuf,
+    secret: String,
+    created_new_secret: bool,
+    ready: Ready,
+) {
     // A file from an earlier version has no encryption yet.
     if let Err(err) = Database::encrypt_plain_file(&path, &secret) {
         return show_error(app, "Couldn’t Encrypt Your Data", &err.to_string());
@@ -188,6 +277,8 @@ fn open_with_secret(app: &adw::Application, path: PathBuf, secret: String, ready
             db,
             keys: Keys::Keyring { secret },
             set_aside,
+            created_new_secret,
+            notice: None,
         }),
         // The secret alone does not open it, so a passphrase was added.
         Err(Error::WrongKey) => show_passphrase_prompt(app, path, Some(secret), true, ready),
@@ -322,6 +413,8 @@ fn show_setup(
                         db,
                         keys: Keys::PassphraseOnly { passphrase },
                         set_aside,
+                        created_new_secret: false,
+                        notice: None,
                     });
                     window.close();
                 }
@@ -362,6 +455,10 @@ fn show_passphrase_prompt(
         .css_classes(["flat"])
         .visible(!keyring_reachable)
         .build();
+    let recovery = gtk::Button::builder()
+        .label("Use Recovery Key…")
+        .css_classes(["flat"])
+        .build();
     let start_over = gtk::Button::builder()
         .label("Start Over…")
         .css_classes(["flat"])
@@ -372,6 +469,7 @@ fn show_passphrase_prompt(
         .spacing(12)
         .build();
     more.append(&try_again);
+    more.append(&recovery);
     more.append(&start_over);
 
     let content = gtk::Box::builder()
@@ -413,6 +511,8 @@ fn show_passphrase_prompt(
                         db,
                         keys,
                         set_aside,
+                        created_new_secret: false,
+                        notice: None,
                     });
                     window.close();
                 }
@@ -435,6 +535,16 @@ fn show_passphrase_prompt(
         start(&retry_app, retry_ready.clone());
         retry_window.close();
     });
+    let (recover_path, recover_ready) = (path.clone(), ready.clone());
+    let (recover_window, recover_page) = (window.clone(), page.clone());
+    recovery.connect_clicked(move |_| {
+        show_recovery_dialog(
+            &recover_window,
+            &recover_page,
+            recover_path.clone(),
+            recover_ready.clone(),
+        );
+    });
     let (over_app, over_window) = (app.clone(), window.clone());
     start_over.connect_clicked(move |_| {
         confirm_start_over(&over_app, path.clone(), ready.clone(), &over_window);
@@ -442,6 +552,61 @@ fn show_passphrase_prompt(
 
     window.present();
     entry.grab_focus();
+}
+
+/// Asks for a recovery key (and the passphrase, if there is one) and opens the
+/// data with it. A problem is shown on the unlock page.
+fn show_recovery_dialog(
+    parent: &adw::ApplicationWindow,
+    page: &adw::StatusPage,
+    path: PathBuf,
+    ready: Ready,
+) {
+    let dialog = adw::AlertDialog::new(
+        Some("Use Recovery Key"),
+        Some("Enter the recovery key you saved. If you also set a passphrase, enter that too."),
+    );
+    dialog.add_responses(&[("cancel", "_Cancel"), ("open", "_Open")]);
+    dialog.set_response_appearance("open", adw::ResponseAppearance::Suggested);
+    dialog.set_response_enabled("open", false);
+    dialog.set_default_response(Some("open"));
+    dialog.set_close_response("cancel");
+
+    let key = adw::EntryRow::builder().title("Recovery key").build();
+    let passphrase = adw::PasswordEntryRow::builder()
+        .title("Passphrase (if you set one)")
+        .build();
+    let fields = boxed_fields();
+    fields.append(&key);
+    fields.append(&passphrase);
+    dialog.set_extra_child(Some(&fields));
+
+    let enabler = dialog.clone();
+    key.connect_changed(move |entry| {
+        enabler.set_response_enabled("open", !entry.text().trim().is_empty());
+    });
+
+    let (page, window) = (page.clone(), parent.clone());
+    dialog.connect_response(None, move |_, response| {
+        if response != "open" {
+            return;
+        }
+        match recover(&path, &key.text(), &passphrase.text()) {
+            Ok((db, keys, set_aside)) => {
+                let notice = restore_secret(&SecretService, &keys);
+                ready(Unlocked {
+                    db,
+                    keys,
+                    set_aside,
+                    created_new_secret: false,
+                    notice,
+                });
+                window.close();
+            }
+            Err(problem) => page.set_description(Some(&problem.to_string())),
+        }
+    });
+    dialog.present(Some(parent));
 }
 
 /// Asks whether to delete the saved data, and if so does it and starts again.
@@ -500,7 +665,7 @@ mod tests {
     use morlaco_core::chain::{Chain, WalletId};
 
     use super::*;
-    use crate::keys::Mode;
+    use crate::keys::{MemoryKeyring, Mode};
     use crate::testutil::TempDir;
 
     const SECRET: &str = "0123abcd";
@@ -636,6 +801,121 @@ mod tests {
             open_with_candidates(&path, candidates(Some("stale-secret"), PASSPHRASE))
                 .expect("falls back to the passphrase alone");
         assert_eq!(matched.mode(), Mode::PassphraseOnly);
+    }
+
+    fn recovery_key() -> String {
+        keys::format_recovery_key(&SECRET.repeat(8))
+    }
+
+    /// The secret the recovery tests use: `SECRET` repeated to 64 digits.
+    fn full_secret() -> String {
+        SECRET.repeat(8)
+    }
+
+    #[test]
+    fn the_recovery_key_opens_keyring_protected_data() {
+        let keys = Keys::Keyring {
+            secret: full_secret(),
+        };
+        let (_dir, path) = protected_file("rk", &keys);
+
+        let (db, matched, _) = recover(&path, &recovery_key(), "").expect("opens");
+        assert_eq!(matched, keys);
+        assert_eq!(db.wallets().expect("wallets")[0].label, "Kept");
+    }
+
+    #[test]
+    fn data_with_a_passphrase_needs_it_as_well_as_the_recovery_key() {
+        let keys = Keys::KeyringAndPassphrase {
+            secret: full_secret(),
+            passphrase: PASSPHRASE.into(),
+        };
+        let (_dir, path) = protected_file("rkpw", &keys);
+
+        // The key alone is not enough, and the message says a passphrase may be needed.
+        assert_eq!(
+            recover(&path, &recovery_key(), "").err(),
+            Some(RecoveryProblem::NoMatch {
+                tried_passphrase: false
+            })
+        );
+        assert_eq!(
+            recover(&path, &recovery_key(), "not it").err(),
+            Some(RecoveryProblem::NoMatch {
+                tried_passphrase: true
+            })
+        );
+        let (_, matched, _) = recover(&path, &recovery_key(), PASSPHRASE).expect("opens");
+        assert_eq!(matched, keys);
+    }
+
+    #[test]
+    fn a_wrong_recovery_key_does_not_open_anything() {
+        let keys = Keys::Keyring {
+            secret: full_secret(),
+        };
+        let (_dir, path) = protected_file("rkwrong", &keys);
+        let other = keys::format_recovery_key(&"f".repeat(64));
+
+        assert_eq!(
+            recover(&path, &other, "").err(),
+            Some(RecoveryProblem::NoMatch {
+                tried_passphrase: false
+            })
+        );
+    }
+
+    #[test]
+    fn a_malformed_recovery_key_is_called_out_before_trying_the_file() {
+        let keys = Keys::Keyring {
+            secret: full_secret(),
+        };
+        let (_dir, path) = protected_file("rkbad", &keys);
+        assert_eq!(
+            recover(&path, "definitely not a key", "").err(),
+            Some(RecoveryProblem::Malformed)
+        );
+    }
+
+    #[test]
+    fn passphrase_only_data_has_no_recovery_key() {
+        let keys = Keys::PassphraseOnly {
+            passphrase: PASSPHRASE.into(),
+        };
+        let (_dir, path) = protected_file("rkalone", &keys);
+        assert!(recover(&path, &recovery_key(), "").is_err());
+    }
+
+    #[test]
+    fn a_recovered_secret_goes_back_into_the_keyring() {
+        let keyring = MemoryKeyring::default();
+        let keys = Keys::Keyring {
+            secret: full_secret(),
+        };
+        let notice = restore_secret(&keyring, &keys).expect("a notice");
+        assert!(notice.contains("saved in the keyring again"));
+        assert_eq!(keyring.current(), Some(full_secret()));
+    }
+
+    #[test]
+    fn if_the_keyring_will_not_take_it_back_the_user_is_told() {
+        let keyring = MemoryKeyring::default();
+        keyring.fail_store.set(true);
+        let keys = Keys::Keyring {
+            secret: full_secret(),
+        };
+        let notice = restore_secret(&keyring, &keys).expect("a notice");
+        assert!(notice.contains("recovery key again next time"));
+        assert_eq!(keyring.current(), None);
+    }
+
+    #[test]
+    fn data_protected_by_a_passphrase_alone_has_nothing_to_restore() {
+        let keyring = MemoryKeyring::default();
+        let keys = Keys::PassphraseOnly {
+            passphrase: PASSPHRASE.into(),
+        };
+        assert_eq!(restore_secret(&keyring, &keys), None);
     }
 
     #[test]

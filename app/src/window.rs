@@ -22,7 +22,9 @@ use morlaco_core::util::date_string;
 
 use crate::encryption;
 use crate::format;
-use crate::keys::{Keyring, Keys, MIN_PASSPHRASE_ONLY_CHARS, Mode, SecretService};
+use crate::keys::{
+    Keyring, Keys, MIN_PASSPHRASE_ONLY_CHARS, Mode, SecretService, format_recovery_key,
+};
 use crate::migrate;
 use crate::store::{Store, Wallet};
 use crate::unlock;
@@ -308,6 +310,12 @@ fn open_main_window(app: &adw::Application, unlocked: unlock::Unlocked) {
                     )
                 ));
             }
+            if let Some(notice) = unlocked.notice {
+                ui.toast(&notice);
+            }
+            if unlocked.created_new_secret {
+                ui.suggest_recovery_key();
+            }
         }
         Err(message) => unlock::show_error(app, "Couldn’t Open Your Data", &message),
     }
@@ -466,6 +474,7 @@ impl Ui {
         let menu = gio::Menu::new();
         let data = gio::Menu::new();
         data.append(Some("_Encryption…"), Some("win.encryption"));
+        data.append(Some("_Recovery Key…"), Some("win.recovery-key"));
         data.append(Some("_Clear Local Data…"), Some("win.clear-data"));
         menu.append_section(None, &data);
         let app_menu = gio::Menu::new();
@@ -572,6 +581,7 @@ impl Ui {
             ui.hide_btn.set_active(!ui.hide_btn.is_active());
         });
         self.add_action("encryption", |ui| ui.show_encryption_dialog());
+        self.add_action("recovery-key", |ui| ui.show_recovery_key_dialog());
         self.add_action("clear-data", |ui| ui.confirm_clear_data());
         self.add_action("toggle-sidebar", |ui| {
             ui.split.set_show_sidebar(!ui.split.shows_sidebar());
@@ -635,6 +645,18 @@ impl Ui {
 
     fn toast(&self, message: &str) {
         self.toasts.add_toast(adw::Toast::new(message));
+    }
+
+    /// Reminds the user to save their recovery key, with a button that opens it.
+    fn suggest_recovery_key(&self) {
+        self.toasts.add_toast(
+            adw::Toast::builder()
+                .title("Your data is encrypted. Save your recovery key in case the keyring is ever reset.")
+                .button_label("Save…")
+                .action_name("win.recovery-key")
+                .timeout(0)
+                .build(),
+        );
     }
 
     /// A message that stays until the user closes it, for things they need
@@ -919,14 +941,76 @@ impl Ui {
                         Mode::PassphraseOnly => "Your data now needs a passphrase only",
                     }
                 };
+                let new_secret = before.secret().is_none() && changed.keys.secret().is_some();
                 self.state.borrow_mut().keys = changed.keys;
                 self.toast(message);
                 if let Some(warning) = changed.warning {
                     self.toast(&warning);
                 }
+                // A secret was just made, and it is the only thing that
+                // opens the data if the keyring is ever lost.
+                if new_secret {
+                    self.suggest_recovery_key();
+                }
             }
             Err(message) => self.toast(&format!("Couldn’t change the encryption: {message}")),
         }
+    }
+
+    fn show_recovery_key_dialog(self: &Rc<Self>) {
+        let keys = self.state.borrow().keys.clone();
+
+        let Some(secret) = keys.secret() else {
+            let dialog = adw::AlertDialog::new(
+                Some("No Recovery Key"),
+                Some(
+                    "Your passphrase is the only key to your data, so there is no separate \
+                     recovery key. If you forget the passphrase, your data can’t be recovered.",
+                ),
+            );
+            dialog.add_response("close", "_Close");
+            dialog.set_close_response("close");
+            dialog.present(Some(&self.window));
+            return;
+        };
+
+        let shown = format_recovery_key(secret);
+        let passphrase_note = if keys.mode() == Mode::KeyringAndPassphrase {
+            " You will still need your passphrase too."
+        } else {
+            ""
+        };
+        let dialog = adw::AlertDialog::new(
+            Some("Recovery Key"),
+            Some(&format!(
+                "If your keyring is ever reset, or you move to another computer, this key \
+                 lets you open your data again.{passphrase_note} Keep it somewhere safe and \
+                 private, such as a password manager. Anyone who has this key and your data \
+                 file can open your data."
+            )),
+        );
+        dialog.add_responses(&[("close", "_Close"), ("copy", "_Copy")]);
+        dialog.set_response_appearance("copy", adw::ResponseAppearance::Suggested);
+        dialog.set_default_response(Some("copy"));
+        dialog.set_close_response("close");
+        dialog.set_extra_child(Some(
+            &gtk::Label::builder()
+                .label(&shown)
+                .selectable(true)
+                .wrap(true)
+                .justify(gtk::Justification::Center)
+                .css_classes(["monospace", "title-4"])
+                .build(),
+        ));
+
+        let ui = self.clone();
+        dialog.connect_response(None, move |_, response| {
+            if response == "copy" {
+                ui.window.clipboard().set_text(&shown);
+                ui.toast("Recovery key copied. A clipboard manager may keep a copy of it.");
+            }
+        });
+        dialog.present(Some(&self.window));
     }
 
     fn confirm_clear_data(self: &Rc<Self>) {

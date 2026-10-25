@@ -118,6 +118,32 @@ fn to_hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
+/// Length of a secret: 32 bytes as hex.
+const SECRET_CHARS: usize = 64;
+
+/// The secret written so a person can store and retype it: groups of eight
+/// characters joined by dashes.
+pub fn format_recovery_key(secret: &str) -> String {
+    secret
+        .as_bytes()
+        .chunks(8)
+        .map(String::from_utf8_lossy)
+        .collect::<Vec<_>>()
+        .join("-")
+}
+
+/// Reads a recovery key back. Spaces, dashes, line breaks and capital letters
+/// are all fine. Returns `None` unless exactly 64 hex digits remain.
+pub fn parse_recovery_key(text: &str) -> Option<String> {
+    let cleaned: String = text
+        .chars()
+        .filter(|c| !c.is_whitespace() && *c != '-')
+        .flat_map(char::to_lowercase)
+        .collect();
+    (cleaned.len() == SECRET_CHARS && cleaned.chars().all(|c| c.is_ascii_hexdigit()))
+        .then_some(cleaned)
+}
+
 /// Where the secret is kept. A trait so everything that changes the keyring
 /// can be tested without touching a real one.
 pub trait Keyring {
@@ -286,6 +312,57 @@ mod tests {
         assert_eq!(a.len(), 64);
         assert!(a.chars().all(|c| c.is_ascii_hexdigit()));
         assert_ne!(a, b);
+    }
+
+    #[test]
+    fn a_recovery_key_is_eight_groups_of_eight() {
+        let secret = generate_secret().expect("random bytes");
+        let shown = format_recovery_key(&secret);
+        let groups: Vec<&str> = shown.split('-').collect();
+        assert_eq!(groups.len(), 8);
+        assert!(groups.iter().all(|g| g.len() == 8));
+        assert_eq!(shown.len(), 64 + 7);
+    }
+
+    #[test]
+    fn a_recovery_key_reads_back_to_the_same_secret() {
+        let secret = generate_secret().expect("random bytes");
+        assert_eq!(
+            parse_recovery_key(&format_recovery_key(&secret)),
+            Some(secret)
+        );
+    }
+
+    #[test]
+    fn reading_a_recovery_key_forgives_spacing_dashes_and_case() {
+        let secret = "0123456789abcdef".repeat(4);
+        let messy = format!(
+            "  {}\n{}  ",
+            format_recovery_key(&secret).to_uppercase(),
+            ""
+        );
+        assert_eq!(parse_recovery_key(&messy), Some(secret.clone()));
+        // Spaces instead of dashes, as someone might retype it.
+        let spaced = format_recovery_key(&secret).replace('-', " ");
+        assert_eq!(parse_recovery_key(&spaced), Some(secret));
+    }
+
+    #[test]
+    fn a_recovery_key_that_is_wrong_in_any_way_is_refused() {
+        let secret = "0123456789abcdef".repeat(4);
+        assert_eq!(parse_recovery_key(""), None);
+        assert_eq!(parse_recovery_key(&secret[..63]), None, "one digit short");
+        assert_eq!(
+            parse_recovery_key(&format!("{secret}0")),
+            None,
+            "one digit too many"
+        );
+        assert_eq!(
+            parse_recovery_key(&format!("{}g", &secret[..63])),
+            None,
+            "not hexadecimal"
+        );
+        assert_eq!(parse_recovery_key("not a key at all"), None);
     }
 
     #[test]
