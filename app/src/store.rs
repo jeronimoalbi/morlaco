@@ -6,8 +6,10 @@
 
 use morlaco_core::Result;
 use morlaco_core::db::Database;
+use morlaco_core::portfolio::History;
 
 const HIDDEN_KEY: &str = "hidden";
+const LAST_PRICE_KEY: &str = "last_price_usd";
 
 /// A tracked address with an optional user label.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -55,6 +57,28 @@ impl Store {
             hidden,
             db,
         })
+    }
+
+    /// The history saved for `address`, or `None` if it was never fetched.
+    pub fn saved_history(&self, address: &str) -> Result<Option<History>> {
+        if !self.db.is_synced(address)? {
+            return Ok(None);
+        }
+        Ok(Some(History {
+            address: address.to_owned(),
+            txs: self.db.history(address)?,
+        }))
+    }
+
+    /// The BTC/USD price from the last successful refresh.
+    pub fn last_price(&self) -> Option<f64> {
+        let saved = self.db.setting(LAST_PRICE_KEY).ok()??;
+        saved.parse().ok()
+    }
+
+    /// Remembers the price so the next start can show values at once.
+    pub fn set_last_price(&self, usd: f64) -> Result<()> {
+        self.db.set_setting(LAST_PRICE_KEY, &usd.to_string())
     }
 
     /// Re-encrypts the database with a new key. See [`Database::rekey`].
@@ -198,6 +222,32 @@ mod tests {
         store.remove(0).expect("remove");
         assert!(store.wallets.is_empty());
         assert!(store.database().wallets().expect("list").is_empty());
+    }
+
+    #[test]
+    fn the_last_price_is_remembered() {
+        let store = store();
+        assert_eq!(store.last_price(), None);
+        store.set_last_price(81_234.5).expect("save");
+        assert_eq!(store.last_price(), Some(81_234.5));
+    }
+
+    #[test]
+    fn saved_history_is_only_returned_for_wallets_that_were_fetched() {
+        let store = store();
+        assert!(store.saved_history("bc1qa").expect("query").is_none());
+
+        // A fetched wallet with no transactions is saved, but empty.
+        store
+            .database()
+            .replace_history_above("bc1qa", 0, &[])
+            .expect("save");
+        let saved = store
+            .saved_history("bc1qa")
+            .expect("query")
+            .expect("synced");
+        assert_eq!(saved.address, "bc1qa");
+        assert!(saved.txs.is_empty());
     }
 
     #[test]

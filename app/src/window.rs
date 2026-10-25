@@ -56,6 +56,19 @@ struct State {
 }
 
 impl State {
+    /// Addresses in the current view that are not loaded yet.
+    fn missing_addresses(&self) -> Vec<String> {
+        let wanted: Vec<&Wallet> = match self.selection {
+            Selection::Overview => self.store.wallets.iter().collect(),
+            Selection::Wallet(i) => self.store.wallets.get(i).into_iter().collect(),
+        };
+        wanted
+            .into_iter()
+            .filter(|w| !self.histories.contains_key(&w.address))
+            .map(|w| w.address.clone())
+            .collect()
+    }
+
     /// Rebuilds every portfolio from the loaded histories.
     ///
     /// Wallets are valued together so that coins moved between them keep
@@ -224,7 +237,13 @@ struct Ui {
     state: RefCell<State>,
     /// Incremented on every load or selection so late answers are dropped.
     generation: Cell<u64>,
-    loading: Cell<bool>,
+    /// Number of worker threads reading data. While any runs, the database
+    /// must not be re-encrypted.
+    running: Cell<u32>,
+    /// Whether the full-page loading screen is what the user sees.
+    showing_loading: Cell<bool>,
+    /// Shown in the header while a refresh runs behind saved data.
+    refresh_spinner: gtk::Spinner,
 }
 
 /// Builds the window, or raises it if it already exists.
@@ -248,7 +267,7 @@ fn open_main_window(app: &adw::Application, db: Database, keys: Keys) {
             let ui = Ui::new(app, store, keys);
             ui.connect_signals();
             ui.rebuild_sidebar();
-            ui.select(Selection::Overview);
+            ui.start();
             ui.window.present();
         }
         Err(message) => unlock::show_error(app, "Couldn’t Open Your Data", &message),
@@ -422,7 +441,9 @@ impl Ui {
 
         let content_header = adw::HeaderBar::builder().title_widget(&title_stack).build();
         content_header.pack_start(&sidebar_btn);
+        let refresh_spinner = gtk::Spinner::builder().visible(false).build();
         content_header.pack_start(&refresh_btn);
+        content_header.pack_start(&refresh_spinner);
         content_header.pack_end(&menu_btn);
         content_header.pack_end(&hide_btn);
 
@@ -494,7 +515,9 @@ impl Ui {
                 errors: HashMap::new(),
             }),
             generation: Cell::new(0),
-            loading: Cell::new(false),
+            running: Cell::new(0),
+            showing_loading: Cell::new(false),
+            refresh_spinner,
         })
     }
 
@@ -668,7 +691,7 @@ impl Ui {
     // --- Encryption ------------------------------------------------------
 
     fn show_passphrase_dialog(self: &Rc<Self>) {
-        if self.loading.get() {
+        if self.running.get() > 0 {
             self.toast("Wait for the refresh to finish first");
             return;
         }
@@ -731,7 +754,7 @@ impl Ui {
 
     fn set_passphrase(self: &Rc<Self>, passphrase: Option<String>) {
         // No other connection may use the file while it is re-encrypted.
-        if self.loading.get() {
+        if self.running.get() > 0 {
             self.toast("Wait for the refresh to finish first");
             return;
         }
@@ -890,9 +913,6 @@ impl Ui {
 
     fn select(self: &Rc<Self>, selection: Selection) {
         self.state.borrow_mut().selection = selection;
-        // Drop any load still running for the previous view.
-        self.generation.set(self.generation.get() + 1);
-        self.loading.set(false);
 
         self.sync_sidebar_selection();
         self.sync_chrome();
@@ -918,16 +938,7 @@ impl Ui {
 
     /// Addresses in the current view that are not loaded yet.
     fn missing_addresses(&self) -> Vec<String> {
-        let state = self.state.borrow();
-        let wanted: Vec<&Wallet> = match state.selection {
-            Selection::Overview => state.store.wallets.iter().collect(),
-            Selection::Wallet(i) => state.store.wallets.get(i).into_iter().collect(),
-        };
-        wanted
-            .into_iter()
-            .filter(|w| !state.histories.contains_key(&w.address))
-            .map(|w| w.address.clone())
-            .collect()
+        self.state.borrow().missing_addresses()
     }
 
     /// Reloads everything in the current view, ignoring what is cached.
@@ -958,11 +969,22 @@ impl Ui {
     fn load(self: &Rc<Self>, addresses: Vec<String>) {
         let generation = self.generation.get() + 1;
         self.generation.set(generation);
-        self.loading.set(true);
+        self.running.set(self.running.get() + 1);
 
-        self.pages.set_visible_child_name("loading");
-        self.loading_label.set_label("Fetching transactions…");
+        // With saved data to show, refresh quietly behind it. Otherwise
+        // there is nothing to look at yet, so show a loading screen.
+        let background = {
+            let state = self.state.borrow();
+            state.price_now.is_some() && addresses.iter().all(|a| state.histories.contains_key(a))
+        };
+        if !background {
+            self.showing_loading.set(true);
+            self.pages.set_visible_child_name("loading");
+            self.loading_label.set_label("Fetching transactions…");
+        }
         self.refresh_btn.set_sensitive(false);
+        self.refresh_spinner.set_visible(true);
+        self.refresh_spinner.set_spinning(true);
 
         // The worker thread bumps these counters; the main loop reads them.
         let total = addresses.len();
@@ -998,14 +1020,19 @@ impl Ui {
     }
 
     fn finish_load(self: &Rc<Self>, generation: u64, fetched: Fetched) {
-        if generation != self.generation.get() {
-            return;
-        }
-        self.loading.set(false);
+        self.running.set(self.running.get().saturating_sub(1));
+        let latest = generation == self.generation.get();
+
+        // Results are always kept: they are keyed by address, so a load that
+        // was overtaken by a newer one is still correct.
+        let mut kept_saved_data = None;
         {
             let mut state = self.state.borrow_mut();
-            if fetched.price_now.is_some() {
-                state.price_now = fetched.price_now;
+            if let Some(price) = fetched.price_now {
+                state.price_now = Some(price);
+                if let Err(err) = state.store.set_last_price(price) {
+                    glib::g_warning!("morlaco", "could not save the price: {err}");
+                }
             }
             for (address, result) in fetched.wallets {
                 match result {
@@ -1013,32 +1040,89 @@ impl Ui {
                         state.errors.remove(&address);
                         state.histories.insert(address, history);
                     }
+                    // A failed refresh must not throw away data we have.
+                    Err(message) if state.histories.contains_key(&address) => {
+                        kept_saved_data.get_or_insert(message);
+                    }
                     Err(message) => {
-                        state.histories.remove(&address);
                         state.errors.insert(address, message);
                     }
                 }
             }
             state.recompute();
         }
-        self.show_current();
+
+        if self.running.get() == 0 {
+            self.refresh_spinner.set_spinning(false);
+            self.refresh_spinner.set_visible(false);
+            let has_wallets = !self.state.borrow().store.wallets.is_empty();
+            self.refresh_btn.set_sensitive(has_wallets);
+        }
+        // Do not replace the loading screen of a newer load.
+        if latest || !self.showing_loading.get() {
+            self.show_current();
+        }
+        if let Some(message) = kept_saved_data {
+            self.toast(&format!("Couldn’t refresh: {message}. Showing saved data."));
+        }
+    }
+
+    /// Fills the app from the database so it can be shown before any
+    /// network request.
+    fn restore_saved_data(&self) {
+        let mut state = self.state.borrow_mut();
+        let addresses: Vec<String> = state
+            .store
+            .wallets
+            .iter()
+            .map(|w| w.address.clone())
+            .collect();
+        for address in addresses {
+            match state.store.saved_history(&address) {
+                Ok(Some(history)) => {
+                    state.histories.insert(address, history);
+                }
+                Ok(None) => {}
+                Err(err) => glib::g_warning!("morlaco", "could not read saved data: {err}"),
+            }
+        }
+        state.price_now = state.store.last_price();
+        state.recompute();
+    }
+
+    /// Shows what is saved at once, then refreshes it.
+    fn start(self: &Rc<Self>) {
+        self.restore_saved_data();
+        self.sync_sidebar_selection();
+        self.sync_chrome();
+
+        let ready = {
+            let state = self.state.borrow();
+            state.store.wallets.is_empty()
+                || (state.price_now.is_some() && state.missing_addresses().is_empty())
+        };
+        if ready {
+            self.show_current();
+        }
+        self.refresh();
     }
 
     // --- Rendering -------------------------------------------------------
 
     /// Redraws after a setting changes, unless a load is on screen.
     fn render(&self) {
-        if !self.loading.get() {
+        if !self.showing_loading.get() {
             self.show_current();
         }
     }
 
     /// Picks the right page for the current selection and fills it.
     fn show_current(&self) {
+        self.showing_loading.set(false);
         let hidden = self.state.borrow().store.hidden;
         let state = self.state.borrow();
         self.refresh_btn
-            .set_sensitive(!state.store.wallets.is_empty());
+            .set_sensitive(!state.store.wallets.is_empty() && self.running.get() == 0);
 
         match state.selection {
             Selection::Overview => self.show_overview(&state, hidden),
@@ -1246,8 +1330,10 @@ fn fetch_all(addresses: Vec<String>, key: &str, done: &AtomicUsize, txs: &Atomic
         .into_iter()
         .map(|address| {
             txs.store(0, Ordering::Relaxed);
-            let result = portfolio::fetch(&address, &prices, |n| txs.store(n, Ordering::Relaxed))
-                .map_err(|e| e.to_string());
+            let result = portfolio::fetch(&address, &prices, &cache, |n| {
+                txs.store(n, Ordering::Relaxed)
+            })
+            .map_err(|e| e.to_string());
             done.fetch_add(1, Ordering::Relaxed);
             (address, result)
         })

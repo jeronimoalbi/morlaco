@@ -7,10 +7,30 @@ use std::time::Duration;
 
 use rusqlite::{Connection, OptionalExtension, params};
 
+use crate::chain::Delta;
+use crate::portfolio::PricedTx;
 use crate::{Error, Result};
 
 /// How long a connection waits for another one to release a lock.
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// SQLite stores signed 64-bit integers. Heights and fees never get near
+/// that limit, so saturating is only a formality.
+fn to_sql_int(value: u64) -> i64 {
+    i64::try_from(value).unwrap_or(i64::MAX)
+}
+
+/// Reads an unsigned column, failing on a negative value.
+fn get_u64(row: &rusqlite::Row<'_>, index: usize) -> rusqlite::Result<u64> {
+    let value: i64 = row.get(index)?;
+    u64::try_from(value).map_err(|err| {
+        rusqlite::Error::FromSqlConversionFailure(
+            index,
+            rusqlite::types::Type::Integer,
+            Box::new(err),
+        )
+    })
+}
 
 /// Runs `PRAGMA <name> = '<value>'` with the value quoted as an SQL string.
 ///
@@ -143,6 +163,21 @@ impl Database {
              CREATE TABLE IF NOT EXISTS settings (
                  key TEXT PRIMARY KEY,
                  value TEXT NOT NULL
+             );
+             CREATE TABLE IF NOT EXISTS txs (
+                 address TEXT NOT NULL,
+                 txid TEXT NOT NULL,
+                 height INTEGER NOT NULL,
+                 time INTEGER NOT NULL,
+                 net_sats INTEGER NOT NULL,
+                 fee_sats INTEGER NOT NULL,
+                 parents TEXT NOT NULL,
+                 price_usd REAL NOT NULL,
+                 PRIMARY KEY (address, txid)
+             );
+             CREATE INDEX IF NOT EXISTS txs_by_height ON txs (address, height);
+             CREATE TABLE IF NOT EXISTS synced (
+                 address TEXT PRIMARY KEY
              );",
         )?;
         Ok(Self { conn })
@@ -207,10 +242,99 @@ impl Database {
         Ok(())
     }
 
-    /// Stops tracking the wallet with this address.
+    /// Stops tracking the wallet with this address and forgets its saved
+    /// transactions.
     pub fn remove_wallet(&self, address: &str) -> Result<()> {
-        self.conn
-            .execute("DELETE FROM wallets WHERE address = ?1", params![address])?;
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute("DELETE FROM wallets WHERE address = ?1", params![address])?;
+        tx.execute("DELETE FROM txs WHERE address = ?1", params![address])?;
+        tx.execute("DELETE FROM synced WHERE address = ?1", params![address])?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    // --- Transaction history --------------------------------------------
+
+    /// Whether the history of `address` was fetched and saved at least
+    /// once. A wallet without transactions is synced too.
+    pub fn is_synced(&self, address: &str) -> Result<bool> {
+        let found = self
+            .conn
+            .query_row(
+                "SELECT 1 FROM synced WHERE address = ?1",
+                params![address],
+                |_| Ok(()),
+            )
+            .optional()?;
+        Ok(found.is_some())
+    }
+
+    /// The saved transactions of `address`, oldest first.
+    pub fn history(&self, address: &str) -> Result<Vec<PricedTx>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT txid, height, time, net_sats, fee_sats, parents, price_usd
+             FROM txs WHERE address = ?1 ORDER BY height, txid",
+        )?;
+        let rows = stmt.query_map(params![address], |r| {
+            let parents: String = r.get(5)?;
+            Ok(PricedTx {
+                delta: Delta {
+                    txid: r.get(0)?,
+                    height: get_u64(r, 1)?,
+                    time: r.get(2)?,
+                    net_sats: r.get(3)?,
+                    fee_sats: get_u64(r, 4)?,
+                    parents: parents
+                        .split(',')
+                        .filter(|p| !p.is_empty())
+                        .map(str::to_owned)
+                        .collect(),
+                },
+                price_usd: r.get(6)?,
+            })
+        })?;
+        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+
+    /// Replaces everything of `address` above `height` with `fresh` and marks
+    /// the wallet as synced, all or nothing. Transactions at or below
+    /// `height` are kept.
+    pub fn replace_history_above(
+        &self,
+        address: &str,
+        height: u64,
+        fresh: &[PricedTx],
+    ) -> Result<()> {
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute(
+            "DELETE FROM txs WHERE address = ?1 AND height > ?2",
+            params![address, to_sql_int(height)],
+        )?;
+        {
+            let mut insert = tx.prepare(
+                "INSERT OR REPLACE INTO txs
+                 (address, txid, height, time, net_sats, fee_sats, parents, price_usd)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            )?;
+            for t in fresh {
+                let d = &t.delta;
+                insert.execute(params![
+                    address,
+                    d.txid,
+                    to_sql_int(d.height),
+                    d.time,
+                    d.net_sats,
+                    to_sql_int(d.fee_sats),
+                    d.parents.join(","),
+                    t.price_usd,
+                ])?;
+            }
+        }
+        tx.execute(
+            "INSERT OR IGNORE INTO synced (address) VALUES (?1)",
+            params![address],
+        )?;
+        tx.commit()?;
         Ok(())
     }
 
@@ -295,6 +419,83 @@ mod tests {
 
         // Unknown addresses are not an error.
         db.remove_wallet("bc1qzzz").expect("remove");
+    }
+
+    fn priced(txid: &str, height: u64) -> PricedTx {
+        PricedTx {
+            delta: Delta {
+                txid: txid.to_owned(),
+                height,
+                time: height as i64 * 600,
+                net_sats: 1_000,
+                fee_sats: 0,
+                parents: vec!["p1".to_owned(), "p2".to_owned()],
+            },
+            price_usd: 100.0 * height as f64,
+        }
+    }
+
+    #[test]
+    fn history_round_trips_in_height_order() {
+        let db = db();
+        assert!(!db.is_synced("bc1qa").expect("query"));
+
+        db.replace_history_above("bc1qa", 0, &[priced("b", 9), priced("a", 3)])
+            .expect("save");
+        assert!(db.is_synced("bc1qa").expect("query"));
+
+        let saved = db.history("bc1qa").expect("load");
+        let heights: Vec<u64> = saved.iter().map(|t| t.delta.height).collect();
+        assert_eq!(heights, [3, 9]);
+        assert_eq!(saved[0].delta.parents, ["p1", "p2"]);
+        assert_eq!(saved[1].price_usd, 900.0);
+    }
+
+    #[test]
+    fn replacing_above_a_height_keeps_older_transactions() {
+        let db = db();
+        db.replace_history_above(
+            "bc1qa",
+            0,
+            &[priced("a", 1), priced("b", 5), priced("c", 8)],
+        )
+        .expect("save");
+
+        // Blocks above 5 are redone: "c" is replaced by "d" and "e".
+        db.replace_history_above("bc1qa", 5, &[priced("d", 7), priced("e", 9)])
+            .expect("save");
+
+        let ids: Vec<String> = db
+            .history("bc1qa")
+            .expect("load")
+            .into_iter()
+            .map(|t| t.delta.txid)
+            .collect();
+        assert_eq!(ids, ["a", "b", "d", "e"]);
+    }
+
+    #[test]
+    fn an_empty_history_still_counts_as_synced() {
+        let db = db();
+        db.replace_history_above("bc1qa", 0, &[]).expect("save");
+        assert!(db.is_synced("bc1qa").expect("query"));
+        assert!(db.history("bc1qa").expect("load").is_empty());
+    }
+
+    #[test]
+    fn histories_are_kept_apart_and_removed_with_their_wallet() {
+        let db = db();
+        db.add_wallet("bc1qa", "").expect("add");
+        db.add_wallet("bc1qb", "").expect("add");
+        db.replace_history_above("bc1qa", 0, &[priced("a", 1)])
+            .expect("save");
+        db.replace_history_above("bc1qb", 0, &[priced("a", 1)])
+            .expect("save");
+
+        db.remove_wallet("bc1qa").expect("remove");
+        assert!(db.history("bc1qa").expect("load").is_empty());
+        assert!(!db.is_synced("bc1qa").expect("query"));
+        assert_eq!(db.history("bc1qb").expect("load").len(), 1);
     }
 
     #[test]

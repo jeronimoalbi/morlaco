@@ -9,6 +9,7 @@ use std::collections::{HashMap, HashSet};
 
 use crate::Result;
 use crate::chain::{self, Delta};
+use crate::db::Database;
 use crate::lots::{Ledger, Lot, Move, Summary};
 use crate::price::PriceSource;
 
@@ -57,15 +58,27 @@ pub struct Portfolio {
     pub history: Vec<Entry>,
 }
 
-/// Downloads the history of `address` and prices every transaction.
+/// Blocks this deep can still be replaced by a chain reorganization, so
+/// they are always fetched again.
+const REORG_DEPTH: u64 = 6;
+
+/// Brings the saved history of `address` up to date and returns it.
 ///
-/// `on_progress` receives the number of transactions fetched so far.
+/// Only blocks above the last saved one, minus [`REORG_DEPTH`], are
+/// downloaded and priced; everything older comes from `db`. The result is
+/// saved in one step, so a failure leaves the earlier state intact.
+///
+/// `on_progress` receives the number of new transactions found so far.
 pub fn fetch(
     address: &str,
     prices: &impl PriceSource,
+    db: &Database,
     on_progress: impl FnMut(usize),
 ) -> Result<History> {
-    let txs = chain::fetch_history(address, on_progress)?
+    let saved = db.history(address)?;
+    let since = refetch_above(&saved);
+
+    let fresh = chain::fetch_history(address, since, on_progress)?
         .into_iter()
         .map(|delta| {
             prices
@@ -74,10 +87,31 @@ pub fn fetch(
         })
         .collect::<Result<Vec<_>>>()?;
 
+    db.replace_history_above(address, since, &fresh)?;
     Ok(History {
         address: address.to_owned(),
-        txs,
+        txs: merge(saved, since, fresh),
     })
+}
+
+/// Height above which saved transactions must be fetched again. 0 when
+/// nothing is saved.
+fn refetch_above(saved: &[PricedTx]) -> u64 {
+    saved
+        .iter()
+        .map(|t| t.delta.height)
+        .max()
+        .map_or(0, |tip| tip.saturating_sub(REORG_DEPTH))
+}
+
+/// Keeps the saved transactions at or below `since` and adds the fresh ones.
+fn merge(saved: Vec<PricedTx>, since: u64, fresh: Vec<PricedTx>) -> Vec<PricedTx> {
+    let mut txs: Vec<PricedTx> = saved
+        .into_iter()
+        .filter(|t| t.delta.height <= since)
+        .collect();
+    txs.extend(fresh);
+    txs
 }
 
 /// One transaction as seen across all tracked wallets.
@@ -222,6 +256,35 @@ mod tests {
             address: address.to_owned(),
             txs,
         }
+    }
+
+    fn ids(txs: &[PricedTx]) -> Vec<&str> {
+        txs.iter().map(|t| t.delta.txid.as_str()).collect()
+    }
+
+    #[test]
+    fn nothing_saved_means_a_full_fetch() {
+        assert_eq!(refetch_above(&[]), 0);
+    }
+
+    #[test]
+    fn the_last_blocks_are_refetched_in_case_of_a_reorg() {
+        let saved = [tx("a", 100, BTC, 0, &[]), tx("b", 120, BTC, 0, &[])];
+        assert_eq!(refetch_above(&saved), 120 - REORG_DEPTH);
+        // Near the start of the chain it cannot go below zero.
+        assert_eq!(refetch_above(&[tx("c", 2, BTC, 0, &[])]), 0);
+    }
+
+    #[test]
+    fn merge_drops_saved_blocks_that_are_refetched() {
+        let saved = vec![
+            tx("old", 100, BTC, 0, &[]),
+            tx("replaced", 118, BTC, 0, &[]),
+            tx("tip", 120, BTC, 0, &[]),
+        ];
+        let fresh = vec![tx("tip", 120, BTC, 0, &[]), tx("new", 125, BTC, 0, &[])];
+        let merged = merge(saved, 114, fresh);
+        assert_eq!(ids(&merged), ["old", "tip", "new"]);
     }
 
     #[test]

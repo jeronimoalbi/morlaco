@@ -127,34 +127,67 @@ pub fn check_address(address: &str) -> Result<()> {
     }
 }
 
-/// Downloads the full confirmed history of `address`, oldest first.
+/// Downloads the confirmed transactions of `address` in blocks above
+/// `since_height`, oldest first. Pass 0 for the full history.
+///
+/// Pages arrive newest first, so paging stops as soon as a page reaches a
+/// block at or below `since_height`.
 ///
 /// `on_progress` is called after each page with the number of transactions
 /// found so far. Unconfirmed transactions are skipped because they have no
 /// block time to price.
-pub fn fetch_history(address: &str, mut on_progress: impl FnMut(usize)) -> Result<Vec<Delta>> {
+pub fn fetch_history(
+    address: &str,
+    since_height: u64,
+    on_progress: impl FnMut(usize),
+) -> Result<Vec<Delta>> {
     check_address(address)?;
+    collect_history(
+        address,
+        since_height,
+        |cursor| {
+            let url = match cursor {
+                None => format!("{BASE_URL}/address/{address}/txs"),
+                Some(txid) => format!("{BASE_URL}/address/{address}/txs/chain/{txid}"),
+            };
+            let page: Vec<RawTx> = ureq::get(&url).call()?.body_mut().read_json()?;
+            Ok(page)
+        },
+        on_progress,
+    )
+}
 
+/// The paging loop behind [`fetch_history`]. `fetch_page` receives the id of
+/// the last transaction of the previous page, or `None` for the first page.
+fn collect_history(
+    address: &str,
+    since_height: u64,
+    mut fetch_page: impl FnMut(Option<&str>) -> Result<Vec<RawTx>>,
+    mut on_progress: impl FnMut(usize),
+) -> Result<Vec<Delta>> {
     let mut deltas = Vec::new();
-    let mut last_seen: Option<String> = None;
+    let mut cursor: Option<String> = None;
 
     loop {
-        let url = match &last_seen {
-            None => format!("{BASE_URL}/address/{address}/txs"),
-            Some(txid) => format!("{BASE_URL}/address/{address}/txs/chain/{txid}"),
-        };
-        let page: Vec<RawTx> = ureq::get(&url).call()?.body_mut().read_json()?;
+        let page = fetch_page(cursor.as_deref())?;
 
-        deltas.extend(page.iter().filter_map(|tx| tx.delta_for(address)));
+        deltas.extend(
+            page.iter()
+                .filter_map(|tx| tx.delta_for(address))
+                .filter(|d| d.height > since_height),
+        );
         on_progress(deltas.len());
 
-        // The first page lists mempool transactions before confirmed ones, so
-        // the cursor is the last confirmed transaction. A page with none ends
-        // the history.
-        match page.iter().rev().find(|tx| tx.is_confirmed()) {
-            Some(tx) => last_seen = Some(tx.txid.clone()),
-            None => break,
+        // The first page lists mempool transactions before confirmed ones,
+        // so the cursor is the last confirmed transaction. A page with none
+        // ends the history.
+        let Some(last) = page.iter().rev().find(|tx| tx.is_confirmed()) else {
+            break;
+        };
+        if last.status.block_height.is_some_and(|h| h <= since_height) {
+            break;
         }
+        cursor = Some(last.txid.clone());
     }
 
     deltas.sort_by_key(|d| d.height);
@@ -239,6 +272,85 @@ mod tests {
                 "status":{{"confirmed":true,"block_height":100,"block_time":2}}}}"#
         ));
         assert_eq!(t.delta_for(ME).map(|d| d.net_sats), Some(625));
+    }
+
+    /// A confirmed transaction paying `ME` in block `height`.
+    fn raw(txid: &str, height: u64) -> RawTx {
+        tx(&format!(
+            r#"{{"txid":"{txid}","fee":0,"vin":[],
+                "vout":[{{"scriptpubkey_address":"{ME}","value":1000}}],
+                "status":{{"confirmed":true,"block_height":{height},"block_time":{height}}}}}"#
+        ))
+    }
+
+    /// Runs `collect_history` over fixed pages and reports how many pages it
+    /// asked for and the heights it returned.
+    fn run(pages: &[&[(&str, u64)]], since: u64) -> (usize, Vec<u64>) {
+        let mut requested = 0;
+        let deltas = collect_history(
+            ME,
+            since,
+            |_| {
+                let page = pages.get(requested).copied().unwrap_or(&[]);
+                requested += 1;
+                Ok(page.iter().map(|(id, h)| raw(id, *h)).collect())
+            },
+            |_| {},
+        )
+        .expect("pages are valid");
+        (requested, deltas.iter().map(|d| d.height).collect())
+    }
+
+    const PAGES: [&[(&str, u64)]; 3] = [
+        &[("f", 6), ("e", 5)],
+        &[("d", 4), ("c", 3)],
+        &[("b", 2), ("a", 1)],
+    ];
+
+    #[test]
+    fn a_full_fetch_reads_every_page_and_sorts_oldest_first() {
+        // After the last full page, one empty page ends the history.
+        assert_eq!(run(&PAGES, 0), (4, vec![1, 2, 3, 4, 5, 6]));
+    }
+
+    #[test]
+    fn paging_stops_at_the_first_page_that_reaches_known_blocks() {
+        // Heights 4 and below are known: the second page reaches them.
+        assert_eq!(run(&PAGES, 4), (2, vec![5, 6]));
+    }
+
+    #[test]
+    fn nothing_new_costs_a_single_request() {
+        assert_eq!(run(&PAGES, 5), (1, vec![6]));
+        assert_eq!(run(&PAGES, 6), (1, vec![]));
+    }
+
+    #[test]
+    fn mempool_transactions_do_not_count_and_do_not_end_paging() {
+        let pending = tx(&format!(
+            r#"{{"txid":"p","fee":0,"vin":[],
+                "vout":[{{"scriptpubkey_address":"{ME}","value":5}}],
+                "status":{{"confirmed":false}}}}"#
+        ));
+        let mut first = vec![pending];
+        first.push(raw("f", 6));
+        let mut calls = 0;
+        let deltas = collect_history(
+            ME,
+            0,
+            |_| {
+                calls += 1;
+                Ok(if calls == 1 {
+                    std::mem::take(&mut first)
+                } else {
+                    vec![]
+                })
+            },
+            |_| {},
+        )
+        .expect("valid");
+        assert_eq!(deltas.len(), 1);
+        assert_eq!(calls, 2);
     }
 
     #[test]
