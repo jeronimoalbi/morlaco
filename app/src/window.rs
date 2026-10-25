@@ -20,8 +20,9 @@ use morlaco_core::portfolio::{self, History, Portfolio};
 use morlaco_core::price::{CachedPrices, MempoolPrices, PriceSource};
 use morlaco_core::util::date_string;
 
+use crate::encryption;
 use crate::format;
-use crate::keys::{self, Keys};
+use crate::keys::{Keyring, Keys, MIN_PASSPHRASE_ONLY_CHARS, Mode, SecretService};
 use crate::migrate;
 use crate::store::{Store, Wallet};
 use crate::unlock;
@@ -464,7 +465,7 @@ impl Ui {
 
         let menu = gio::Menu::new();
         let data = gio::Menu::new();
-        data.append(Some("_Passphrase…"), Some("win.passphrase"));
+        data.append(Some("_Encryption…"), Some("win.encryption"));
         data.append(Some("_Clear Local Data…"), Some("win.clear-data"));
         menu.append_section(None, &data);
         let app_menu = gio::Menu::new();
@@ -570,7 +571,7 @@ impl Ui {
         self.add_action("toggle-privacy", |ui| {
             ui.hide_btn.set_active(!ui.hide_btn.is_active());
         });
-        self.add_action("passphrase", |ui| ui.show_passphrase_dialog());
+        self.add_action("encryption", |ui| ui.show_encryption_dialog());
         self.add_action("clear-data", |ui| ui.confirm_clear_data());
         self.add_action("toggle-sidebar", |ui| {
             ui.split.set_show_sidebar(!ui.split.shows_sidebar());
@@ -773,91 +774,159 @@ impl Ui {
 
     // --- Encryption ------------------------------------------------------
 
-    fn show_passphrase_dialog(self: &Rc<Self>) {
+    fn show_encryption_dialog(self: &Rc<Self>) {
         if self.running.get() > 0 {
             self.toast("Wait for the refresh to finish first");
             return;
         }
-        let has_passphrase = self.state.borrow().keys.has_passphrase();
+        let mode = self.state.borrow().keys.mode();
 
-        let dialog = adw::AlertDialog::new(
-            Some(if has_passphrase {
-                "Change Passphrase"
-            } else {
-                "Set Passphrase"
-            }),
-            Some(
-                "Your data is encrypted with a key kept in your system keyring. A \
-                 passphrase adds a second lock that is asked for every time Morlaco \
-                 starts. If you forget it, the data can’t be recovered.",
-            ),
-        );
-        dialog.add_response("cancel", "_Cancel");
-        if has_passphrase {
-            dialog.add_response("remove", "_Remove Passphrase");
-            dialog.set_response_appearance("remove", adw::ResponseAppearance::Destructive);
-        }
-        dialog.add_response("save", "_Save");
+        let current = match mode {
+            Mode::Keyring => {
+                "Your data is encrypted with a key kept in your system keyring. Nothing \
+                 is asked when Morlaco starts."
+            }
+            Mode::KeyringAndPassphrase => {
+                "Your data is encrypted with a key kept in your system keyring and a \
+                 passphrase that you type every time Morlaco starts."
+            }
+            Mode::PassphraseOnly => {
+                "Your data is encrypted with a passphrase alone, which you type every \
+                 time Morlaco starts."
+            }
+        };
+        let dialog = adw::AlertDialog::new(Some("Encryption"), Some(current));
+        dialog.add_responses(&[("cancel", "_Cancel"), ("save", "_Save")]);
         dialog.set_response_appearance("save", adw::ResponseAppearance::Suggested);
         dialog.set_response_enabled("save", false);
         dialog.set_default_response(Some("save"));
         dialog.set_close_response("cancel");
 
+        let keep_in_keyring = adw::SwitchRow::builder()
+            .title("Keep the key in the keyring")
+            .subtitle("Recommended. Nothing to type unless you add a passphrase.")
+            .active(mode != Mode::PassphraseOnly)
+            .build();
         let new = adw::PasswordEntryRow::builder()
             .title("New passphrase")
             .build();
         let confirm = adw::PasswordEntryRow::builder()
             .title("Confirm passphrase")
             .build();
+        let hint = gtk::Label::builder()
+            .css_classes(["dim-label", "caption"])
+            .wrap(true)
+            .xalign(0.0)
+            .build();
         let fields = boxed_list();
+        fields.append(&keep_in_keyring);
         fields.append(&new);
         fields.append(&confirm);
-        dialog.set_extra_child(Some(&fields));
+        let content = gtk::Box::builder()
+            .orientation(gtk::Orientation::Vertical)
+            .spacing(12)
+            .build();
+        content.append(&fields);
+        content.append(&hint);
+        dialog.set_extra_child(Some(&content));
 
-        // Saving is possible once both fields are filled and match.
-        let validate: Rc<dyn Fn()> = {
-            let (new, confirm, dialog) = (new.clone(), confirm.clone(), dialog.clone());
+        // Saving is possible once the entries make sense, and the hint says
+        // what the current choice means or what is wrong with it.
+        let refresh: Rc<dyn Fn()> = {
+            let (keep, new, confirm, hint, dialog) = (
+                keep_in_keyring.clone(),
+                new.clone(),
+                confirm.clone(),
+                hint.clone(),
+                dialog.clone(),
+            );
             Rc::new(move || {
-                let ok = !new.text().is_empty() && new.text() == confirm.text();
-                dialog.set_response_enabled("save", ok);
+                let keeping = keep.is_active();
+                let checked = encryption::target_from_inputs(keeping, &new.text(), &confirm.text());
+                dialog.set_response_enabled("save", checked.is_ok());
+
+                let untouched = new.text().is_empty() && confirm.text().is_empty();
+                let general = match (keeping, mode) {
+                    (false, _) => format!(
+                        "Without the keyring, your passphrase is the only protection. Use at \
+                         least {MIN_PASSPHRASE_ONLY_CHARS} characters. If you forget it, your \
+                         data can’t be recovered."
+                    ),
+                    (true, Mode::KeyringAndPassphrase) => {
+                        "Leave both fields empty to remove the passphrase.".to_owned()
+                    }
+                    (true, _) => {
+                        "Add a passphrase to also require one every time Morlaco starts.".to_owned()
+                    }
+                };
+                let message = match checked {
+                    Err(problem) if !untouched => problem.to_string(),
+                    _ => general,
+                };
+                hint.set_label(&message);
             })
         };
-        let on_new = validate.clone();
+        let on_new = refresh.clone();
         new.connect_changed(move |_| on_new());
-        confirm.connect_changed(move |_| validate());
+        let on_confirm = refresh.clone();
+        confirm.connect_changed(move |_| on_confirm());
+        let on_switch = refresh.clone();
+        keep_in_keyring.connect_active_notify(move |_| on_switch());
+        refresh();
 
         let ui = self.clone();
-        dialog.connect_response(None, move |_, response| match response {
-            "save" => ui.set_passphrase(Some(new.text().to_string())),
-            "remove" => ui.set_passphrase(None),
-            _ => {}
+        dialog.connect_response(None, move |_, response| {
+            if response != "save" {
+                return;
+            }
+            let target = encryption::target_from_inputs(
+                keep_in_keyring.is_active(),
+                &new.text(),
+                &confirm.text(),
+            );
+            match target {
+                Ok(target) => ui.apply_protection(target),
+                Err(problem) => ui.toast(&problem.to_string()),
+            }
         });
         dialog.present(Some(&self.window));
     }
 
-    fn set_passphrase(self: &Rc<Self>, passphrase: Option<String>) {
+    fn apply_protection(self: &Rc<Self>, target: encryption::Target) {
         // No other connection may use the file while it is re-encrypted.
         if self.running.get() > 0 {
             self.toast("Wait for the refresh to finish first");
             return;
         }
-        let mut state = self.state.borrow_mut();
-        let keys = state.keys.with_passphrase(passphrase);
-        let result = state.store.rekey(&keys.database_key());
-        let message = match result {
-            Ok(()) => {
-                let message = if keys.has_passphrase() {
-                    "Passphrase set"
-                } else {
-                    "Passphrase removed"
-                };
-                state.keys = keys;
-                message.to_owned()
-            }
-            Err(err) => format!("Couldn’t change the passphrase: {err}"),
+        let before = self.state.borrow().keys.clone();
+        let result = {
+            let state = self.state.borrow();
+            encryption::change_protection(&SecretService, &state.keys, target, |key| {
+                state.store.rekey(key).map_err(|e| e.to_string())
+            })
         };
-        drop(state);
-        self.toast(&message);
+
+        match result {
+            Ok(changed) => {
+                let message = if changed.keys == before {
+                    "Nothing changed"
+                } else {
+                    match changed.keys.mode() {
+                        Mode::Keyring => "Your key is now kept in the keyring",
+                        Mode::KeyringAndPassphrase => {
+                            "Your data now needs the keyring and a passphrase"
+                        }
+                        Mode::PassphraseOnly => "Your data now needs a passphrase only",
+                    }
+                };
+                self.state.borrow_mut().keys = changed.keys;
+                self.toast(message);
+                if let Some(warning) = changed.warning {
+                    self.toast(&warning);
+                }
+            }
+            Err(message) => self.toast(&format!("Couldn’t change the encryption: {message}")),
+        }
     }
 
     fn confirm_clear_data(self: &Rc<Self>) {
@@ -894,7 +963,7 @@ impl Ui {
         // The data goes first. If the key then cannot be removed, the next
         // start finds a key and no data and simply begins again, whereas the
         // other order could leave data without its key.
-        if let Err(message) = keys::clear() {
+        if let Err(message) = SecretService.clear() {
             glib::g_warning!("morlaco", "could not remove the key: {message}");
         }
         if let Some(app) = self.window.application() {

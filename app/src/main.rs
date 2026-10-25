@@ -1,9 +1,12 @@
 //! Morlaco: a GNOME app that tracks crypto wallets and estimates gains.
 
+mod encryption;
 mod format;
 mod keys;
 mod migrate;
 mod store;
+#[cfg(test)]
+mod testutil;
 mod unlock;
 mod window;
 

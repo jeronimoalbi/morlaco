@@ -70,12 +70,20 @@ Use the pencil and trash buttons next to a wallet to rename or remove it.
 
 - Everything Morlaco saves (your wallets, their history, prices) lives in one
   file, `~/.local/share/morlaco/morlaco.db`, and it's encrypted.
-- The key is made for you and kept in your system keyring (GNOME Keyring, or
-  any other Secret Service). That means Morlaco needs a keyring to open your
-  data.
-- Want a second lock? Open the main menu and choose **Passphrase…**. Morlaco
-  will then ask for it every time it starts. If you forget it, your saved data
-  can't be recovered.
+- You choose how the key is protected, in the main menu under **Encryption…**:
+  - **Keyring** (the default): Morlaco makes a random key and keeps it in your
+    system keyring (GNOME Keyring, or any other Secret Service). There's
+    nothing to type. Someone who copies the file can't open it without your
+    keyring.
+  - **Keyring and passphrase**: a second lock. Morlaco asks for your
+    passphrase every time it starts, and both are needed.
+  - **Passphrase only**: no keyring at all. This works on computers without
+    one, and the file can move to another computer. The catch is that your data
+    is only as safe as your passphrase, because someone who gets the file can
+    try guesses on their own machine. Use at least 12 characters.
+- No keyring on your computer? Morlaco asks you to choose a passphrase the
+  first time you start it.
+- If you forget a passphrase, your saved data can't be recovered.
 - **Clear Local Data…** in the same menu deletes the file and the key.
 - To read the blockchain and coin prices, Morlaco asks public websites. For
   Bitcoin that's [mempool.space](https://mempool.space). So that site sees
