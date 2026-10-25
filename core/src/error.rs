@@ -29,6 +29,18 @@ pub enum Error {
     /// The database holds a chain this version does not know.
     #[error("the saved data mentions an unknown network: {0}")]
     UnknownChain(String),
+    /// A portfolio was given an empty name.
+    #[error("a portfolio needs a name")]
+    EmptyPortfolioName,
+    /// Another portfolio already has this name.
+    #[error("there is already a portfolio with this name")]
+    PortfolioNameTaken,
+    /// There is no portfolio with this id.
+    #[error("there is no such portfolio")]
+    NoSuchPortfolio,
+    /// Removing the only portfolio would leave wallets with no home.
+    #[error("the last portfolio cannot be removed")]
+    LastPortfolio,
     /// The database was written by version 1, which used a different layout.
     #[error("the saved data uses an older layout")]
     OldFormat,

@@ -20,7 +20,13 @@ use crate::{Error, Result};
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// The layout this version reads and writes.
-const SCHEMA_VERSION: i64 = 2;
+const SCHEMA_VERSION: i64 = 3;
+
+/// The name of the portfolio every database starts with.
+pub const DEFAULT_PORTFOLIO_NAME: &str = "Main";
+
+/// Layout version 2 had no portfolios. Opening such a file adds them.
+const VERSION_WITHOUT_PORTFOLIOS: i64 = 2;
 
 /// Tables of the current layout.
 ///
@@ -33,11 +39,16 @@ const SCHEMA: &str = "
         usd REAL NOT NULL,
         PRIMARY KEY (chain, day)
     );
+    CREATE TABLE portfolios (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        name TEXT NOT NULL UNIQUE COLLATE NOCASE
+    );
     CREATE TABLE wallets (
         position INTEGER PRIMARY KEY AUTOINCREMENT,
         chain TEXT NOT NULL,
         address TEXT NOT NULL,
         label TEXT NOT NULL,
+        portfolio_id INTEGER NOT NULL DEFAULT 1,
         UNIQUE (chain, address)
     );
     CREATE TABLE settings (
@@ -63,6 +74,16 @@ const SCHEMA: &str = "
         address TEXT NOT NULL,
         PRIMARY KEY (chain, address)
     );";
+
+/// What turns a version 2 file into version 3: the portfolios table, with
+/// one portfolio that takes every existing wallet (the column's default points
+/// at it).
+const ADD_PORTFOLIOS: &str = "
+    CREATE TABLE portfolios (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        name TEXT NOT NULL UNIQUE COLLATE NOCASE
+    );
+    ALTER TABLE wallets ADD COLUMN portfolio_id INTEGER NOT NULL DEFAULT 1;";
 
 /// SQLite stores signed 64-bit integers. Heights never get near that limit,
 /// so saturating is only a formality.
@@ -126,6 +147,22 @@ fn check_readable(conn: &Connection) -> Result<()> {
     }
 }
 
+/// Where a copy of a version 2 file is kept before it is upgraded.
+fn upgrade_copy_path(path: &Path) -> PathBuf {
+    path.with_extension("db.v2-backup")
+}
+
+/// Copies the file next to itself before its layout is upgraded, so the
+/// upgrade can be undone by hand. An earlier copy is never overwritten.
+fn keep_copy_before_upgrade(path: &Path) -> Result<()> {
+    let copy = upgrade_copy_path(path);
+    if !copy.exists() {
+        std::fs::copy(path, &copy)?;
+        std::fs::set_permissions(&copy, std::fs::Permissions::from_mode(0o600))?;
+    }
+    Ok(())
+}
+
 fn table_exists(conn: &Connection, name: &str) -> Result<bool> {
     let found = conn
         .query_row(
@@ -144,6 +181,17 @@ pub struct WalletRecord {
     pub id: WalletId,
     /// Name chosen by the user; may be empty.
     pub label: String,
+    /// The [`PortfolioRecord::id`] of the portfolio the wallet is in.
+    pub portfolio: i64,
+}
+
+/// A named group of wallets.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PortfolioRecord {
+    /// Stable identifier. Ids grow, so they also give the creation order.
+    pub id: i64,
+    /// Name chosen by the user.
+    pub name: String,
 }
 
 /// Handle to the database file.
@@ -172,6 +220,10 @@ impl Database {
         let conn = Connection::open(path)?;
         set_pragma_text(&conn, "key", key)?;
         check_readable(&conn)?;
+        let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+        if version == VERSION_WITHOUT_PORTFOLIOS {
+            keep_copy_before_upgrade(path)?;
+        }
         let db = Self::init(conn)?;
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
         Ok(db)
@@ -260,8 +312,24 @@ impl Database {
             return Err(Error::NewerFormat(version));
         } else if version == 0 && !table_exists(&conn, "wallets")? {
             // Brand new file.
-            conn.execute_batch(SCHEMA)?;
-            conn.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION};"))?;
+            let tx = conn.unchecked_transaction()?;
+            tx.execute_batch(SCHEMA)?;
+            tx.execute(
+                "INSERT INTO portfolios (name) VALUES (?1)",
+                params![DEFAULT_PORTFOLIO_NAME],
+            )?;
+            tx.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION};"))?;
+            tx.commit()?;
+        } else if version == VERSION_WITHOUT_PORTFOLIOS {
+            // All or nothing: a failure leaves the file as it was.
+            let tx = conn.unchecked_transaction()?;
+            tx.execute_batch(ADD_PORTFOLIOS)?;
+            tx.execute(
+                "INSERT INTO portfolios (name) VALUES (?1)",
+                params![DEFAULT_PORTFOLIO_NAME],
+            )?;
+            tx.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION};"))?;
+            tx.commit()?;
         } else {
             // Version 1 never set `user_version`, so it reads as 0 with tables.
             return Err(Error::OldFormat);
@@ -301,34 +369,157 @@ impl Database {
     pub fn wallets(&self) -> Result<Vec<WalletRecord>> {
         let mut stmt = self
             .conn
-            .prepare("SELECT chain, address, label FROM wallets ORDER BY position")?;
+            .prepare("SELECT chain, address, label, portfolio_id FROM wallets ORDER BY position")?;
         let rows = stmt
             .query_map([], |r| {
                 Ok((
                     r.get::<_, String>(0)?,
                     r.get::<_, String>(1)?,
                     r.get::<_, String>(2)?,
+                    r.get::<_, i64>(3)?,
                 ))
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
 
         rows.into_iter()
-            .map(|(key, address, label)| {
+            .map(|(key, address, label, portfolio)| {
                 let chain = Chain::from_key(&key).ok_or(Error::UnknownChain(key))?;
                 Ok(WalletRecord {
                     id: WalletId::new(chain, address),
                     label,
+                    portfolio,
                 })
             })
             .collect()
     }
 
-    /// Adds a wallet at the end of the list. Fails if it is already tracked.
+    /// Adds a wallet at the end of the list, in the first portfolio. Fails if
+    /// it is already tracked.
     pub fn add_wallet(&self, wallet: &WalletId, label: &str) -> Result<()> {
+        let first = self.first_portfolio()?;
+        self.add_wallet_to(wallet, label, first)
+    }
+
+    /// Adds a wallet at the end of the list, in `portfolio`. Fails if it is
+    /// already tracked.
+    pub fn add_wallet_to(&self, wallet: &WalletId, label: &str, portfolio: i64) -> Result<()> {
+        self.require_portfolio(portfolio)?;
         self.conn.execute(
-            "INSERT INTO wallets (chain, address, label) VALUES (?1, ?2, ?3)",
-            params![wallet.chain.key(), wallet.address, label],
+            "INSERT INTO wallets (chain, address, label, portfolio_id) VALUES (?1, ?2, ?3, ?4)",
+            params![wallet.chain.key(), wallet.address, label, portfolio],
         )?;
+        Ok(())
+    }
+
+    /// Puts a wallet in another portfolio. Its saved transactions stay.
+    pub fn move_wallet(&self, wallet: &WalletId, portfolio: i64) -> Result<()> {
+        self.require_portfolio(portfolio)?;
+        self.conn.execute(
+            "UPDATE wallets SET portfolio_id = ?3 WHERE chain = ?1 AND address = ?2",
+            params![wallet.chain.key(), wallet.address, portfolio],
+        )?;
+        Ok(())
+    }
+
+    // --- Portfolios ------------------------------------------------------
+
+    /// All portfolios in the order they were created.
+    pub fn portfolios(&self) -> Result<Vec<PortfolioRecord>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT id, name FROM portfolios ORDER BY id")?;
+        let rows = stmt.query_map([], |r| {
+            Ok(PortfolioRecord {
+                id: r.get(0)?,
+                name: r.get(1)?,
+            })
+        })?;
+        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+
+    fn first_portfolio(&self) -> Result<i64> {
+        self.conn
+            .query_row("SELECT min(id) FROM portfolios", [], |r| {
+                r.get::<_, Option<i64>>(0)
+            })?
+            .ok_or(Error::NoSuchPortfolio)
+    }
+
+    fn require_portfolio(&self, id: i64) -> Result<()> {
+        self.conn
+            .query_row(
+                "SELECT 1 FROM portfolios WHERE id = ?1",
+                params![id],
+                |_| Ok(()),
+            )
+            .optional()?
+            .ok_or(Error::NoSuchPortfolio)
+    }
+
+    /// Checks a name the user typed: not empty, and not used by another
+    /// portfolio (`except`), ignoring case. Returns it without surrounding
+    /// spaces.
+    fn clean_portfolio_name(&self, name: &str, except: Option<i64>) -> Result<String> {
+        let name = name.trim();
+        if name.is_empty() {
+            return Err(Error::EmptyPortfolioName);
+        }
+        let taken = self
+            .conn
+            .query_row(
+                "SELECT 1 FROM portfolios WHERE name = ?1 COLLATE NOCASE AND id != ?2",
+                params![name, except.unwrap_or(-1)],
+                |_| Ok(()),
+            )
+            .optional()?;
+        if taken.is_some() {
+            return Err(Error::PortfolioNameTaken);
+        }
+        Ok(name.to_owned())
+    }
+
+    /// Creates a portfolio and returns its id.
+    pub fn add_portfolio(&self, name: &str) -> Result<i64> {
+        let name = self.clean_portfolio_name(name, None)?;
+        self.conn
+            .execute("INSERT INTO portfolios (name) VALUES (?1)", params![name])?;
+        Ok(self.conn.last_insert_rowid())
+    }
+
+    /// Gives a portfolio a new name.
+    pub fn rename_portfolio(&self, id: i64, name: &str) -> Result<()> {
+        self.require_portfolio(id)?;
+        let name = self.clean_portfolio_name(name, Some(id))?;
+        self.conn.execute(
+            "UPDATE portfolios SET name = ?2 WHERE id = ?1",
+            params![id, name],
+        )?;
+        Ok(())
+    }
+
+    /// Removes a portfolio together with its wallets and their saved
+    /// transactions, all or nothing. The last portfolio cannot be removed.
+    pub fn remove_portfolio(&self, id: i64) -> Result<()> {
+        self.require_portfolio(id)?;
+        let count: i64 = self
+            .conn
+            .query_row("SELECT count(*) FROM portfolios", [], |r| r.get(0))?;
+        if count <= 1 {
+            return Err(Error::LastPortfolio);
+        }
+        let tx = self.conn.unchecked_transaction()?;
+        for table in ["txs", "synced"] {
+            tx.execute(
+                &format!(
+                    "DELETE FROM {table} WHERE (chain, address) IN
+                     (SELECT chain, address FROM wallets WHERE portfolio_id = ?1)"
+                ),
+                params![id],
+            )?;
+        }
+        tx.execute("DELETE FROM wallets WHERE portfolio_id = ?1", params![id])?;
+        tx.execute("DELETE FROM portfolios WHERE id = ?1", params![id])?;
+        tx.commit()?;
         Ok(())
     }
 
@@ -863,6 +1054,203 @@ mod tests {
             Database::open(&path, "key"),
             Err(Error::NewerFormat(99))
         ));
+    }
+
+    #[test]
+    fn a_new_database_starts_with_one_portfolio() {
+        let db = db();
+        let portfolios = db.portfolios().expect("list");
+        assert_eq!(portfolios.len(), 1);
+        assert_eq!(portfolios[0].name, DEFAULT_PORTFOLIO_NAME);
+    }
+
+    #[test]
+    fn wallets_are_added_to_a_portfolio_and_can_move() {
+        let db = db();
+        let main = db.portfolios().expect("list")[0].id;
+        let other = db.add_portfolio("Business").expect("create");
+
+        db.add_wallet(&btc("bc1qa"), "").expect("add to the first");
+        db.add_wallet_to(&btc("bc1qb"), "", other).expect("add");
+        let wallets = db.wallets().expect("list");
+        assert_eq!((wallets[0].portfolio, wallets[1].portfolio), (main, other));
+
+        db.move_wallet(&btc("bc1qa"), other).expect("move");
+        assert_eq!(db.wallets().expect("list")[0].portfolio, other);
+
+        assert!(matches!(
+            db.add_wallet_to(&btc("bc1qc"), "", 999),
+            Err(Error::NoSuchPortfolio)
+        ));
+        assert!(matches!(
+            db.move_wallet(&btc("bc1qa"), 999),
+            Err(Error::NoSuchPortfolio)
+        ));
+    }
+
+    #[test]
+    fn portfolio_names_are_trimmed_and_unique_ignoring_case() {
+        let db = db();
+        let id = db.add_portfolio("  Business  ").expect("create");
+        assert_eq!(db.portfolios().expect("list")[1].name, "Business");
+
+        assert!(matches!(
+            db.add_portfolio(""),
+            Err(Error::EmptyPortfolioName)
+        ));
+        assert!(matches!(
+            db.add_portfolio("   "),
+            Err(Error::EmptyPortfolioName)
+        ));
+        assert!(matches!(
+            db.add_portfolio("business"),
+            Err(Error::PortfolioNameTaken)
+        ));
+        assert!(matches!(
+            db.add_portfolio("MAIN"),
+            Err(Error::PortfolioNameTaken)
+        ));
+
+        // Renaming to its own name, only in another case, is fine.
+        db.rename_portfolio(id, "BUSINESS").expect("rename");
+        assert_eq!(db.portfolios().expect("list")[1].name, "BUSINESS");
+        assert!(matches!(
+            db.rename_portfolio(id, "main"),
+            Err(Error::PortfolioNameTaken)
+        ));
+        assert!(matches!(
+            db.rename_portfolio(999, "Anything"),
+            Err(Error::NoSuchPortfolio)
+        ));
+    }
+
+    #[test]
+    fn removing_a_portfolio_removes_its_wallets_and_their_transactions_only() {
+        let db = db();
+        let other = db.add_portfolio("Business").expect("create");
+        db.add_wallet(&btc("bc1qa"), "keep").expect("add");
+        db.add_wallet_to(&btc("bc1qb"), "drop", other).expect("add");
+        db.replace_history_above(&btc("bc1qa"), 0, &[priced("a1", 10)])
+            .expect("save");
+        db.replace_history_above(&btc("bc1qb"), 0, &[priced("b1", 10)])
+            .expect("save");
+
+        db.remove_portfolio(other).expect("remove");
+
+        let left = db.wallets().expect("list");
+        assert_eq!(left.len(), 1);
+        assert_eq!(left[0].id.address, "bc1qa");
+        assert_eq!(db.history(&btc("bc1qa")).expect("history").len(), 1);
+        assert!(db.history(&btc("bc1qb")).expect("history").is_empty());
+        assert!(!db.is_synced(&btc("bc1qb")).expect("synced"));
+        assert_eq!(db.portfolios().expect("list").len(), 1);
+    }
+
+    #[test]
+    fn the_last_portfolio_cannot_be_removed() {
+        let db = db();
+        let only = db.portfolios().expect("list")[0].id;
+        assert!(matches!(
+            db.remove_portfolio(only),
+            Err(Error::LastPortfolio)
+        ));
+        assert!(matches!(
+            db.remove_portfolio(999),
+            Err(Error::NoSuchPortfolio)
+        ));
+    }
+
+    /// The layout version 2 used: wallets, but no portfolios.
+    const V2_SCHEMA: &str = "
+        CREATE TABLE prices (chain TEXT NOT NULL, day INTEGER NOT NULL, usd REAL NOT NULL,
+            PRIMARY KEY (chain, day));
+        CREATE TABLE wallets (position INTEGER PRIMARY KEY AUTOINCREMENT, chain TEXT NOT NULL,
+            address TEXT NOT NULL, label TEXT NOT NULL, UNIQUE (chain, address));
+        CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+        CREATE TABLE txs (chain TEXT NOT NULL, address TEXT NOT NULL, txid TEXT NOT NULL,
+            height INTEGER NOT NULL, idx INTEGER, time INTEGER NOT NULL, amount TEXT NOT NULL,
+            fee TEXT NOT NULL, parents TEXT NOT NULL, price_usd REAL NOT NULL,
+            PRIMARY KEY (chain, address, txid));
+        CREATE TABLE synced (chain TEXT NOT NULL, address TEXT NOT NULL,
+            PRIMARY KEY (chain, address));
+        INSERT INTO wallets (chain, address, label) VALUES ('bitcoin', 'bc1qa', 'First');
+        INSERT INTO wallets (chain, address, label) VALUES ('ethereum', '0xb', 'Second');
+        INSERT INTO txs VALUES ('bitcoin', 'bc1qa', 'tx1', 10, NULL, 1700000000, '1000', '0', '', 30000.0);
+        INSERT INTO synced VALUES ('bitcoin', 'bc1qa');
+        INSERT INTO settings VALUES ('hidden', '1');
+        PRAGMA user_version = 2;";
+
+    fn write_v2_file(path: &Path, key: &str) {
+        let conn = Connection::open(path).expect("create");
+        set_pragma_text(&conn, "key", key).expect("key");
+        conn.execute_batch(V2_SCHEMA).expect("v2 schema");
+    }
+
+    #[test]
+    fn a_version_2_file_gets_one_portfolio_holding_everything() {
+        let dir = TempDir::new("v2");
+        let path = dir.path().join("morlaco.db");
+        write_v2_file(&path, "key");
+
+        let db = Database::open(&path, "key").expect("upgrades");
+        let portfolios = db.portfolios().expect("list");
+        assert_eq!(portfolios.len(), 1);
+        assert_eq!(portfolios[0].name, DEFAULT_PORTFOLIO_NAME);
+
+        let wallets = db.wallets().expect("list");
+        assert_eq!(wallets.len(), 2);
+        assert!(wallets.iter().all(|w| w.portfolio == portfolios[0].id));
+        assert_eq!(wallets[0].label, "First");
+        // Transactions, sync marks and settings are all still there.
+        assert_eq!(db.history(&btc("bc1qa")).expect("history").len(), 1);
+        assert!(db.is_synced(&btc("bc1qa")).expect("synced"));
+        assert_eq!(db.setting("hidden").expect("read").as_deref(), Some("1"));
+        let version: i64 = db
+            .conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .expect("read");
+        assert_eq!(version, SCHEMA_VERSION);
+
+        // New wallets can be added to the upgraded file.
+        db.add_wallet(&btc("bc1qnew"), "").expect("add");
+    }
+
+    #[test]
+    fn upgrading_keeps_a_copy_of_the_old_file_once() {
+        let dir = TempDir::new("v2copy");
+        let path = dir.path().join("morlaco.db");
+        write_v2_file(&path, "key");
+        let before = std::fs::read(&path).expect("read");
+        let copy = dir.path().join("morlaco.db.v2-backup");
+        assert_eq!(copy, upgrade_copy_path(&path));
+
+        drop(Database::open(&path, "key").expect("upgrades"));
+        assert_eq!(std::fs::read(&copy).expect("copy exists"), before);
+        let mode = std::fs::metadata(&copy)
+            .expect("metadata")
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o600);
+
+        // Later opens leave the copy alone, even though the file has changed.
+        let db = Database::open(&path, "key").expect("opens");
+        db.add_wallet(&btc("bc1qnew"), "").expect("change");
+        drop(db);
+        drop(Database::open(&path, "key").expect("opens again"));
+        assert_eq!(std::fs::read(&copy).expect("copy exists"), before);
+    }
+
+    #[test]
+    fn a_version_2_file_is_not_copied_when_the_key_is_wrong() {
+        let dir = TempDir::new("v2wrong");
+        let path = dir.path().join("morlaco.db");
+        write_v2_file(&path, "key");
+
+        assert!(matches!(
+            Database::open(&path, "other"),
+            Err(Error::WrongKey)
+        ));
+        assert!(!dir.path().join("morlaco.db.v2-backup").exists());
     }
 
     /// A directory under the system temp dir that is removed on drop.
