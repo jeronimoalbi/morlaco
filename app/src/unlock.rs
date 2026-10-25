@@ -4,7 +4,7 @@
 //! is shown only when the user must act: a passphrase is required, the
 //! keyring lost the key, or something failed.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
 use gtk::glib;
@@ -18,8 +18,31 @@ use morlaco_core::paths;
 
 use crate::keys::{self, Keys};
 
+/// An open database and what happened while opening it.
+pub struct Unlocked {
+    /// The database.
+    pub db: Database,
+    /// What opened it.
+    pub keys: Keys,
+    /// Where an older database was moved to, if there was one that this
+    /// version cannot read. The new database then starts empty.
+    pub set_aside: Option<PathBuf>,
+}
+
 /// Called once the database is open.
-pub type Ready = Rc<dyn Fn(Database, Keys)>;
+pub type Ready = Rc<dyn Fn(Unlocked)>;
+
+/// Opens the database. A file in the layout of version 1 cannot be read, so
+/// it is renamed out of the way and a fresh database takes its place.
+fn open_database(path: &Path, key: &str) -> Result<(Database, Option<PathBuf>), Error> {
+    match Database::open(path, key) {
+        Err(Error::OldFormat) => {
+            let aside = Database::set_aside_old_format(path)?;
+            Ok((Database::open(path, key)?, Some(aside)))
+        }
+        other => other.map(|db| (db, None)),
+    }
+}
 
 /// Opens the database and calls `ready`, possibly after the user has
 /// entered a passphrase.
@@ -67,8 +90,12 @@ fn open_with_secret(app: &adw::Application, path: PathBuf, secret: String, ready
     if let Err(err) = Database::encrypt_plain_file(&path, &secret) {
         return show_error(app, "Couldn’t Encrypt Your Data", &err.to_string());
     }
-    match Database::open(&path, &secret) {
-        Ok(db) => ready(db, Keys::new(secret, None)),
+    match open_database(&path, &secret) {
+        Ok((db, set_aside)) => ready(Unlocked {
+            db,
+            keys: Keys::new(secret, None),
+            set_aside,
+        }),
         // The secret alone does not open it, so a passphrase was added.
         Err(Error::WrongKey) => show_passphrase_prompt(app, path, secret, ready),
         Err(err) => show_error(app, "Couldn’t Open Your Data", &err.to_string()),
@@ -132,9 +159,13 @@ fn show_passphrase_prompt(app: &adw::Application, path: PathBuf, secret: String,
         Rc::new(move || {
             let passphrase = entry.text().to_string();
             let key = keys::compose(&secret, Some(&passphrase));
-            match Database::open(&path, &key) {
-                Ok(db) => {
-                    ready(db, Keys::new(secret.clone(), Some(passphrase)));
+            match open_database(&path, &key) {
+                Ok((db, set_aside)) => {
+                    ready(Unlocked {
+                        db,
+                        keys: Keys::new(secret.clone(), Some(passphrase)),
+                        set_aside,
+                    });
                     window.close();
                 }
                 Err(Error::WrongKey) => {
@@ -205,9 +236,14 @@ fn show_keyring_lost(app: &adw::Application, path: PathBuf, ready: Ready) {
     window.present();
 }
 
-/// Deletes the database file and its leftovers.
-pub fn delete_database_files(path: &std::path::Path) -> Result<(), String> {
-    for file in [path.to_owned(), path.with_extension("db-journal")] {
+/// Deletes the database file, its journal and any older database that was
+/// set aside.
+pub fn delete_database_files(path: &Path) -> Result<(), String> {
+    for file in [
+        path.to_owned(),
+        path.with_extension("db-journal"),
+        Database::set_aside_path(path),
+    ] {
         match std::fs::remove_file(&file) {
             Ok(()) => {}
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}

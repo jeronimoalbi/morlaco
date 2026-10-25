@@ -7,6 +7,7 @@
 use std::path::Path;
 
 use morlaco_core::Result;
+use morlaco_core::chain::{Chain, WalletId};
 use morlaco_core::paths;
 
 use crate::store::Store;
@@ -66,9 +67,11 @@ fn import_from(
         && let Ok(text) = std::fs::read_to_string(path)
     {
         let legacy = parse(&text);
+        // The old format only knew Bitcoin.
         for (address, label) in &legacy.wallets {
-            if store.position(address).is_none() {
-                store.add(address, label)?;
+            let id = WalletId::new(Chain::Bitcoin, address);
+            if store.position(&id).is_none() {
+                store.add(&id, label)?;
             }
         }
         if legacy.hidden {
@@ -126,11 +129,17 @@ mod tests {
 
         let mut store = Store::open(Database::in_memory().expect("db")).expect("store");
         // Already present: must not be added twice.
-        store.add("bc1qb", "").expect("add");
+        store
+            .add(&WalletId::new(Chain::Bitcoin, "bc1qb"), "")
+            .expect("add");
 
         import_from(&mut store, Some(&wallets), Some(&cache)).expect("import");
 
-        let addresses: Vec<&str> = store.wallets.iter().map(|w| w.address.as_str()).collect();
+        let addresses: Vec<&str> = store
+            .wallets
+            .iter()
+            .map(|w| w.id.address.as_str())
+            .collect();
         assert_eq!(addresses, ["bc1qb", "bc1qa"]);
         assert!(store.hidden);
         assert!(!wallets.exists() && !cache.exists());

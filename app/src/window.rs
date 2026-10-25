@@ -12,7 +12,7 @@ use gtk4 as gtk;
 use libadwaita as adw;
 
 use adw::prelude::*;
-use morlaco_core::chain;
+use morlaco_core::chain::{Chain, WalletId};
 use morlaco_core::db::Database;
 use morlaco_core::lots::Summary;
 use morlaco_core::paths;
@@ -25,8 +25,6 @@ use crate::keys::{self, Keys};
 use crate::migrate;
 use crate::store::{Store, Wallet};
 use crate::unlock;
-
-const EXPLORER_TX_URL: &str = "https://mempool.space/tx/";
 
 /// The app's own symbolic wallet icon, which the Adwaita theme lacks.
 /// See `app/data/icons`.
@@ -45,32 +43,40 @@ enum Selection {
 struct State {
     store: Store,
     selection: Selection,
-    /// Downloaded and priced history by address. Kept so switching views is
+    /// Downloaded and priced history by wallet. Kept so switching views is
     /// instant.
-    histories: HashMap<String, History>,
-    /// BTC/USD from the latest successful load.
-    price_now: Option<f64>,
-    /// Derived from `histories` by [`State::recompute`], by address.
-    portfolios: HashMap<String, Portfolio>,
-    /// Why a wallet failed to load, by address.
-    errors: HashMap<String, String>,
+    histories: HashMap<WalletId, History>,
+    /// USD price of each chain's coin from the latest successful load.
+    prices_now: HashMap<Chain, f64>,
+    /// Derived from `histories` by [`State::recompute`], by wallet.
+    portfolios: HashMap<WalletId, Portfolio>,
+    /// Why a wallet failed to load, by wallet.
+    errors: HashMap<WalletId, String>,
     /// What opens the database; worker threads need it for their own
     /// connections.
     keys: Keys,
 }
 
 impl State {
-    /// Addresses in the current view that are not loaded yet.
-    fn missing_addresses(&self) -> Vec<String> {
+    /// Wallets in the current view that are not loaded yet.
+    fn missing_wallets(&self) -> Vec<WalletId> {
         let wanted: Vec<&Wallet> = match self.selection {
             Selection::Overview => self.store.wallets.iter().collect(),
             Selection::Wallet(i) => self.store.wallets.get(i).into_iter().collect(),
         };
         wanted
             .into_iter()
-            .filter(|w| !self.histories.contains_key(&w.address))
-            .map(|w| w.address.clone())
+            .filter(|w| !self.histories.contains_key(&w.id))
+            .map(|w| w.id.clone())
             .collect()
+    }
+
+    /// Whether `wallets` can all be valued from what is already loaded: each
+    /// has its history and its chain has a price.
+    fn can_show(&self, wallets: &[WalletId]) -> bool {
+        wallets
+            .iter()
+            .all(|w| self.histories.contains_key(w) && self.prices_now.contains_key(&w.chain))
     }
 
     /// Rebuilds every portfolio from the loaded histories.
@@ -79,21 +85,16 @@ impl State {
     /// their original cost basis. Call after any history is added, replaced
     /// or removed.
     fn recompute(&mut self) {
-        let portfolios = match self.price_now {
-            Some(price) => {
-                let loaded: Vec<&History> = self
-                    .store
-                    .wallets
-                    .iter()
-                    .filter_map(|w| self.histories.get(&w.address))
-                    .collect();
-                portfolio::assemble(&loaded, price)
-            }
-            None => Vec::new(),
-        };
+        let loaded: Vec<&History> = self
+            .store
+            .wallets
+            .iter()
+            .filter_map(|w| self.histories.get(&w.id))
+            .collect();
+        let portfolios = portfolio::assemble(&loaded, &self.prices_now);
         self.portfolios = portfolios
             .into_iter()
-            .map(|p| (p.address.clone(), p))
+            .map(|p| (p.wallet.clone(), p))
             .collect();
     }
 }
@@ -193,7 +194,17 @@ impl SummaryView {
         }
     }
 
-    fn update(&self, title: &str, subtitle: &str, s: &Summary, price_usd: f64, hidden: bool) {
+    /// Fills the figures. `coin` describes the one coin all of the figures
+    /// are about; when they mix chains it is `None` and the rows that only
+    /// make sense for a single coin are hidden.
+    fn update(
+        &self,
+        title: &str,
+        subtitle: &str,
+        s: &Summary,
+        coin: Option<CoinFigures>,
+        hidden: bool,
+    ) {
         self.heading.set_label(title);
         self.subtitle.set_label(subtitle);
         self.gain
@@ -203,9 +214,6 @@ impl SummaryView {
         tone(&self.gain, s.unrealized_usd, hidden);
         tone(&self.gain_pct, s.unrealized_usd, hidden);
 
-        self.balance
-            .value
-            .set_label(&format::btc(s.balance_sats, hidden));
         self.value
             .value
             .set_label(&format::usd(s.value_usd, hidden));
@@ -216,8 +224,28 @@ impl SummaryView {
             .value
             .set_label(&format::signed_usd(s.realized_usd, hidden));
         tone(&self.realized.value, s.realized_usd, hidden);
-        self.price.value.set_label(&format::usd(price_usd, false));
+
+        self.balance.row.set_visible(coin.is_some());
+        self.price.row.set_visible(coin.is_some());
+        if let Some(coin) = coin {
+            self.balance
+                .value
+                .set_label(&format::amount(coin.balance_units, coin.chain, hidden));
+            self.price
+                .row
+                .set_title(&format!("{} price", coin.chain.symbol()));
+            self.price
+                .value
+                .set_label(&format::usd(coin.price_usd, false));
+        }
     }
+}
+
+/// The single-coin figures of a summary.
+struct CoinFigures {
+    chain: Chain,
+    balance_units: u128,
+    price_usd: f64,
 }
 
 struct Ui {
@@ -261,18 +289,28 @@ pub fn present(app: &adw::Application) {
     // once it is open.
     unlock::start(
         app,
-        Rc::new(move |db, keys| open_main_window(&main_app, db, keys)),
+        Rc::new(move |unlocked| open_main_window(&main_app, unlocked)),
     );
 }
 
-fn open_main_window(app: &adw::Application, db: Database, keys: Keys) {
-    match open_store(db) {
+fn open_main_window(app: &adw::Application, unlocked: unlock::Unlocked) {
+    match open_store(unlocked.db) {
         Ok(store) => {
-            let ui = Ui::new(app, store, keys);
+            let ui = Ui::new(app, store, unlocked.keys);
             ui.connect_signals();
             ui.rebuild_sidebar();
             ui.start();
             ui.window.present();
+            if let Some(aside) = unlocked.set_aside {
+                ui.toast_until_dismissed(&format!(
+                    "Data from an earlier version can’t be read. It was kept as {} \
+                     and Morlaco starts empty. Add your wallets again.",
+                    aside.file_name().map_or_else(
+                        || aside.display().to_string(),
+                        |n| n.to_string_lossy().into_owned()
+                    )
+                ));
+            }
         }
         Err(message) => unlock::show_error(app, "Couldn’t Open Your Data", &message),
     }
@@ -514,7 +552,7 @@ impl Ui {
                 keys,
                 selection: Selection::Overview,
                 histories: HashMap::new(),
-                price_now: None,
+                prices_now: HashMap::new(),
                 portfolios: HashMap::new(),
                 errors: HashMap::new(),
             }),
@@ -602,6 +640,13 @@ impl Ui {
         self.toasts.add_toast(adw::Toast::new(message));
     }
 
+    /// A message that stays until the user closes it, for things they need
+    /// to notice.
+    fn toast_until_dismissed(&self, message: &str) {
+        self.toasts
+            .add_toast(adw::Toast::builder().title(message).timeout(0).build());
+    }
+
     // --- Sidebar ---------------------------------------------------------
 
     fn rebuild_sidebar(self: &Rc<Self>) {
@@ -614,14 +659,24 @@ impl Ui {
         overview.add_prefix(&gtk::Image::from_icon_name("go-home-symbolic"));
         self.wallet_list.append(&overview);
 
-        for (index, wallet) in self.state.borrow().store.wallets.iter().enumerate() {
+        let state = self.state.borrow();
+        // Naming the network only helps once there is more than one.
+        let show_network = state.store.chains_in_use().len() > 1;
+        for (index, wallet) in state.store.wallets.iter().enumerate() {
             let row = adw::ActionRow::builder()
                 .title(wallet.display_name())
                 .use_markup(false)
                 .activatable(true)
                 .build();
+            let mut subtitle = Vec::new();
+            if show_network {
+                subtitle.push(wallet.id.chain.name().to_owned());
+            }
             if !wallet.label.is_empty() {
-                row.set_subtitle(&format::short_address(&wallet.address));
+                subtitle.push(format::short_address(&wallet.id.address));
+            }
+            if !subtitle.is_empty() {
+                row.set_subtitle(&subtitle.join(" · "));
             }
 
             let rename = gtk::Button::builder()
@@ -645,6 +700,7 @@ impl Ui {
             row.add_suffix(&remove);
             self.wallet_list.append(&row);
         }
+        drop(state);
         self.sync_sidebar_selection();
     }
 
@@ -662,7 +718,7 @@ impl Ui {
     fn show_add_dialog(self: &Rc<Self>) {
         let dialog = adw::AlertDialog::new(
             Some("Add Wallet"),
-            Some("Enter a Bitcoin address to track. Only public blockchain data is read."),
+            Some("Enter an address to track. Only public blockchain data is read."),
         );
         dialog.add_responses(&[("cancel", "_Cancel"), ("add", "_Add")]);
         dialog.set_response_appearance("add", adw::ResponseAppearance::Suggested);
@@ -670,23 +726,50 @@ impl Ui {
         dialog.set_default_response(Some("add"));
         dialog.set_close_response("cancel");
 
+        // The network matters because one address format can exist on
+        // several chains. With a single chain there is nothing to choose.
+        let names: Vec<&str> = Chain::ALL.iter().map(|c| c.name()).collect();
+        let network = adw::ComboRow::builder()
+            .title("Network")
+            .model(&gtk::StringList::new(&names))
+            .visible(Chain::ALL.len() > 1)
+            .build();
         let address = adw::EntryRow::builder().title("Address").build();
         let label = adw::EntryRow::builder().title("Label (optional)").build();
         let fields = boxed_list();
+        fields.append(&network);
         fields.append(&address);
         fields.append(&label);
         dialog.set_extra_child(Some(&fields));
 
-        let dlg = dialog.clone();
-        address.connect_changed(move |entry| {
-            let valid = chain::check_address(entry.text().trim()).is_ok();
-            dlg.set_response_enabled("add", valid);
-        });
+        let chosen_chain = {
+            let network = network.clone();
+            move || {
+                Chain::ALL
+                    .get(network.selected() as usize)
+                    .copied()
+                    .unwrap_or(Chain::Bitcoin)
+            }
+        };
+
+        // Adding is possible once the address looks right for the network.
+        let validate: Rc<dyn Fn()> = {
+            let (address, dialog, chosen_chain) =
+                (address.clone(), dialog.clone(), chosen_chain.clone());
+            Rc::new(move || {
+                let valid = chosen_chain().check_address(address.text().trim()).is_ok();
+                dialog.set_response_enabled("add", valid);
+            })
+        };
+        let on_address = validate.clone();
+        address.connect_changed(move |_| on_address());
+        network.connect_selected_notify(move |_| validate());
 
         let ui = self.clone();
         dialog.connect_response(None, move |_, response| {
             if response == "add" {
-                ui.add_wallet(address.text().trim(), label.text().as_str());
+                let wallet = WalletId::new(chosen_chain(), address.text().trim());
+                ui.add_wallet(&wallet, label.text().as_str());
             }
         });
         dialog.present(Some(&self.window));
@@ -830,7 +913,7 @@ impl Ui {
 
         let dialog = adw::AlertDialog::new(
             Some("Rename Wallet"),
-            Some(&format::short_address(&wallet.address)),
+            Some(&format::short_address(&wallet.id.address)),
         );
         dialog.add_responses(&[("cancel", "_Cancel"), ("save", "_Save")]);
         dialog.set_response_appearance("save", adw::ResponseAppearance::Suggested);
@@ -865,15 +948,15 @@ impl Ui {
         self.render();
     }
 
-    fn add_wallet(self: &Rc<Self>, address: &str, label: &str) {
-        let existing = self.state.borrow().store.position(address);
+    fn add_wallet(self: &Rc<Self>, wallet: &WalletId, label: &str) {
+        let existing = self.state.borrow().store.position(wallet);
         let index = match existing {
             Some(i) => {
                 self.toast("This wallet is already tracked");
                 i
             }
             None => {
-                let added = self.state.borrow_mut().store.add(address, label);
+                let added = self.state.borrow_mut().store.add(wallet, label);
                 match added {
                     Ok(i) => i,
                     Err(err) => {
@@ -890,15 +973,15 @@ impl Ui {
     fn remove_wallet(self: &Rc<Self>, index: usize) {
         let selection = {
             let mut state = self.state.borrow_mut();
-            let address = state.store.wallets.get(index).map(|w| w.address.clone());
+            let removed = state.store.wallets.get(index).map(|w| w.id.clone());
             if let Err(err) = state.store.remove(index) {
                 drop(state);
                 self.toast(&format!("Couldn’t remove the wallet: {err}"));
                 return;
             }
-            if let Some(address) = address {
-                state.histories.remove(&address);
-                state.errors.remove(&address);
+            if let Some(id) = removed {
+                state.histories.remove(&id);
+                state.errors.remove(&id);
             }
             // Wallets that were linked to the removed one now see its
             // transfers as sales and purchases.
@@ -924,7 +1007,7 @@ impl Ui {
             self.split.set_show_sidebar(false);
         }
 
-        let missing = self.missing_addresses();
+        let missing = self.missing_wallets();
         if missing.is_empty() {
             self.show_current();
         } else {
@@ -940,47 +1023,39 @@ impl Ui {
         self.switcher_bar.set_visible(is_wallet);
     }
 
-    /// Addresses in the current view that are not loaded yet.
-    fn missing_addresses(&self) -> Vec<String> {
-        self.state.borrow().missing_addresses()
+    /// Wallets in the current view that are not loaded yet.
+    fn missing_wallets(&self) -> Vec<WalletId> {
+        self.state.borrow().missing_wallets()
     }
 
     /// Reloads everything in the current view, ignoring what is cached.
     fn refresh(self: &Rc<Self>) {
-        let addresses: Vec<String> = {
+        let wallets: Vec<WalletId> = {
             let state = self.state.borrow();
             match state.selection {
-                Selection::Overview => state
-                    .store
-                    .wallets
-                    .iter()
-                    .map(|w| w.address.clone())
-                    .collect(),
+                Selection::Overview => state.store.wallets.iter().map(|w| w.id.clone()).collect(),
                 Selection::Wallet(i) => state
                     .store
                     .wallets
                     .get(i)
-                    .map(|w| w.address.clone())
+                    .map(|w| w.id.clone())
                     .into_iter()
                     .collect(),
             }
         };
-        if !addresses.is_empty() {
-            self.load(addresses);
+        if !wallets.is_empty() {
+            self.load(wallets);
         }
     }
 
-    fn load(self: &Rc<Self>, addresses: Vec<String>) {
+    fn load(self: &Rc<Self>, wallets: Vec<WalletId>) {
         let generation = self.generation.get() + 1;
         self.generation.set(generation);
         self.running.set(self.running.get() + 1);
 
         // With saved data to show, refresh quietly behind it. Otherwise
         // there is nothing to look at yet, so show a loading screen.
-        let background = {
-            let state = self.state.borrow();
-            state.price_now.is_some() && addresses.iter().all(|a| state.histories.contains_key(a))
-        };
+        let background = self.state.borrow().can_show(&wallets);
         if !background {
             self.showing_loading.set(true);
             self.pages.set_visible_child_name("loading");
@@ -991,7 +1066,7 @@ impl Ui {
         self.refresh_spinner.set_spinning(true);
 
         // The worker thread bumps these counters; the main loop reads them.
-        let total = addresses.len();
+        let total = wallets.len();
         let done = Arc::new(AtomicUsize::new(0));
         let txs = Arc::new(AtomicUsize::new(0));
         let label = self.loading_label.clone();
@@ -1013,9 +1088,8 @@ impl Ui {
         let key = self.state.borrow().keys.database_key();
         let ui = self.clone();
         glib::spawn_future_local(async move {
-            let names = addresses.clone();
-            let outcome =
-                gio::spawn_blocking(move || fetch_all(addresses, &key, &done, &txs)).await;
+            let names = wallets.clone();
+            let outcome = gio::spawn_blocking(move || fetch_all(wallets, &key, &done, &txs)).await;
             ticker.remove();
             let fetched =
                 outcome.unwrap_or_else(|_| Fetched::failed(names, "the worker thread crashed"));
@@ -1027,29 +1101,29 @@ impl Ui {
         self.running.set(self.running.get().saturating_sub(1));
         let latest = generation == self.generation.get();
 
-        // Results are always kept: they are keyed by address, so a load that
+        // Results are always kept: they are keyed by wallet, so a load that
         // was overtaken by a newer one is still correct.
         let mut kept_saved_data = None;
         {
             let mut state = self.state.borrow_mut();
-            if let Some(price) = fetched.price_now {
-                state.price_now = Some(price);
-                if let Err(err) = state.store.set_last_price(price) {
+            for (chain, price) in fetched.prices_now {
+                state.prices_now.insert(chain, price);
+                if let Err(err) = state.store.set_last_price(chain, price) {
                     glib::g_warning!("morlaco", "could not save the price: {err}");
                 }
             }
-            for (address, result) in fetched.wallets {
+            for (wallet, result) in fetched.wallets {
                 match result {
                     Ok(history) => {
-                        state.errors.remove(&address);
-                        state.histories.insert(address, history);
+                        state.errors.remove(&wallet);
+                        state.histories.insert(wallet, history);
                     }
                     // A failed refresh must not throw away data we have.
-                    Err(message) if state.histories.contains_key(&address) => {
+                    Err(message) if state.histories.contains_key(&wallet) => {
                         kept_saved_data.get_or_insert(message);
                     }
                     Err(message) => {
-                        state.errors.insert(address, message);
+                        state.errors.insert(wallet, message);
                     }
                 }
             }
@@ -1075,22 +1149,21 @@ impl Ui {
     /// network request.
     fn restore_saved_data(&self) {
         let mut state = self.state.borrow_mut();
-        let addresses: Vec<String> = state
-            .store
-            .wallets
-            .iter()
-            .map(|w| w.address.clone())
-            .collect();
-        for address in addresses {
-            match state.store.saved_history(&address) {
+        let wallets: Vec<WalletId> = state.store.wallets.iter().map(|w| w.id.clone()).collect();
+        for wallet in wallets {
+            match state.store.saved_history(&wallet) {
                 Ok(Some(history)) => {
-                    state.histories.insert(address, history);
+                    state.histories.insert(wallet, history);
                 }
                 Ok(None) => {}
                 Err(err) => glib::g_warning!("morlaco", "could not read saved data: {err}"),
             }
         }
-        state.price_now = state.store.last_price();
+        for chain in Chain::ALL {
+            if let Some(price) = state.store.last_price(*chain) {
+                state.prices_now.insert(*chain, price);
+            }
+        }
         state.recompute();
     }
 
@@ -1102,8 +1175,8 @@ impl Ui {
 
         let ready = {
             let state = self.state.borrow();
-            state.store.wallets.is_empty()
-                || (state.price_now.is_some() && state.missing_addresses().is_empty())
+            let wallets: Vec<WalletId> = state.store.wallets.iter().map(|w| w.id.clone()).collect();
+            wallets.is_empty() || state.can_show(&wallets)
         };
         if ready {
             self.show_current();
@@ -1131,12 +1204,12 @@ impl Ui {
         match state.selection {
             Selection::Overview => self.show_overview(&state, hidden),
             Selection::Wallet(i) => match state.store.wallets.get(i) {
-                Some(wallet) => match state.portfolios.get(&wallet.address) {
+                Some(wallet) => match state.portfolios.get(&wallet.id) {
                     Some(p) => {
                         self.show_wallet(wallet, p, hidden);
                         self.pages.set_visible_child_name("data");
                     }
-                    None => self.show_error(state.errors.get(&wallet.address)),
+                    None => self.show_error(state.errors.get(&wallet.id)),
                 },
                 None => self.pages.set_visible_child_name("empty"),
             },
@@ -1158,7 +1231,7 @@ impl Ui {
 
         let loaded: Vec<(&Wallet, &Portfolio)> = wallets
             .iter()
-            .filter_map(|w| state.portfolios.get(&w.address).map(|p| (w, p)))
+            .filter_map(|w| state.portfolios.get(&w.id).map(|p| (w, p)))
             .collect();
         let Some((_, first)) = loaded.first() else {
             self.show_error(state.errors.values().next());
@@ -1170,8 +1243,19 @@ impl Ui {
             1 => "1 wallet".to_owned(),
             n => format!("{n} wallets"),
         };
+        // Balance and price only make sense when every wallet holds the same
+        // coin.
+        let chain = first.wallet.chain;
+        let coin = loaded
+            .iter()
+            .all(|(w, _)| w.id.chain == chain)
+            .then(|| CoinFigures {
+                chain,
+                balance_units: loaded.iter().map(|(_, p)| p.balance_units).sum(),
+                price_usd: first.price_now_usd,
+            });
         self.overview
-            .update("All Wallets", &count, &total, first.price_now_usd, hidden);
+            .update("All Wallets", &count, &total, coin, hidden);
 
         let failed = wallets.len() - loaded.len();
         self.overview_warning.set_visible(failed > 0);
@@ -1187,9 +1271,9 @@ impl Ui {
                 .use_markup(false)
                 .activatable(true)
                 .build();
-            match state.portfolios.get(&wallet.address) {
+            match state.portfolios.get(&wallet.id) {
                 Some(p) => {
-                    row.set_subtitle(&format::btc(p.summary.balance_sats, hidden));
+                    row.set_subtitle(&format::amount(p.balance_units, wallet.id.chain, hidden));
                     let gain = gtk::Label::builder().css_classes(["numeric"]).build();
                     gain.set_label(&format::signed_usd(p.summary.unrealized_usd, hidden));
                     tone(&gain, p.summary.unrealized_usd, hidden);
@@ -1199,7 +1283,7 @@ impl Ui {
                     row.set_subtitle(
                         state
                             .errors
-                            .get(&wallet.address)
+                            .get(&wallet.id)
                             .map_or("Not loaded", String::as_str),
                     );
                     row.add_css_class("error");
@@ -1225,11 +1309,16 @@ impl Ui {
     }
 
     fn show_wallet(&self, wallet: &Wallet, p: &Portfolio, hidden: bool) {
+        let chain = wallet.id.chain;
         self.holdings.update(
             &wallet.display_name(),
-            &format::short_address(&wallet.address),
+            &format::short_address(&wallet.id.address),
             &p.summary,
-            p.price_now_usd,
+            Some(CoinFigures {
+                chain,
+                balance_units: p.balance_units,
+                price_usd: p.price_now_usd,
+            }),
             hidden,
         );
 
@@ -1245,7 +1334,7 @@ impl Ui {
         for lot in &p.lots {
             let pl = lot.unrealized_usd(p.price_now_usd);
             let row = adw::ActionRow::builder()
-                .title(format::btc(lot.sats, hidden))
+                .title(format::amount(lot.units, chain, hidden))
                 .subtitle(format!(
                     "Acquired {} at {}",
                     date_string(lot.time),
@@ -1261,28 +1350,31 @@ impl Ui {
 
         clear(&self.history_list);
         for entry in p.history.iter().rev() {
-            let delta = &entry.delta;
-            let kind = if entry.internal_sats > 0 {
+            let activity = &entry.activity;
+            let kind = if entry.internal_units > 0 {
                 "Transfer between your wallets · "
             } else {
                 ""
             };
             let row = adw::ActionRow::builder()
-                .title(date_string(delta.time))
+                .title(date_string(activity.time))
                 .subtitle(format!(
-                    "{kind}{} · BTC at {}",
-                    format::short_address(&delta.txid),
+                    "{kind}{} · {} at {}",
+                    format::short_address(&activity.txid),
+                    chain.symbol(),
                     format::usd(entry.price_usd, false)
                 ))
                 .use_markup(false)
                 .activatable(true)
                 .build();
             let label = gtk::Label::builder().css_classes(["numeric"]).build();
-            label.set_label(&format::signed_btc(delta.net_sats, hidden));
-            tone(&label, delta.net_sats as f64, hidden);
+            // What the balance changed by, which includes the fee.
+            let change = activity.amount - activity.fee as i128;
+            label.set_label(&format::signed_amount(change, chain, hidden));
+            tone(&label, change as f64, hidden);
             row.add_suffix(&label);
 
-            let uri = format!("{EXPLORER_TX_URL}{}", delta.txid);
+            let uri = chain.explorer_tx_url(&activity.txid);
             row.connect_activated(move |_| {
                 // Opening a browser can fail on a headless system; nothing to recover.
                 let _ = gio::AppInfo::launch_default_for_uri(&uri, None::<&gio::AppLaunchContext>);
@@ -1293,59 +1385,68 @@ impl Ui {
 }
 
 /// One wallet's outcome from the worker thread.
-type WalletResult = (String, Result<History, String>);
+type WalletResult = (WalletId, Result<History, String>);
 
 /// What a load brings back.
 struct Fetched {
-    /// Current BTC/USD, or `None` when it could not be read, in which case
-    /// every wallet is marked as failed because nothing can be valued.
-    price_now: Option<f64>,
+    /// Current USD price of each chain's coin that could be read.
+    prices_now: HashMap<Chain, f64>,
     wallets: Vec<WalletResult>,
 }
 
 impl Fetched {
-    fn failed(addresses: Vec<String>, message: &str) -> Self {
+    fn failed(wallets: Vec<WalletId>, message: &str) -> Self {
         Self {
-            price_now: None,
-            wallets: addresses
+            prices_now: HashMap::new(),
+            wallets: wallets
                 .into_iter()
-                .map(|a| (a, Err(message.to_owned())))
+                .map(|w| (w, Err(message.to_owned())))
                 .collect(),
         }
     }
 }
 
-/// Reads blockchain data and prices for each address. Runs on a worker thread.
+/// Reads blockchain data and prices for each wallet. Runs on a worker thread.
 ///
 /// `done` counts finished wallets and `txs` the transactions fetched so far
-/// for the current one.
-fn fetch_all(addresses: Vec<String>, key: &str, done: &AtomicUsize, txs: &AtomicUsize) -> Fetched {
+/// for the current one. A wallet whose chain price cannot be read fails,
+/// because nothing can be valued without it.
+fn fetch_all(wallets: Vec<WalletId>, key: &str, done: &AtomicUsize, txs: &AtomicUsize) -> Fetched {
     let cache = match open_database(key) {
         Ok(cache) => cache,
-        Err(message) => return Fetched::failed(addresses, &message),
+        Err(message) => return Fetched::failed(wallets, &message),
     };
     let prices = CachedPrices::new(MempoolPrices, &cache);
-    let price_now = match prices.usd_now() {
-        Ok(price) => price,
-        Err(err) => return Fetched::failed(addresses, &err.to_string()),
-    };
 
-    let wallets = addresses
+    // One price lookup per chain, however many wallets it has.
+    let mut now: HashMap<Chain, Result<f64, String>> = HashMap::new();
+    for wallet in &wallets {
+        now.entry(wallet.chain)
+            .or_insert_with(|| prices.usd_now(wallet.chain).map_err(|e| e.to_string()));
+    }
+
+    let results = wallets
         .into_iter()
-        .map(|address| {
+        .map(|wallet| {
             txs.store(0, Ordering::Relaxed);
-            let result = portfolio::fetch(&address, &prices, &cache, |n| {
-                txs.store(n, Ordering::Relaxed)
-            })
-            .map_err(|e| e.to_string());
+            let result = match &now[&wallet.chain] {
+                Ok(_) => portfolio::fetch(&wallet, &prices, &cache, |n| {
+                    txs.store(n, Ordering::Relaxed)
+                })
+                .map_err(|e| e.to_string()),
+                Err(message) => Err(message.clone()),
+            };
             done.fetch_add(1, Ordering::Relaxed);
-            (address, result)
+            (wallet, result)
         })
         .collect();
 
     Fetched {
-        price_now: Some(price_now),
-        wallets,
+        prices_now: now
+            .into_iter()
+            .filter_map(|(chain, price)| price.ok().map(|p| (chain, p)))
+            .collect(),
+        wallets: results,
     }
 }
 

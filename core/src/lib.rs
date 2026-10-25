@@ -4,6 +4,7 @@
 //! [`portfolio::fetch`], values them together with [`portfolio::assemble`]
 //! and renders the resulting [`portfolio::Portfolio`] values.
 
+pub mod backend;
 pub mod chain;
 pub mod db;
 mod error;

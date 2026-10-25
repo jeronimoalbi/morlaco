@@ -1,7 +1,7 @@
 //! Display formatting. Every amount goes through here so privacy mode can
 //! mask it in one place.
 
-use morlaco_core::lots::SATS_PER_BTC;
+use morlaco_core::chain::Chain;
 
 /// Shown in place of any masked number.
 pub const MASK: &str = "•••••";
@@ -58,22 +58,35 @@ pub fn percent(pct: Option<f64>, hidden: bool) -> String {
     }
 }
 
-/// Bitcoin amount from sats, e.g. `0.52000000 BTC`.
-pub fn btc(sats: u64, hidden: bool) -> String {
+/// Most decimals shown for a coin amount. Bitcoin has 8; chains with more
+/// (18 for Ethereum) are rounded to keep amounts readable.
+const MAX_SHOWN_DECIMALS: u8 = 8;
+
+fn coins_text(units: u128, chain: Chain) -> String {
+    let decimals = usize::from(chain.decimals().min(MAX_SHOWN_DECIMALS));
+    format!("{:.*}", decimals, chain.to_coins(units))
+}
+
+/// Amount of a chain's coin from its smallest units, e.g. `0.52000000 BTC`.
+pub fn amount(units: u128, chain: Chain, hidden: bool) -> String {
     if hidden {
         MASK.to_owned()
     } else {
-        format!("{:.8} BTC", sats as f64 / SATS_PER_BTC)
+        format!("{} {}", coins_text(units, chain), chain.symbol())
     }
 }
 
-/// Bitcoin amount with an explicit sign.
-pub fn signed_btc(sats: i64, hidden: bool) -> String {
+/// Amount with an explicit sign.
+pub fn signed_amount(units: i128, chain: Chain, hidden: bool) -> String {
     if hidden {
         MASK.to_owned()
     } else {
-        let sign = if sats < 0 { "−" } else { "+" };
-        format!("{sign}{:.8} BTC", sats.unsigned_abs() as f64 / SATS_PER_BTC)
+        let sign = if units < 0 { "−" } else { "+" };
+        format!(
+            "{sign}{} {}",
+            coins_text(units.unsigned_abs(), chain),
+            chain.symbol()
+        )
     }
 }
 
@@ -116,10 +129,11 @@ mod tests {
     }
 
     #[test]
-    fn btc_formats() {
-        assert_eq!(btc(52_000_000, false), "0.52000000 BTC");
-        assert_eq!(signed_btc(-30_200, false), "−0.00030200 BTC");
-        assert_eq!(signed_btc(10_000, false), "+0.00010000 BTC");
+    fn amount_formats() {
+        let btc = Chain::Bitcoin;
+        assert_eq!(amount(52_000_000, btc, false), "0.52000000 BTC");
+        assert_eq!(signed_amount(-30_200, btc, false), "−0.00030200 BTC");
+        assert_eq!(signed_amount(10_000, btc, false), "+0.00010000 BTC");
     }
 
     #[test]
@@ -128,8 +142,8 @@ mod tests {
         assert_eq!(signed_usd(-1.0, true), MASK);
         assert_eq!(percent(Some(5.0), true), MASK);
         assert_eq!(percent(None, true), MASK);
-        assert_eq!(btc(1, true), MASK);
-        assert_eq!(signed_btc(-1, true), MASK);
+        assert_eq!(amount(1, Chain::Bitcoin, true), MASK);
+        assert_eq!(signed_amount(-1, Chain::Bitcoin, true), MASK);
     }
 
     #[test]

@@ -16,6 +16,18 @@ pub enum Error {
     /// The local database failed.
     #[error("database error: {0}")]
     Database(#[from] rusqlite::Error),
+    /// No price source covers this chain.
+    #[error("no price source for {0}")]
+    UnsupportedChain(&'static str),
+    /// The database holds a chain this version does not know.
+    #[error("the saved data mentions an unknown network: {0}")]
+    UnknownChain(String),
+    /// The database was written by version 1, which used a different layout.
+    #[error("the saved data uses an older layout")]
+    OldFormat,
+    /// The database was written by a newer version of Morlaco.
+    #[error("the saved data was written by a newer version of Morlaco (layout {0})")]
+    NewerFormat(i64),
     /// The key does not open the database file.
     #[error("the database could not be unlocked with this key")]
     WrongKey,

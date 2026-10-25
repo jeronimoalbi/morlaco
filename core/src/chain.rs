@@ -1,362 +1,263 @@
-//! Bitcoin address history from the mempool.space (Esplora) API.
+//! Chains, and what a chain reports about an address.
+//!
+//! A [`Chain`] says how to read and display one network's native coin. A
+//! [`ChainBackend`] fetches an address's history and reports it as
+//! [`Activity`] values, which is all the rest of the crate knows about a
+//! chain.
+//!
+//! # Adding a chain
+//!
+//! 1. Add a [`Chain`] variant. The compiler then lists every `match` that
+//!    needs an arm: key, name, symbol, decimals, address check, explorer URL
+//!    and backend.
+//! 2. Implement [`ChainBackend`] in `backend/`. Networks that work alike
+//!    (Ethereum, BNB Smart Chain, Polygon, …) can share one backend that is
+//!    configured per network.
+//! 3. Teach a [`PriceSource`](crate::price::PriceSource) the new chain.
+//!
+//! Tokens are not supported yet: a wallet holds only its chain's native coin.
 
-use serde::Deserialize;
-
+use crate::backend::bitcoin::BitcoinBackend;
 use crate::{Error, Result};
 
-const BASE_URL: &str = "https://mempool.space/api";
+/// A blockchain network whose native coin can be tracked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum Chain {
+    /// Bitcoin.
+    Bitcoin,
+    /// A second chain with 18 decimals, so tests can cover several chains.
+    #[cfg(test)]
+    Fake,
+}
 
-/// The effect of one confirmed transaction on a single address.
+impl Chain {
+    /// Every chain the app can track.
+    pub const ALL: &'static [Chain] = &[Chain::Bitcoin];
+
+    /// Stable identifier used when saving data.
+    pub fn key(self) -> &'static str {
+        match self {
+            Chain::Bitcoin => "bitcoin",
+            #[cfg(test)]
+            Chain::Fake => "fake",
+        }
+    }
+
+    /// The chain with this [`key`](Self::key).
+    pub fn from_key(key: &str) -> Option<Chain> {
+        match key {
+            "bitcoin" => Some(Chain::Bitcoin),
+            #[cfg(test)]
+            "fake" => Some(Chain::Fake),
+            _ => None,
+        }
+    }
+
+    /// Display name of the network.
+    pub fn name(self) -> &'static str {
+        match self {
+            Chain::Bitcoin => "Bitcoin",
+            #[cfg(test)]
+            Chain::Fake => "Fake Chain",
+        }
+    }
+
+    /// Ticker of the native coin.
+    pub fn symbol(self) -> &'static str {
+        match self {
+            Chain::Bitcoin => "BTC",
+            #[cfg(test)]
+            Chain::Fake => "FAKE",
+        }
+    }
+
+    /// Decimal places of the native coin: how many of its smallest units
+    /// make one coin (10^decimals).
+    pub fn decimals(self) -> u8 {
+        match self {
+            Chain::Bitcoin => 8,
+            #[cfg(test)]
+            Chain::Fake => 18,
+        }
+    }
+
+    /// Converts smallest units to whole coins. Precision beyond what a
+    /// float holds is dropped, which is fine for display and valuation.
+    pub fn to_coins(self, units: u128) -> f64 {
+        units as f64 / 10f64.powi(i32::from(self.decimals()))
+    }
+
+    /// Checks that `address` is plausible before it is sent anywhere.
+    ///
+    /// This is a cheap shape check, not a checksum validation; a backend
+    /// reports addresses the network rejects as [`Error::InvalidAddress`].
+    pub fn check_address(self, address: &str) -> Result<()> {
+        let plausible = match self {
+            Chain::Bitcoin => {
+                (14..=90).contains(&address.len())
+                    && address.chars().all(|c| c.is_ascii_alphanumeric())
+            }
+            #[cfg(test)]
+            Chain::Fake => !address.is_empty(),
+        };
+        if plausible {
+            Ok(())
+        } else {
+            Err(Error::InvalidAddress)
+        }
+    }
+
+    /// Link to a transaction in a block explorer.
+    pub fn explorer_tx_url(self, txid: &str) -> String {
+        match self {
+            Chain::Bitcoin => format!("https://mempool.space/tx/{txid}"),
+            #[cfg(test)]
+            Chain::Fake => format!("https://fake.example/tx/{txid}"),
+        }
+    }
+
+    /// The code that reads this chain.
+    pub fn backend(self) -> &'static dyn ChainBackend {
+        match self {
+            Chain::Bitcoin => &BitcoinBackend,
+            #[cfg(test)]
+            Chain::Fake => &FakeBackend,
+        }
+    }
+}
+
+/// Identifies a tracked wallet: an address on a chain.
+///
+/// The same text can be a valid address on several chains (Ethereum and BNB
+/// Smart Chain share one format), so the chain is part of the identity.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct WalletId {
+    /// The network.
+    pub chain: Chain,
+    /// The address on that network.
+    pub address: String,
+}
+
+impl WalletId {
+    /// Creates an id.
+    pub fn new(chain: Chain, address: impl Into<String>) -> Self {
+        Self {
+            chain,
+            address: address.into(),
+        }
+    }
+}
+
+/// What one confirmed transaction did to one wallet, in the chain's smallest
+/// unit.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Delta {
+pub struct Activity {
     /// Transaction id.
     pub txid: String,
     /// Block height, used to order transactions.
     pub height: u64,
+    /// Position inside the block, where the chain defines one. Orders
+    /// transactions that share a block.
+    pub index: Option<u32>,
     /// Block time as a Unix timestamp.
     pub time: i64,
-    /// Sats received minus sats spent by the address. Negative when the
-    /// address paid out.
-    pub net_sats: i64,
-    /// Share of the network fee paid by this address: all of it when the
-    /// address funded the whole transaction, none when it funded nothing.
-    pub fee_sats: u64,
-    /// Ids of the transactions whose outputs this one spends. Lets
-    /// transactions in the same block be put in spending order.
+    /// Coins received minus coins sent, **not** counting the fee. Negative
+    /// when the wallet paid out.
+    pub amount: i128,
+    /// What the wallet paid in fees for this transaction, on top of
+    /// `amount`. Zero for a wallet that funded nothing.
+    pub fee: u128,
+    /// Ids of the transactions whose outputs this one spends, on chains
+    /// where that is meaningful. Lets transactions in one block be put in
+    /// spending order.
     pub parents: Vec<String>,
 }
 
-#[derive(Debug, Deserialize)]
-struct RawTx {
-    txid: String,
-    vin: Vec<RawVin>,
-    vout: Vec<RawOutput>,
-    fee: u64,
-    status: RawStatus,
+/// Reads one chain's history.
+pub trait ChainBackend: Sync {
+    /// The chain this backend reads.
+    fn chain(&self) -> Chain;
+
+    /// Downloads the confirmed activity of `address` in blocks above
+    /// `since_height`, oldest first. Pass 0 for the full history.
+    ///
+    /// `on_progress` is called while paging with the number of activities
+    /// found so far.
+    fn fetch(
+        &self,
+        address: &str,
+        since_height: u64,
+        on_progress: &mut dyn FnMut(usize),
+    ) -> Result<Vec<Activity>>;
 }
 
-#[derive(Debug, Deserialize)]
-struct RawVin {
-    /// Id of the transaction being spent.
-    #[serde(default)]
-    txid: String,
-    /// Absent for coinbase inputs.
-    prevout: Option<RawOutput>,
-}
+/// Backend of the test-only chain: it never has any history.
+#[cfg(test)]
+struct FakeBackend;
 
-#[derive(Debug, Deserialize)]
-struct RawOutput {
-    /// Absent for outputs without an address, such as OP_RETURN.
-    scriptpubkey_address: Option<String>,
-    value: u64,
-}
-
-#[derive(Debug, Deserialize)]
-struct RawStatus {
-    confirmed: bool,
-    block_height: Option<u64>,
-    block_time: Option<i64>,
-}
-
-impl RawTx {
-    fn is_confirmed(&self) -> bool {
-        self.status.confirmed
+#[cfg(test)]
+impl ChainBackend for FakeBackend {
+    fn chain(&self) -> Chain {
+        Chain::Fake
     }
 
-    /// Returns the effect on `address`, or `None` for unconfirmed
-    /// transactions and transactions that do not touch the address.
-    fn delta_for(&self, address: &str) -> Option<Delta> {
-        let time = self.status.block_time.filter(|_| self.is_confirmed())?;
-        let height = self.status.block_height?;
-        let pays_to = |o: &RawOutput| o.scriptpubkey_address.as_deref() == Some(address);
-
-        let received: u64 = self
-            .vout
-            .iter()
-            .filter(|o| pays_to(o))
-            .map(|o| o.value)
-            .sum();
-        let spent: u64 = self
-            .vin
-            .iter()
-            .filter_map(|i| i.prevout.as_ref())
-            .filter(|o| pays_to(o))
-            .map(|o| o.value)
-            .sum();
-
-        if received == 0 && spent == 0 {
-            return None;
-        }
-
-        // When other parties fund part of the inputs, the fee is split in
-        // proportion to what each side put in.
-        let total_in: u64 = self
-            .vin
-            .iter()
-            .filter_map(|i| i.prevout.as_ref())
-            .map(|o| o.value)
-            .sum();
-        let fee_sats = if spent > 0 && total_in > 0 {
-            (u128::from(self.fee) * u128::from(spent) / u128::from(total_in)) as u64
-        } else {
-            0
-        };
-
-        Some(Delta {
-            txid: self.txid.clone(),
-            height,
-            time,
-            net_sats: received as i64 - spent as i64,
-            fee_sats,
-            parents: self.vin.iter().map(|i| i.txid.clone()).collect(),
-        })
+    fn fetch(&self, _: &str, _: u64, _: &mut dyn FnMut(usize)) -> Result<Vec<Activity>> {
+        Ok(Vec::new())
     }
-}
-
-/// Checks that `address` looks plausible before it is put in a URL.
-///
-/// This is not a checksum validation; the API rejects bad addresses with
-/// HTTP 400, which maps to [`Error::InvalidAddress`].
-pub fn check_address(address: &str) -> Result<()> {
-    let plausible =
-        (14..=90).contains(&address.len()) && address.chars().all(|c| c.is_ascii_alphanumeric());
-    if plausible {
-        Ok(())
-    } else {
-        Err(Error::InvalidAddress)
-    }
-}
-
-/// Downloads the confirmed transactions of `address` in blocks above
-/// `since_height`, oldest first. Pass 0 for the full history.
-///
-/// Pages arrive newest first, so paging stops as soon as a page reaches a
-/// block at or below `since_height`.
-///
-/// `on_progress` is called after each page with the number of transactions
-/// found so far. Unconfirmed transactions are skipped because they have no
-/// block time to price.
-pub fn fetch_history(
-    address: &str,
-    since_height: u64,
-    on_progress: impl FnMut(usize),
-) -> Result<Vec<Delta>> {
-    check_address(address)?;
-    collect_history(
-        address,
-        since_height,
-        |cursor| {
-            let url = match cursor {
-                None => format!("{BASE_URL}/address/{address}/txs"),
-                Some(txid) => format!("{BASE_URL}/address/{address}/txs/chain/{txid}"),
-            };
-            let page: Vec<RawTx> = ureq::get(&url).call()?.body_mut().read_json()?;
-            Ok(page)
-        },
-        on_progress,
-    )
-}
-
-/// The paging loop behind [`fetch_history`]. `fetch_page` receives the id of
-/// the last transaction of the previous page, or `None` for the first page.
-fn collect_history(
-    address: &str,
-    since_height: u64,
-    mut fetch_page: impl FnMut(Option<&str>) -> Result<Vec<RawTx>>,
-    mut on_progress: impl FnMut(usize),
-) -> Result<Vec<Delta>> {
-    let mut deltas = Vec::new();
-    let mut cursor: Option<String> = None;
-
-    loop {
-        let page = fetch_page(cursor.as_deref())?;
-
-        deltas.extend(
-            page.iter()
-                .filter_map(|tx| tx.delta_for(address))
-                .filter(|d| d.height > since_height),
-        );
-        on_progress(deltas.len());
-
-        // The first page lists mempool transactions before confirmed ones,
-        // so the cursor is the last confirmed transaction. A page with none
-        // ends the history.
-        let Some(last) = page.iter().rev().find(|tx| tx.is_confirmed()) else {
-            break;
-        };
-        if last.status.block_height.is_some_and(|h| h <= since_height) {
-            break;
-        }
-        cursor = Some(last.txid.clone());
-    }
-
-    deltas.sort_by_key(|d| d.height);
-    Ok(deltas)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    const ME: &str = "bc1qme00000000000000000000000000000000";
-    const OTHER: &str = "bc1qother000000000000000000000000000";
-
-    fn tx(json: &str) -> RawTx {
-        serde_json::from_str(json).expect("fixture is valid JSON")
+    #[test]
+    fn keys_round_trip_for_every_chain() {
+        for chain in [Chain::Bitcoin, Chain::Fake] {
+            assert_eq!(Chain::from_key(chain.key()), Some(chain));
+        }
+        assert_eq!(Chain::from_key("dogecoin"), None);
     }
 
     #[test]
-    fn incoming_payment_is_positive_with_no_fee() {
-        let t = tx(&format!(
-            r#"{{"txid":"a","fee":300,
-                "vin":[{{"prevout":{{"scriptpubkey_address":"{OTHER}","value":10300}}}}],
-                "vout":[{{"scriptpubkey_address":"{ME}","value":10000}}],
-                "status":{{"confirmed":true,"block_height":100,"block_time":1700000000}}}}"#
-        ));
-        let d = t.delta_for(ME).expect("touches address");
-        assert_eq!((d.net_sats, d.fee_sats, d.time), (10_000, 0, 1_700_000_000));
+    fn every_listed_chain_has_a_matching_backend() {
+        for chain in Chain::ALL {
+            assert_eq!(chain.backend().chain(), *chain);
+        }
     }
 
     #[test]
-    fn outgoing_payment_nets_out_change_and_carries_the_fee() {
-        let t = tx(&format!(
-            r#"{{"txid":"b","fee":200,
-                "vin":[{{"prevout":{{"scriptpubkey_address":"{ME}","value":50000}}}}],
-                "vout":[{{"scriptpubkey_address":"{OTHER}","value":30000}},
-                        {{"scriptpubkey_address":"{ME}","value":19800}}],
-                "status":{{"confirmed":true,"block_height":100,"block_time":1700000100}}}}"#
-        ));
-        let d = t.delta_for(ME).expect("touches address");
-        assert_eq!((d.net_sats, d.fee_sats), (-30_200, 200));
+    fn units_convert_to_coins_by_decimals() {
+        assert_eq!(Chain::Bitcoin.to_coins(150_000_000), 1.5);
+        // 2.5 coins of an 18-decimals chain; larger than u64::MAX units.
+        let units = 2_500_000_000_000_000_000_u128;
+        assert!(units > u128::from(u64::MAX) / 10);
+        assert_eq!(Chain::Fake.to_coins(units), 2.5);
     }
 
     #[test]
-    fn fee_is_split_when_others_fund_part_of_the_inputs() {
-        // ME puts in 30,000 of 40,000; the 400 sat fee is split 300 / 100.
-        let t = tx(&format!(
-            r#"{{"txid":"f","fee":400,
-                "vin":[{{"txid":"p1","prevout":{{"scriptpubkey_address":"{ME}","value":30000}}}},
-                       {{"txid":"p2","prevout":{{"scriptpubkey_address":"{OTHER}","value":10000}}}}],
-                "vout":[{{"scriptpubkey_address":"{OTHER}","value":39600}}],
-                "status":{{"confirmed":true,"block_height":7,"block_time":3}}}}"#
-        ));
-        let d = t.delta_for(ME).expect("touches address");
-        assert_eq!((d.net_sats, d.fee_sats, d.height), (-30_000, 300, 7));
-        assert_eq!(d.parents, vec!["p1", "p2"]);
+    fn implausible_bitcoin_addresses_are_rejected() {
+        let btc = Chain::Bitcoin;
+        assert!(btc.check_address("").is_err());
+        assert!(btc.check_address("not an address!!!!!").is_err());
+        assert!(
+            btc.check_address("bc1qar0srrr7xfkvy5l643lydnw9re59gtzzwf5mdq")
+                .is_ok()
+        );
     }
 
     #[test]
-    fn unconfirmed_and_unrelated_transactions_are_skipped() {
-        let pending = tx(&format!(
-            r#"{{"txid":"c","fee":1,"vin":[],
-                "vout":[{{"scriptpubkey_address":"{ME}","value":5}}],
-                "status":{{"confirmed":false}}}}"#
-        ));
-        assert!(pending.delta_for(ME).is_none());
-
-        let unrelated = tx(&format!(
-            r#"{{"txid":"d","fee":1,"vin":[],
-                "vout":[{{"scriptpubkey_address":"{OTHER}","value":5}}],
-                "status":{{"confirmed":true,"block_height":100,"block_time":1}}}}"#
-        ));
-        assert!(unrelated.delta_for(ME).is_none());
+    fn explorer_links_use_the_chain_explorer() {
+        assert_eq!(
+            Chain::Bitcoin.explorer_tx_url("abc"),
+            "https://mempool.space/tx/abc"
+        );
     }
 
     #[test]
-    fn coinbase_inputs_and_op_return_outputs_parse() {
-        let t = tx(&format!(
-            r#"{{"txid":"e","fee":0,
-                "vin":[{{"prevout":null}}],
-                "vout":[{{"scriptpubkey_address":"{ME}","value":625}},
-                        {{"value":0}}],
-                "status":{{"confirmed":true,"block_height":100,"block_time":2}}}}"#
-        ));
-        assert_eq!(t.delta_for(ME).map(|d| d.net_sats), Some(625));
-    }
-
-    /// A confirmed transaction paying `ME` in block `height`.
-    fn raw(txid: &str, height: u64) -> RawTx {
-        tx(&format!(
-            r#"{{"txid":"{txid}","fee":0,"vin":[],
-                "vout":[{{"scriptpubkey_address":"{ME}","value":1000}}],
-                "status":{{"confirmed":true,"block_height":{height},"block_time":{height}}}}}"#
-        ))
-    }
-
-    /// Runs `collect_history` over fixed pages and reports how many pages it
-    /// asked for and the heights it returned.
-    fn run(pages: &[&[(&str, u64)]], since: u64) -> (usize, Vec<u64>) {
-        let mut requested = 0;
-        let deltas = collect_history(
-            ME,
-            since,
-            |_| {
-                let page = pages.get(requested).copied().unwrap_or(&[]);
-                requested += 1;
-                Ok(page.iter().map(|(id, h)| raw(id, *h)).collect())
-            },
-            |_| {},
-        )
-        .expect("pages are valid");
-        (requested, deltas.iter().map(|d| d.height).collect())
-    }
-
-    const PAGES: [&[(&str, u64)]; 3] = [
-        &[("f", 6), ("e", 5)],
-        &[("d", 4), ("c", 3)],
-        &[("b", 2), ("a", 1)],
-    ];
-
-    #[test]
-    fn a_full_fetch_reads_every_page_and_sorts_oldest_first() {
-        // After the last full page, one empty page ends the history.
-        assert_eq!(run(&PAGES, 0), (4, vec![1, 2, 3, 4, 5, 6]));
-    }
-
-    #[test]
-    fn paging_stops_at_the_first_page_that_reaches_known_blocks() {
-        // Heights 4 and below are known: the second page reaches them.
-        assert_eq!(run(&PAGES, 4), (2, vec![5, 6]));
-    }
-
-    #[test]
-    fn nothing_new_costs_a_single_request() {
-        assert_eq!(run(&PAGES, 5), (1, vec![6]));
-        assert_eq!(run(&PAGES, 6), (1, vec![]));
-    }
-
-    #[test]
-    fn mempool_transactions_do_not_count_and_do_not_end_paging() {
-        let pending = tx(&format!(
-            r#"{{"txid":"p","fee":0,"vin":[],
-                "vout":[{{"scriptpubkey_address":"{ME}","value":5}}],
-                "status":{{"confirmed":false}}}}"#
-        ));
-        let mut first = vec![pending];
-        first.push(raw("f", 6));
-        let mut calls = 0;
-        let deltas = collect_history(
-            ME,
-            0,
-            |_| {
-                calls += 1;
-                Ok(if calls == 1 {
-                    std::mem::take(&mut first)
-                } else {
-                    vec![]
-                })
-            },
-            |_| {},
-        )
-        .expect("valid");
-        assert_eq!(deltas.len(), 1);
-        assert_eq!(calls, 2);
-    }
-
-    #[test]
-    fn implausible_addresses_are_rejected() {
-        assert!(check_address("").is_err());
-        assert!(check_address("not an address!!!!!").is_err());
-        assert!(check_address("bc1qar0srrr7xfkvy5l643lydnw9re59gtzzwf5mdq").is_ok());
+    fn the_same_address_on_two_chains_is_two_wallets() {
+        assert_ne!(
+            WalletId::new(Chain::Bitcoin, "x"),
+            WalletId::new(Chain::Fake, "x")
+        );
     }
 }
