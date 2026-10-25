@@ -288,15 +288,19 @@ fn open_with_secret(
 
 // --- Windows ---------------------------------------------------------------
 
+/// A window that holds one status page. The compact style and the size leave
+/// room for the longest page (the passphrase setup with an error message)
+/// including its buttons, which measured about 565 pixels with the header bar.
 fn gate_window(app: &adw::Application, page: &adw::StatusPage) -> adw::ApplicationWindow {
+    page.add_css_class("compact");
     let toolbar = adw::ToolbarView::new();
     toolbar.add_top_bar(&adw::HeaderBar::new());
     toolbar.set_content(Some(page));
     adw::ApplicationWindow::builder()
         .application(app)
         .title("Morlaco")
-        .default_width(480)
-        .default_height(480)
+        .default_width(520)
+        .default_height(620)
         .content(&toolbar)
         .build()
 }
@@ -456,11 +460,11 @@ fn show_passphrase_prompt(
         .visible(!keyring_reachable)
         .build();
     let recovery = gtk::Button::builder()
-        .label("Use Recovery Key…")
+        .label("Use Recovery Key")
         .css_classes(["flat"])
         .build();
     let start_over = gtk::Button::builder()
-        .label("Start Over…")
+        .label("Start Over")
         .css_classes(["flat"])
         .build();
     let more = gtk::Box::builder()
