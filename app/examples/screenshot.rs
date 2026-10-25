@@ -25,6 +25,8 @@ mod keys;
 mod migrate;
 #[path = "../src/store.rs"]
 mod store;
+#[path = "../src/system_keyring.rs"]
+mod system_keyring;
 #[path = "../src/unlock.rs"]
 mod unlock;
 #[path = "../src/window.rs"]

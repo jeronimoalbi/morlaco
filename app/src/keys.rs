@@ -10,17 +10,7 @@
 //!   and works where no keyring exists, but it is only as strong as the
 //!   passphrase, which can be guessed offline if the file leaks.
 
-use std::collections::HashMap;
 use std::io::Read;
-
-use gtk4::gio;
-use libsecret::{
-    COLLECTION_DEFAULT, Schema, SchemaAttributeType, SchemaFlags, password_clear_sync,
-    password_lookup_sync, password_store_sync,
-};
-
-const SCHEMA_NAME: &str = "io.github.jeronimoalbi.Morlaco.DatabaseKey";
-const LABEL: &str = "Morlaco database key";
 
 /// Shortest passphrase accepted when it is the only protection.
 pub const MIN_PASSPHRASE_ONLY_CHARS: usize = 12;
@@ -154,46 +144,6 @@ pub trait Keyring {
     fn store(&self, secret: &str) -> Result<(), String>;
     /// Removes the secret.
     fn clear(&self) -> Result<(), String>;
-}
-
-/// The login keyring, through the Secret Service (libsecret).
-pub struct SecretService;
-
-fn schema() -> Schema {
-    Schema::new(
-        SCHEMA_NAME,
-        SchemaFlags::NONE,
-        HashMap::from([("purpose", SchemaAttributeType::String)]),
-    )
-}
-
-fn attributes() -> HashMap<&'static str, &'static str> {
-    HashMap::from([("purpose", "database-key")])
-}
-
-impl Keyring for SecretService {
-    fn lookup(&self) -> Result<Option<String>, String> {
-        password_lookup_sync(Some(&schema()), attributes(), gio::Cancellable::NONE)
-            .map(|found| found.map(|s| s.to_string()))
-            .map_err(|e| e.message().to_owned())
-    }
-
-    fn store(&self, secret: &str) -> Result<(), String> {
-        password_store_sync(
-            Some(&schema()),
-            attributes(),
-            Some(COLLECTION_DEFAULT),
-            LABEL,
-            secret,
-            gio::Cancellable::NONE,
-        )
-        .map_err(|e| e.message().to_owned())
-    }
-
-    fn clear(&self) -> Result<(), String> {
-        password_clear_sync(Some(&schema()), attributes(), gio::Cancellable::NONE)
-            .map_err(|e| e.message().to_owned())
-    }
 }
 
 /// An in-memory keyring for tests, which can be told to fail.

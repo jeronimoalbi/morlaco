@@ -6,6 +6,7 @@ mod gate;
 mod keys;
 mod migrate;
 mod store;
+mod system_keyring;
 #[cfg(test)]
 mod testutil;
 mod unlock;

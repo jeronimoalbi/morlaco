@@ -22,11 +22,10 @@ use morlaco_core::util::date_string;
 
 use crate::encryption;
 use crate::format;
-use crate::keys::{
-    Keyring, Keys, MIN_PASSPHRASE_ONLY_CHARS, Mode, SecretService, format_recovery_key,
-};
+use crate::keys::{Keyring, Keys, MIN_PASSPHRASE_ONLY_CHARS, Mode, format_recovery_key};
 use crate::migrate;
 use crate::store::{Store, Wallet};
+use crate::system_keyring::PlatformKeyring;
 use crate::unlock;
 
 /// What the content area is showing.
@@ -946,7 +945,7 @@ impl Ui {
         let before = self.state.borrow().keys.clone();
         let result = {
             let state = self.state.borrow();
-            encryption::change_protection(&SecretService, &state.keys, target, |key| {
+            encryption::change_protection(&PlatformKeyring, &state.keys, target, |key| {
                 state.store.rekey(key).map_err(|e| e.to_string())
             })
         };
@@ -1070,7 +1069,7 @@ impl Ui {
         // The data goes first. If the key then cannot be removed, the next
         // start finds a key and no data and simply begins again, whereas the
         // other order could leave data without its key.
-        if let Err(message) = SecretService.clear() {
+        if let Err(message) = PlatformKeyring.clear() {
             glib::g_warning!("morlaco", "could not remove the key: {message}");
         }
         if let Some(app) = self.window.application() {

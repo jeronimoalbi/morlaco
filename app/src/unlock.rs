@@ -18,7 +18,8 @@ use morlaco_core::paths;
 
 use crate::encryption::{self, PassphraseProblem};
 use crate::gate::{self, GatePage, PromptLayout, SetupLayout, WINDOW_WIDTH, boxed_fields};
-use crate::keys::{self, Keyring, Keys, MIN_PASSPHRASE_ONLY_CHARS, SecretService};
+use crate::keys::{self, Keyring, Keys, MIN_PASSPHRASE_ONLY_CHARS};
+use crate::system_keyring::PlatformKeyring;
 
 /// An open database and what happened while opening it.
 pub struct Unlocked {
@@ -237,7 +238,7 @@ pub fn start(app: &adw::Application, ready: Ready) {
         Err(err) => return show_error(app, "Couldn’t Open Your Data", &err.to_string()),
     };
 
-    match plan(&SecretService.lookup(), file) {
+    match plan(&PlatformKeyring.lookup(), file) {
         Next::OpenWithSecret(secret) => open_with_secret(app, path, secret, false, ready),
         Next::CreateSecret => create_secret(app, path, file, ready),
         Next::Prompt { keyring_reachable } => {
@@ -256,7 +257,7 @@ fn create_secret(app: &adw::Application, path: PathBuf, file: FileState, ready: 
     };
     // Save the key before using it, so data is never encrypted with a key
     // that was not kept.
-    if let Err(message) = SecretService.store(&secret) {
+    if let Err(message) = PlatformKeyring.store(&secret) {
         return show_setup(app, path, file, Some(message), ready);
     }
     open_with_secret(app, path, secret, true, ready);
@@ -537,7 +538,7 @@ fn show_recovery_dialog(
         }
         match recover(&path, &key.text(), &passphrase.text()) {
             Ok((db, keys, set_aside)) => {
-                let notice = restore_secret(&SecretService, &keys);
+                let notice = restore_secret(&PlatformKeyring, &keys);
                 ready(Unlocked {
                     db,
                     keys,
