@@ -2,7 +2,7 @@ name: Audit
 
 on:
   push:
-    branches: [main]
+    branches: [master]
   pull_request:
   schedule:
     # New security advisories appear without any change to the code,
