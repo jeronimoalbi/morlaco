@@ -130,58 +130,173 @@ impl Position {
     }
 }
 
-/// Removes up to `sats` from the front of `lots`.
+/// Removes up to `sats` from the front of `lots` and returns the removed
+/// pieces, each keeping the date and price of the lot it came from.
 ///
-/// Returns how many sats were actually taken and what they cost in USD. The
-/// two differ only if the history spends more than it ever received.
-fn take(lots: &mut VecDeque<Lot>, mut sats: u64) -> (u64, f64) {
-    let mut taken = 0;
-    let mut cost = 0.0;
+/// Returns less than `sats` only if the history spends more than it ever
+/// received.
+fn take(lots: &mut VecDeque<Lot>, mut sats: u64) -> Vec<Lot> {
+    let mut pieces = Vec::new();
 
     while sats > 0 {
         let Some(front) = lots.front_mut() else { break };
         let used = sats.min(front.sats);
-        cost += used as f64 / SATS_PER_BTC * front.unit_price_usd;
+        pieces.push(Lot {
+            time: front.time,
+            sats: used,
+            unit_price_usd: front.unit_price_usd,
+        });
         front.sats -= used;
-        taken += used;
         sats -= used;
         if front.sats == 0 {
             lots.pop_front();
         }
     }
 
-    (taken, cost)
+    pieces
 }
 
-/// Replays `deltas` (oldest first) into a [`Position`].
-pub fn fifo(deltas: &[PricedDelta]) -> Position {
-    let mut lots: VecDeque<Lot> = VecDeque::new();
-    let mut realized_usd = 0.0;
+fn total_sats(pieces: &[Lot]) -> u64 {
+    pieces.iter().map(|l| l.sats).sum()
+}
 
-    for d in deltas {
-        if d.net_sats > 0 {
-            lots.push_back(Lot {
-                time: d.time,
-                sats: d.net_sats.unsigned_abs(),
-                unit_price_usd: d.price_usd,
-            });
-            continue;
+fn total_cost(pieces: &[Lot]) -> f64 {
+    pieces.iter().map(Lot::cost_usd).sum()
+}
+
+/// Adds `lot` keeping the queue ordered by acquisition time, so FIFO keeps
+/// meaning "oldest coins first" after coins arrive from another wallet.
+fn insert_by_age(lots: &mut VecDeque<Lot>, lot: Lot) {
+    let at = lots.partition_point(|l| l.time <= lot.time);
+    lots.insert(at, lot);
+}
+
+/// One wallet's side of a transaction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Move {
+    /// Index of the wallet in the [`Ledger`].
+    pub wallet: usize,
+    /// Sats received minus sats spent. Negative when the wallet paid out.
+    pub net_sats: i64,
+    /// Share of the network fee paid from this wallet.
+    pub fee_sats: u64,
+}
+
+/// FIFO lots for several wallets at once.
+///
+/// When one transaction moves coins out of one tracked wallet and into
+/// another, the coins keep their original date and price instead of being
+/// booked as a sale and a purchase.
+#[derive(Debug, Clone)]
+pub struct Ledger {
+    lots: Vec<VecDeque<Lot>>,
+    realized_usd: Vec<f64>,
+}
+
+impl Ledger {
+    /// Creates a ledger for `wallets` empty wallets.
+    pub fn new(wallets: usize) -> Self {
+        Self {
+            lots: vec![VecDeque::new(); wallets],
+            realized_usd: vec![0.0; wallets],
+        }
+    }
+
+    /// Applies one transaction. `moves` lists every tracked wallet it touches
+    /// and each wallet may appear once.
+    ///
+    /// Returns, for each move, how many sats went to or came from another
+    /// tracked wallet.
+    pub fn apply(&mut self, moves: &[Move], time: i64, price_usd: f64) -> Vec<u64> {
+        let sendable = |m: &Move| {
+            let out = m.net_sats.unsigned_abs();
+            out - m.fee_sats.min(out)
+        };
+        let senders = || moves.iter().filter(|m| m.net_sats < 0);
+        let receivers = || moves.iter().filter(|m| m.net_sats > 0);
+
+        let total_out: u64 = senders().map(sendable).sum();
+        let total_in: u64 = receivers().map(|m| m.net_sats.unsigned_abs()).sum();
+        let mut internal_left = total_out.min(total_in);
+
+        let mut internal = vec![0; moves.len()];
+        let mut in_transit: VecDeque<Lot> = VecDeque::new();
+
+        // Senders: coins for other wallets move; the rest is sold; fees are lost.
+        for (i, m) in moves.iter().enumerate().filter(|(_, m)| m.net_sats < 0) {
+            let moved = sendable(m).min(internal_left);
+            internal_left -= moved;
+            internal[i] = moved;
+
+            let pieces = take(&mut self.lots[m.wallet], moved);
+            in_transit.extend(pieces);
+
+            let sold = take(&mut self.lots[m.wallet], sendable(m) - moved);
+            self.realized_usd[m.wallet] +=
+                total_sats(&sold) as f64 / SATS_PER_BTC * price_usd - total_cost(&sold);
+
+            let out = m.net_sats.unsigned_abs();
+            let fee = take(&mut self.lots[m.wallet], m.fee_sats.min(out));
+            self.realized_usd[m.wallet] -= total_cost(&fee);
         }
 
-        let outflow = d.net_sats.unsigned_abs();
-        let fee = d.fee_sats.min(outflow);
+        // Receivers: coins from other wallets keep their basis; the rest is
+        // a purchase at the current price.
+        let mut to_assign = total_out.min(total_in);
+        for (i, m) in moves.iter().enumerate().filter(|(_, m)| m.net_sats > 0) {
+            let inflow = m.net_sats.unsigned_abs();
+            let share = inflow.min(to_assign);
+            to_assign -= share;
+            internal[i] = share;
 
-        let (sold, sold_cost) = take(&mut lots, outflow - fee);
-        realized_usd += sold as f64 / SATS_PER_BTC * d.price_usd - sold_cost;
+            let pieces = take(&mut in_transit, share);
+            let given = total_sats(&pieces);
+            for piece in pieces {
+                insert_by_age(&mut self.lots[m.wallet], piece);
+            }
+            // Coins from outside, or that no sender had lots for because its
+            // history is incomplete, are priced at market.
+            let bought = inflow - given;
+            if bought > 0 {
+                insert_by_age(
+                    &mut self.lots[m.wallet],
+                    Lot {
+                        time,
+                        sats: bought,
+                        unit_price_usd: price_usd,
+                    },
+                );
+            }
+        }
 
-        let (_, fee_cost) = take(&mut lots, fee);
-        realized_usd -= fee_cost;
+        internal
     }
 
-    Position {
-        open_lots: lots.into(),
-        realized_usd,
+    /// Finishes and returns each wallet's position, in wallet order.
+    pub fn into_positions(self) -> Vec<Position> {
+        self.lots
+            .into_iter()
+            .zip(self.realized_usd)
+            .map(|(lots, realized_usd)| Position {
+                open_lots: lots.into(),
+                realized_usd,
+            })
+            .collect()
     }
+}
+
+/// Replays `deltas` (oldest first) for a single wallet into a [`Position`].
+pub fn fifo(deltas: &[PricedDelta]) -> Position {
+    let mut ledger = Ledger::new(1);
+    for d in deltas {
+        let moves = [Move {
+            wallet: 0,
+            net_sats: d.net_sats,
+            fee_sats: d.fee_sats,
+        }];
+        ledger.apply(&moves, d.time, d.price_usd);
+    }
+    ledger.into_positions().pop().unwrap_or_default()
 }
 
 #[cfg(test)]
@@ -259,6 +374,85 @@ mod tests {
         assert_eq!(total.value_usd, 40_000.0);
         assert_eq!(total.unrealized_usd, 0.0);
         assert_eq!(total.unrealized_pct, Some(0.0));
+    }
+
+    fn mv(wallet: usize, net_sats: i64, fee_sats: u64) -> Move {
+        Move {
+            wallet,
+            net_sats,
+            fee_sats,
+        }
+    }
+
+    /// Wallet 0 buys 1 BTC at 10k at time 1.
+    fn funded_ledger() -> Ledger {
+        let mut ledger = Ledger::new(2);
+        ledger.apply(&[mv(0, BTC, 0)], 1, 10_000.0);
+        ledger
+    }
+
+    #[test]
+    fn transfer_between_wallets_keeps_the_original_basis() {
+        let mut ledger = funded_ledger();
+        let internal = ledger.apply(&[mv(0, -BTC, 0), mv(1, BTC, 0)], 2, 60_000.0);
+        assert_eq!(internal, vec![BTC as u64, BTC as u64]);
+
+        let [a, b] = ledger.into_positions().try_into().expect("two wallets");
+        assert!(a.open_lots.is_empty());
+        assert_eq!(a.realized_usd, 0.0);
+        assert_eq!(b.open_lots.len(), 1);
+        assert_eq!(b.open_lots[0].unit_price_usd, 10_000.0);
+        assert_eq!(b.open_lots[0].time, 1);
+        assert_eq!(b.summarize(60_000.0).unrealized_usd, 50_000.0);
+    }
+
+    #[test]
+    fn transfer_fee_is_a_loss_and_the_rest_arrives() {
+        let mut ledger = funded_ledger();
+        let fee = BTC / 1_000;
+        ledger.apply(&[mv(0, -BTC, fee as u64), mv(1, BTC - fee, 0)], 2, 60_000.0);
+
+        let [a, b] = ledger.into_positions().try_into().expect("two wallets");
+        // 0.001 BTC bought at 10k is lost: 10 USD.
+        assert!((a.realized_usd + 10.0).abs() < 1e-9);
+        assert_eq!(b.open_lots[0].sats, (BTC - fee) as u64);
+        assert_eq!(b.open_lots[0].unit_price_usd, 10_000.0);
+    }
+
+    #[test]
+    fn payment_to_a_third_party_is_a_sale_alongside_the_transfer() {
+        // Send 1 BTC: half to wallet 1, half to someone else.
+        let mut ledger = funded_ledger();
+        let internal = ledger.apply(&[mv(0, -BTC, 0), mv(1, BTC / 2, 0)], 2, 60_000.0);
+        assert_eq!(internal, vec![(BTC / 2) as u64, (BTC / 2) as u64]);
+
+        let [a, b] = ledger.into_positions().try_into().expect("two wallets");
+        // Sold 0.5 BTC bought at 10k for 60k: 25,000 gained.
+        assert_eq!(a.realized_usd, 25_000.0);
+        assert_eq!(b.open_lots[0].sats, (BTC / 2) as u64);
+        assert_eq!(b.open_lots[0].unit_price_usd, 10_000.0);
+    }
+
+    #[test]
+    fn moved_lots_slot_in_by_age() {
+        let mut ledger = funded_ledger();
+        ledger.apply(&[mv(1, BTC, 0)], 100, 30_000.0);
+        ledger.apply(&[mv(0, -BTC, 0), mv(1, BTC, 0)], 200, 60_000.0);
+
+        let [_, b] = ledger.into_positions().try_into().expect("two wallets");
+        let times: Vec<i64> = b.open_lots.iter().map(|l| l.time).collect();
+        assert_eq!(times, vec![1, 100]);
+    }
+
+    #[test]
+    fn missing_sender_history_falls_back_to_a_purchase() {
+        let mut ledger = Ledger::new(2);
+        ledger.apply(&[mv(0, -BTC, 0), mv(1, BTC, 0)], 5, 40_000.0);
+
+        let [a, b] = ledger.into_positions().try_into().expect("two wallets");
+        assert_eq!(a.realized_usd, 0.0);
+        assert_eq!(b.open_lots.len(), 1);
+        assert_eq!(b.open_lots[0].unit_price_usd, 40_000.0);
     }
 
     #[test]

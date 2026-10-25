@@ -16,8 +16,8 @@ use morlaco_core::cache::Cache;
 use morlaco_core::chain;
 use morlaco_core::lots::Summary;
 use morlaco_core::paths;
-use morlaco_core::portfolio::{self, Portfolio};
-use morlaco_core::price::{CachedPrices, MempoolPrices};
+use morlaco_core::portfolio::{self, History, Portfolio};
+use morlaco_core::price::{CachedPrices, MempoolPrices, PriceSource};
 use morlaco_core::util::date_string;
 
 use crate::format;
@@ -38,10 +38,41 @@ enum Selection {
 struct State {
     store: Store,
     selection: Selection,
-    /// Loaded wallets by address. Kept so switching views is instant.
+    /// Downloaded and priced history by address. Kept so switching views is
+    /// instant.
+    histories: HashMap<String, History>,
+    /// BTC/USD from the latest successful load.
+    price_now: Option<f64>,
+    /// Derived from `histories` by [`State::recompute`], by address.
     portfolios: HashMap<String, Portfolio>,
     /// Why a wallet failed to load, by address.
     errors: HashMap<String, String>,
+}
+
+impl State {
+    /// Rebuilds every portfolio from the loaded histories.
+    ///
+    /// Wallets are valued together so that coins moved between them keep
+    /// their original cost basis. Call after any history is added, replaced
+    /// or removed.
+    fn recompute(&mut self) {
+        let portfolios = match self.price_now {
+            Some(price) => {
+                let loaded: Vec<&History> = self
+                    .store
+                    .wallets
+                    .iter()
+                    .filter_map(|w| self.histories.get(&w.address))
+                    .collect();
+                portfolio::assemble(&loaded, price)
+            }
+            None => Vec::new(),
+        };
+        self.portfolios = portfolios
+            .into_iter()
+            .map(|p| (p.address.clone(), p))
+            .collect();
+    }
 }
 
 /// One labelled figure in a summary table.
@@ -237,8 +268,8 @@ impl Ui {
             .visible(false)
             .build();
         let overview_note = note(
-            "Gains are summed per wallet. Moving coins between your own wallets counts \
-             as a sale and a purchase, so realized figures and cost basis can be off.",
+            "Coins moved between the wallets listed here keep their original cost basis. \
+             Coins moved to or from any other wallet count as a sale or a purchase.",
         );
         let overview_box = page_box();
         overview_box.append(&overview.root);
@@ -418,6 +449,8 @@ impl Ui {
             state: RefCell::new(State {
                 store,
                 selection: Selection::Overview,
+                histories: HashMap::new(),
+                price_now: None,
                 portfolios: HashMap::new(),
                 errors: HashMap::new(),
             }),
@@ -665,10 +698,13 @@ impl Ui {
             let mut state = self.state.borrow_mut();
             if let Some(wallet) = state.store.wallets.get(index) {
                 let address = wallet.address.clone();
-                state.portfolios.remove(&address);
+                state.histories.remove(&address);
                 state.errors.remove(&address);
             }
             state.store.remove(index);
+            // Wallets that were linked to the removed one now see its
+            // transfers as sales and purchases.
+            state.recompute();
             if let Err(err) = state.store.save() {
                 drop(state);
                 self.toast(&format!("Couldn’t save wallets: {err}"));
@@ -723,7 +759,7 @@ impl Ui {
         };
         wanted
             .into_iter()
-            .filter(|w| !state.portfolios.contains_key(&w.address))
+            .filter(|w| !state.histories.contains_key(&w.address))
             .map(|w| w.address.clone())
             .collect()
     }
@@ -785,37 +821,37 @@ impl Ui {
         let ui = self.clone();
         glib::spawn_future_local(async move {
             let names = addresses.clone();
-            let outcome = gio::spawn_blocking(move || fetch_all(&addresses, &done, &txs)).await;
+            let outcome = gio::spawn_blocking(move || fetch_all(addresses, &done, &txs)).await;
             ticker.remove();
-            let results = outcome.unwrap_or_else(|_| {
-                names
-                    .into_iter()
-                    .map(|a| (a, Err("the worker thread crashed".to_owned())))
-                    .collect()
-            });
-            ui.finish_load(generation, results);
+            let fetched =
+                outcome.unwrap_or_else(|_| Fetched::failed(names, "the worker thread crashed"));
+            ui.finish_load(generation, fetched);
         });
     }
 
-    fn finish_load(self: &Rc<Self>, generation: u64, results: Vec<WalletResult>) {
+    fn finish_load(self: &Rc<Self>, generation: u64, fetched: Fetched) {
         if generation != self.generation.get() {
             return;
         }
         self.loading.set(false);
         {
             let mut state = self.state.borrow_mut();
-            for (address, result) in results {
+            if fetched.price_now.is_some() {
+                state.price_now = fetched.price_now;
+            }
+            for (address, result) in fetched.wallets {
                 match result {
-                    Ok(p) => {
+                    Ok(history) => {
                         state.errors.remove(&address);
-                        state.portfolios.insert(address, p);
+                        state.histories.insert(address, history);
                     }
                     Err(message) => {
-                        state.portfolios.remove(&address);
+                        state.histories.remove(&address);
                         state.errors.insert(address, message);
                     }
                 }
             }
+            state.recompute();
         }
         self.show_current();
     }
@@ -968,13 +1004,19 @@ impl Ui {
         }
 
         clear(&self.history_list);
-        for (delta, price) in p.history.iter().rev() {
+        for entry in p.history.iter().rev() {
+            let delta = &entry.delta;
+            let kind = if entry.internal_sats > 0 {
+                "Transfer between your wallets · "
+            } else {
+                ""
+            };
             let row = adw::ActionRow::builder()
                 .title(date_string(delta.time))
                 .subtitle(format!(
-                    "{} · BTC at {}",
+                    "{kind}{} · BTC at {}",
                     format::short_address(&delta.txid),
-                    format::usd(*price, false)
+                    format::usd(entry.price_usd, false)
                 ))
                 .use_markup(false)
                 .activatable(true)
@@ -995,30 +1037,58 @@ impl Ui {
 }
 
 /// One wallet's outcome from the worker thread.
-type WalletResult = (String, Result<Portfolio, String>);
+type WalletResult = (String, Result<History, String>);
+
+/// What a load brings back.
+struct Fetched {
+    /// Current BTC/USD, or `None` when it could not be read, in which case
+    /// every wallet is marked as failed because nothing can be valued.
+    price_now: Option<f64>,
+    wallets: Vec<WalletResult>,
+}
+
+impl Fetched {
+    fn failed(addresses: Vec<String>, message: &str) -> Self {
+        Self {
+            price_now: None,
+            wallets: addresses
+                .into_iter()
+                .map(|a| (a, Err(message.to_owned())))
+                .collect(),
+        }
+    }
+}
 
 /// Reads blockchain data and prices for each address. Runs on a worker thread.
 ///
 /// `done` counts finished wallets and `txs` the transactions fetched so far
 /// for the current one.
-fn fetch_all(addresses: &[String], done: &AtomicUsize, txs: &AtomicUsize) -> Vec<WalletResult> {
-    let cache = open_cache();
-    addresses
-        .iter()
+fn fetch_all(addresses: Vec<String>, done: &AtomicUsize, txs: &AtomicUsize) -> Fetched {
+    let cache = match open_cache() {
+        Ok(cache) => cache,
+        Err(message) => return Fetched::failed(addresses, &message),
+    };
+    let prices = CachedPrices::new(MempoolPrices, &cache);
+    let price_now = match prices.usd_now() {
+        Ok(price) => price,
+        Err(err) => return Fetched::failed(addresses, &err.to_string()),
+    };
+
+    let wallets = addresses
+        .into_iter()
         .map(|address| {
             txs.store(0, Ordering::Relaxed);
-            let result = match &cache {
-                Ok(cache) => {
-                    let prices = CachedPrices::new(MempoolPrices, cache);
-                    portfolio::build(address, &prices, |n| txs.store(n, Ordering::Relaxed))
-                        .map_err(|e| e.to_string())
-                }
-                Err(message) => Err(message.clone()),
-            };
+            let result = portfolio::fetch(&address, &prices, |n| txs.store(n, Ordering::Relaxed))
+                .map_err(|e| e.to_string());
             done.fetch_add(1, Ordering::Relaxed);
-            (address.clone(), result)
+            (address, result)
         })
-        .collect()
+        .collect();
+
+    Fetched {
+        price_now: Some(price_now),
+        wallets,
+    }
 }
 
 fn open_cache() -> Result<Cache, String> {

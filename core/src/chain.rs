@@ -11,13 +11,19 @@ const BASE_URL: &str = "https://mempool.space/api";
 pub struct Delta {
     /// Transaction id.
     pub txid: String,
+    /// Block height, used to order transactions.
+    pub height: u64,
     /// Block time as a Unix timestamp.
     pub time: i64,
     /// Sats received minus sats spent by the address. Negative when the
     /// address paid out.
     pub net_sats: i64,
-    /// Network fee in sats. Zero when the address did not fund the transaction.
+    /// Share of the network fee paid by this address: all of it when the
+    /// address funded the whole transaction, none when it funded nothing.
     pub fee_sats: u64,
+    /// Ids of the transactions whose outputs this one spends. Lets
+    /// transactions in the same block be put in spending order.
+    pub parents: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -31,6 +37,9 @@ struct RawTx {
 
 #[derive(Debug, Deserialize)]
 struct RawVin {
+    /// Id of the transaction being spent.
+    #[serde(default)]
+    txid: String,
     /// Absent for coinbase inputs.
     prevout: Option<RawOutput>,
 }
@@ -45,6 +54,7 @@ struct RawOutput {
 #[derive(Debug, Deserialize)]
 struct RawStatus {
     confirmed: bool,
+    block_height: Option<u64>,
     block_time: Option<i64>,
 }
 
@@ -57,6 +67,7 @@ impl RawTx {
     /// transactions and transactions that do not touch the address.
     fn delta_for(&self, address: &str) -> Option<Delta> {
         let time = self.status.block_time.filter(|_| self.is_confirmed())?;
+        let height = self.status.block_height?;
         let pays_to = |o: &RawOutput| o.scriptpubkey_address.as_deref() == Some(address);
 
         let received: u64 = self
@@ -77,11 +88,27 @@ impl RawTx {
             return None;
         }
 
+        // When other parties fund part of the inputs, the fee is split in
+        // proportion to what each side put in.
+        let total_in: u64 = self
+            .vin
+            .iter()
+            .filter_map(|i| i.prevout.as_ref())
+            .map(|o| o.value)
+            .sum();
+        let fee_sats = if spent > 0 && total_in > 0 {
+            (u128::from(self.fee) * u128::from(spent) / u128::from(total_in)) as u64
+        } else {
+            0
+        };
+
         Some(Delta {
             txid: self.txid.clone(),
+            height,
             time,
             net_sats: received as i64 - spent as i64,
-            fee_sats: if spent > 0 { self.fee } else { 0 },
+            fee_sats,
+            parents: self.vin.iter().map(|i| i.txid.clone()).collect(),
         })
     }
 }
@@ -130,7 +157,7 @@ pub fn fetch_history(address: &str, mut on_progress: impl FnMut(usize)) -> Resul
         }
     }
 
-    deltas.sort_by_key(|d| d.time);
+    deltas.sort_by_key(|d| d.height);
     Ok(deltas)
 }
 
@@ -151,7 +178,7 @@ mod tests {
             r#"{{"txid":"a","fee":300,
                 "vin":[{{"prevout":{{"scriptpubkey_address":"{OTHER}","value":10300}}}}],
                 "vout":[{{"scriptpubkey_address":"{ME}","value":10000}}],
-                "status":{{"confirmed":true,"block_time":1700000000}}}}"#
+                "status":{{"confirmed":true,"block_height":100,"block_time":1700000000}}}}"#
         ));
         let d = t.delta_for(ME).expect("touches address");
         assert_eq!((d.net_sats, d.fee_sats, d.time), (10_000, 0, 1_700_000_000));
@@ -164,10 +191,25 @@ mod tests {
                 "vin":[{{"prevout":{{"scriptpubkey_address":"{ME}","value":50000}}}}],
                 "vout":[{{"scriptpubkey_address":"{OTHER}","value":30000}},
                         {{"scriptpubkey_address":"{ME}","value":19800}}],
-                "status":{{"confirmed":true,"block_time":1700000100}}}}"#
+                "status":{{"confirmed":true,"block_height":100,"block_time":1700000100}}}}"#
         ));
         let d = t.delta_for(ME).expect("touches address");
         assert_eq!((d.net_sats, d.fee_sats), (-30_200, 200));
+    }
+
+    #[test]
+    fn fee_is_split_when_others_fund_part_of_the_inputs() {
+        // ME puts in 30,000 of 40,000; the 400 sat fee is split 300 / 100.
+        let t = tx(&format!(
+            r#"{{"txid":"f","fee":400,
+                "vin":[{{"txid":"p1","prevout":{{"scriptpubkey_address":"{ME}","value":30000}}}},
+                       {{"txid":"p2","prevout":{{"scriptpubkey_address":"{OTHER}","value":10000}}}}],
+                "vout":[{{"scriptpubkey_address":"{OTHER}","value":39600}}],
+                "status":{{"confirmed":true,"block_height":7,"block_time":3}}}}"#
+        ));
+        let d = t.delta_for(ME).expect("touches address");
+        assert_eq!((d.net_sats, d.fee_sats, d.height), (-30_000, 300, 7));
+        assert_eq!(d.parents, vec!["p1", "p2"]);
     }
 
     #[test]
@@ -182,7 +224,7 @@ mod tests {
         let unrelated = tx(&format!(
             r#"{{"txid":"d","fee":1,"vin":[],
                 "vout":[{{"scriptpubkey_address":"{OTHER}","value":5}}],
-                "status":{{"confirmed":true,"block_time":1}}}}"#
+                "status":{{"confirmed":true,"block_height":100,"block_time":1}}}}"#
         ));
         assert!(unrelated.delta_for(ME).is_none());
     }
@@ -194,7 +236,7 @@ mod tests {
                 "vin":[{{"prevout":null}}],
                 "vout":[{{"scriptpubkey_address":"{ME}","value":625}},
                         {{"value":0}}],
-                "status":{{"confirmed":true,"block_time":2}}}}"#
+                "status":{{"confirmed":true,"block_height":100,"block_time":2}}}}"#
         ));
         assert_eq!(t.delta_for(ME).map(|d| d.net_sats), Some(625));
     }
