@@ -4,9 +4,9 @@
 [![Audit](https://github.com/jeronimoalbi/morlaco/actions/workflows/audit.yml/badge.svg?branch=main)](https://github.com/jeronimoalbi/morlaco/actions/workflows/audit.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-Morlaco is a small GNOME app. It reads the public blockchain, looks up what
-the coin cost on the days your coins arrived, and shows your estimated gain or
-loss.
+Morlaco is a private crypto portfolio tracker for GNOME.
+It reads the public blockchain, looks up what the coin cost on the days
+your coins arrived, and shows your estimated gain or loss.
 
 <p align="center">
   <img src="docs/screenshots/overview.png" alt="Morlaco overview with two example wallets" width="70%">
