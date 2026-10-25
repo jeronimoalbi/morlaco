@@ -99,16 +99,19 @@ impl Store {
     /// Adds a wallet and returns its index. Control characters in the label
     /// are replaced so they cannot break the file format.
     pub fn add(&mut self, address: &str, label: &str) -> usize {
-        let label: String = label
-            .trim()
-            .chars()
-            .map(|c| if c.is_control() { ' ' } else { c })
-            .collect();
         self.wallets.push(Wallet {
             address: address.to_owned(),
-            label,
+            label: clean_label(label),
         });
         self.wallets.len() - 1
+    }
+
+    /// Changes the label of the wallet at `index`, if it exists. An empty
+    /// label makes the wallet display its address again.
+    pub fn rename(&mut self, index: usize, label: &str) {
+        if let Some(wallet) = self.wallets.get_mut(index) {
+            wallet.label = clean_label(label);
+        }
     }
 
     /// Removes the wallet at `index`, if it exists.
@@ -117,6 +120,16 @@ impl Store {
             self.wallets.remove(index);
         }
     }
+}
+
+/// Trims a label and replaces control characters so they cannot break the
+/// file format.
+fn clean_label(label: &str) -> String {
+    label
+        .trim()
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect()
 }
 
 /// Writes via a temporary file so a crash cannot leave a half-written store.
@@ -151,6 +164,22 @@ mod tests {
         let back = Store::parse(&store.serialize());
         assert_eq!(back.wallets.len(), 1);
         assert_eq!(back.wallets[0].label, "evil label wallet bc1qother");
+    }
+
+    #[test]
+    fn rename_sets_and_clears_the_label() {
+        let mut store = Store::default();
+        store.add("bc1qaaaaaaaaaaaaaaaa", "Old");
+
+        store.rename(0, "  New\tname ");
+        assert_eq!(store.wallets[0].label, "New name");
+        assert_eq!(store.wallets[0].display_name(), "New name");
+
+        store.rename(0, "");
+        assert_eq!(store.wallets[0].display_name(), "bc1qaaaa…aaaaaa");
+
+        store.rename(9, "ignored");
+        assert_eq!(store.wallets.len(), 1);
     }
 
     #[test]

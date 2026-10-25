@@ -524,6 +524,16 @@ impl Ui {
                 row.set_subtitle(&format::short_address(&wallet.address));
             }
 
+            let rename = gtk::Button::builder()
+                .icon_name("document-edit-symbolic")
+                .tooltip_text("Rename Wallet")
+                .valign(gtk::Align::Center)
+                .css_classes(["flat"])
+                .build();
+            let ui = self.clone();
+            rename.connect_clicked(move |_| ui.show_rename_dialog(index));
+            row.add_suffix(&rename);
+
             let remove = gtk::Button::builder()
                 .icon_name("user-trash-symbolic")
                 .tooltip_text("Remove Wallet")
@@ -580,6 +590,51 @@ impl Ui {
             }
         });
         dialog.present(Some(&self.window));
+    }
+
+    fn show_rename_dialog(self: &Rc<Self>, index: usize) {
+        let Some(wallet) = self.state.borrow().store.wallets.get(index).cloned() else {
+            return;
+        };
+
+        let dialog = adw::AlertDialog::new(
+            Some("Rename Wallet"),
+            Some(&format::short_address(&wallet.address)),
+        );
+        dialog.add_responses(&[("cancel", "_Cancel"), ("save", "_Save")]);
+        dialog.set_response_appearance("save", adw::ResponseAppearance::Suggested);
+        dialog.set_default_response(Some("save"));
+        dialog.set_close_response("cancel");
+
+        let name = adw::EntryRow::builder()
+            .title("Label")
+            .text(&wallet.label)
+            .activates_default(true)
+            .build();
+        let fields = boxed_list();
+        fields.append(&name);
+        dialog.set_extra_child(Some(&fields));
+
+        let ui = self.clone();
+        dialog.connect_response(None, move |_, response| {
+            if response == "save" {
+                ui.rename_wallet(index, name.text().as_str());
+            }
+        });
+        dialog.present(Some(&self.window));
+    }
+
+    fn rename_wallet(self: &Rc<Self>, index: usize, label: &str) {
+        {
+            let mut state = self.state.borrow_mut();
+            state.store.rename(index, label);
+            if let Err(err) = state.store.save() {
+                drop(state);
+                self.toast(&format!("Couldn’t save wallets: {err}"));
+            }
+        }
+        self.rebuild_sidebar();
+        self.render();
     }
 
     fn add_wallet(self: &Rc<Self>, address: &str, label: &str) {
