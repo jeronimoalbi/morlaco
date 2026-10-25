@@ -254,6 +254,8 @@ pub struct Ui {
     toasts: adw::ToastOverlay,
     split: adw::OverlaySplitView,
     wallet_list: gtk::ListBox,
+    /// Shows the portfolio on screen and opens the list of portfolios.
+    portfolio_btn: gtk::MenuButton,
     pages: gtk::Stack,
     title_stack: gtk::Stack,
     switcher_bar: adw::ViewSwitcherBar,
@@ -368,8 +370,14 @@ impl Ui {
             .tooltip_text("Add Wallet (Ctrl+N)")
             .action_name("win.add-wallet")
             .build();
+        let portfolio_btn = gtk::MenuButton::builder()
+            .always_show_arrow(true)
+            .css_classes(["flat"])
+            .tooltip_text("Portfolios")
+            .build();
         let sidebar_header = adw::HeaderBar::new();
         sidebar_header.pack_start(&add_btn);
+        sidebar_header.set_title_widget(Some(&portfolio_btn));
         let sidebar_toolbar = adw::ToolbarView::new();
         sidebar_toolbar.add_top_bar(&sidebar_header);
         sidebar_toolbar.set_content(Some(
@@ -388,8 +396,8 @@ impl Ui {
             .visible(false)
             .build();
         let overview_note = note(
-            "Coins moved between the wallets listed here keep their original cost basis. \
-             Coins moved to or from any other wallet count as a sale or a purchase.",
+            "Coins moved between your wallets keep their original cost basis, even between \
+             portfolios. Coins moved to or from any other wallet count as a sale or a purchase.",
         );
         let overview_box = page_box();
         overview_box.append(&overview.root);
@@ -565,6 +573,7 @@ impl Ui {
             toasts,
             split,
             wallet_list,
+            portfolio_btn,
             pages,
             title_stack,
             switcher_bar,
@@ -609,6 +618,26 @@ impl Ui {
         self.add_action("recovery-key", |ui| ui.show_recovery_key_dialog());
         self.add_action("data-providers", |ui| ui.show_data_providers_dialog());
         self.add_action("clear-data", |ui| ui.confirm_clear_data());
+
+        // Portfolios. The state of the radio action is the id on screen, so
+        // the menu draws a check mark next to it.
+        let active = self.state.borrow().store.active_portfolio().id;
+        let select_portfolio = gio::SimpleAction::new_stateful(
+            "select-portfolio",
+            Some(glib::VariantTy::INT64),
+            &active.to_variant(),
+        );
+        let ui = self.clone();
+        select_portfolio.connect_activate(move |_, parameter| {
+            if let Some(id) = parameter.and_then(|p| p.get::<i64>()) {
+                ui.switch_portfolio(id);
+            }
+        });
+        self.window.add_action(&select_portfolio);
+        self.add_action("new-portfolio", |ui| ui.show_new_portfolio_dialog());
+        self.add_action("rename-portfolio", |ui| ui.show_rename_portfolio_dialog());
+        self.add_action("delete-portfolio", |ui| ui.show_delete_portfolio_dialog());
+        self.sync_portfolio_ui();
         let ui = self.clone();
         self.history
             .more
@@ -658,10 +687,15 @@ impl Ui {
 
         let ui = self.clone();
         self.wallet_list.connect_row_activated(move |_, row| {
-            // Row 0 is the overview; wallets follow in store order.
+            // Row 0 is the overview; the wallets of the portfolio on screen
+            // follow in store order.
+            let visible = ui.state.borrow().store.visible_wallets();
             let selection = match usize::try_from(row.index()) {
                 Ok(0) => Selection::Overview,
-                Ok(n) => Selection::Wallet(n - 1),
+                Ok(n) => match visible.get(n - 1) {
+                    Some(&index) => Selection::Wallet(index),
+                    None => return,
+                },
                 Err(_) => return,
             };
             ui.select(selection);
@@ -713,7 +747,8 @@ impl Ui {
         let state = self.state.borrow();
         // Naming the network only helps once there is more than one.
         let show_network = state.store.chains_in_use().len() > 1;
-        for (index, wallet) in state.store.wallets.iter().enumerate() {
+        for index in state.store.visible_wallets() {
+            let wallet = &state.store.wallets[index];
             let row = adw::ActionRow::builder()
                 .title(wallet.display_name())
                 .use_markup(false)
@@ -756,12 +791,20 @@ impl Ui {
     }
 
     fn sync_sidebar_selection(&self) {
-        let row_index = match self.state.borrow().selection {
-            Selection::Overview => 0,
-            Selection::Wallet(i) => i + 1,
+        let state = self.state.borrow();
+        let row_index = match state.selection {
+            Selection::Overview => Some(0),
+            // Wallets of the portfolio on screen follow the overview row.
+            Selection::Wallet(i) => state
+                .store
+                .visible_wallets()
+                .iter()
+                .position(|&visible| visible == i)
+                .map(|position| position + 1),
         };
-        let row = i32::try_from(row_index)
-            .ok()
+        drop(state);
+        let row = row_index
+            .and_then(|i| i32::try_from(i).ok())
             .and_then(|i| self.wallet_list.row_at_index(i));
         self.wallet_list.select_row(row.as_ref());
     }
@@ -1158,25 +1201,304 @@ impl Ui {
             .build();
         let fields = boxed_list();
         fields.append(&name);
+
+        // Moving a wallet only makes sense with somewhere to move it to.
+        let portfolios = self.state.borrow().store.portfolios.clone();
+        let portfolio_row = (portfolios.len() > 1).then(|| {
+            let names: Vec<&str> = portfolios.iter().map(|p| p.name.as_str()).collect();
+            let current = portfolios
+                .iter()
+                .position(|p| p.id == wallet.portfolio)
+                .unwrap_or(0);
+            adw::ComboRow::builder()
+                .title("Portfolio")
+                .model(&gtk::StringList::new(&names))
+                .selected(u32::try_from(current).unwrap_or(0))
+                .build()
+        });
+        if let Some(row) = &portfolio_row {
+            fields.append(row);
+        }
         dialog.set_extra_child(Some(&fields));
 
         let ui = self.clone();
         dialog.connect_response(None, move |_, response| {
             if response == "save" {
-                ui.rename_wallet(index, name.text().as_str());
+                let portfolio = portfolio_row
+                    .as_ref()
+                    .and_then(|row| portfolios.get(row.selected() as usize))
+                    .map(|p| p.id);
+                ui.rename_wallet(index, name.text().as_str(), portfolio);
             }
         });
         dialog.present(Some(&self.window));
     }
 
-    fn rename_wallet(self: &Rc<Self>, index: usize, label: &str) {
-        let saved = self.state.borrow_mut().store.rename(index, label);
-        if let Err(err) = saved {
-            self.toast(&format!("Couldn’t rename the wallet: {err}"));
+    /// Saves a wallet's new label and, if `portfolio` is another one than it
+    /// is in, moves it there. Its figures do not change: wallets are valued
+    /// together whatever their portfolio.
+    fn rename_wallet(self: &Rc<Self>, index: usize, label: &str, portfolio: Option<i64>) {
+        let moved = {
+            let mut state = self.state.borrow_mut();
+            let current = state.store.wallets.get(index).map(|w| w.portfolio);
+            let saved =
+                state
+                    .store
+                    .rename(index, label)
+                    .and_then(|()| match (portfolio, current) {
+                        (Some(target), Some(now)) if target != now => {
+                            state.store.move_wallet(index, target).map(|()| true)
+                        }
+                        _ => Ok(false),
+                    });
+            match saved {
+                Ok(moved) => moved,
+                Err(err) => {
+                    drop(state);
+                    self.toast(&format!("Couldn’t save the wallet: {err}"));
+                    return;
+                }
+            }
+        };
+        self.rebuild_sidebar();
+        if moved {
+            // The wallet left the portfolio on screen.
+            self.select(Selection::Overview);
+        } else {
+            self.render();
+        }
+    }
+
+    // --- Portfolios ------------------------------------------------------
+
+    /// Shows the portfolio on screen in the sidebar header, rebuilds the list
+    /// of portfolios in its menu and turns Delete off when there is only one.
+    fn sync_portfolio_ui(&self) {
+        let state = self.state.borrow();
+        let active = state.store.active_portfolio();
+        self.portfolio_btn.set_label(&active.name);
+
+        let list = gio::Menu::new();
+        for portfolio in &state.store.portfolios {
+            // An underscore in a menu label marks a shortcut letter.
+            let item = gio::MenuItem::new(Some(&portfolio.name.replace('_', "__")), None);
+            item.set_action_and_target_value(
+                Some("win.select-portfolio"),
+                Some(&portfolio.id.to_variant()),
+            );
+            list.append_item(&item);
+        }
+        let manage = gio::Menu::new();
+        manage.append(Some("_New Portfolio…"), Some("win.new-portfolio"));
+        manage.append(Some("_Rename Portfolio…"), Some("win.rename-portfolio"));
+        manage.append(Some("_Delete Portfolio…"), Some("win.delete-portfolio"));
+        let menu = gio::Menu::new();
+        menu.append_section(None, &list);
+        menu.append_section(None, &manage);
+        self.portfolio_btn.set_menu_model(Some(&menu));
+
+        let (active_id, several) = (active.id, state.store.portfolios.len() > 1);
+        drop(state);
+        gio::prelude::ActionGroupExt::change_action_state(
+            &self.window,
+            "select-portfolio",
+            &active_id.to_variant(),
+        );
+        if let Some(delete) = self
+            .window
+            .lookup_action("delete-portfolio")
+            .and_then(|action| action.downcast::<gio::SimpleAction>().ok())
+        {
+            delete.set_enabled(several);
+        }
+    }
+
+    /// Puts another portfolio on screen, starting at its overview.
+    fn switch_portfolio(self: &Rc<Self>, id: i64) {
+        if self.state.borrow().store.active_portfolio().id == id {
             return;
         }
+        let saved = self.state.borrow_mut().store.set_active(id);
+        if let Err(err) = saved {
+            self.toast(&format!("Couldn’t switch portfolio: {err}"));
+            return;
+        }
+        self.sync_portfolio_ui();
         self.rebuild_sidebar();
+        self.select(Selection::Overview);
+    }
+
+    /// Whether `name` can be given to a portfolio: not empty, and not the
+    /// name of another one (`except`), ignoring case.
+    fn portfolio_name_is_free(&self, name: &str, except: Option<i64>) -> bool {
+        let name = name.trim();
+        !name.is_empty()
+            && !self
+                .state
+                .borrow()
+                .store
+                .portfolios
+                .iter()
+                .any(|p| Some(p.id) != except && p.name.eq_ignore_ascii_case(name))
+    }
+
+    fn show_new_portfolio_dialog(self: &Rc<Self>) {
+        let dialog = self.portfolio_name_dialog(
+            "New Portfolio",
+            Some("A portfolio is a group of wallets, such as personal and business."),
+            "_Create",
+            "",
+            None,
+        );
+        let ui = self.clone();
+        dialog.connect_name_chosen(move |name| ui.create_portfolio(name));
+        dialog.present(&self.window);
+    }
+
+    fn show_rename_portfolio_dialog(self: &Rc<Self>) {
+        let portfolio = self.state.borrow().store.active_portfolio().clone();
+        let dialog = self.portfolio_name_dialog(
+            "Rename Portfolio",
+            None,
+            "_Save",
+            &portfolio.name,
+            Some(portfolio.id),
+        );
+        let ui = self.clone();
+        dialog.connect_name_chosen(move |name| ui.rename_portfolio(portfolio.id, name));
+        dialog.present(&self.window);
+    }
+
+    /// A dialog with one name field. Its button works once the name is not
+    /// empty and not used by another portfolio.
+    fn portfolio_name_dialog(
+        self: &Rc<Self>,
+        title: &str,
+        body: Option<&str>,
+        button: &str,
+        initial: &str,
+        except: Option<i64>,
+    ) -> NameDialog {
+        let dialog = adw::AlertDialog::new(Some(title), body);
+        dialog.add_responses(&[("cancel", "_Cancel"), ("save", button)]);
+        dialog.set_response_appearance("save", adw::ResponseAppearance::Suggested);
+        dialog.set_default_response(Some("save"));
+        dialog.set_close_response("cancel");
+        dialog.set_response_enabled("save", false);
+
+        let entry = adw::EntryRow::builder()
+            .title("Name")
+            .text(initial)
+            .activates_default(true)
+            .build();
+        let fields = boxed_list();
+        fields.append(&entry);
+        dialog.set_extra_child(Some(&fields));
+
+        let check = {
+            let (ui, dialog) = (self.clone(), dialog.clone());
+            move |entry: &adw::EntryRow| {
+                let free = ui.portfolio_name_is_free(entry.text().as_str(), except);
+                dialog.set_response_enabled("save", free);
+            }
+        };
+        check(&entry);
+        entry.connect_changed(check);
+        NameDialog { dialog, entry }
+    }
+
+    fn create_portfolio(self: &Rc<Self>, name: &str) {
+        let created = {
+            let mut state = self.state.borrow_mut();
+            state
+                .store
+                .add_portfolio(name)
+                .and_then(|id| state.store.set_active(id))
+        };
+        if let Err(err) = created {
+            self.toast(&format!("Couldn’t create the portfolio: {err}"));
+        }
+        // Even after a failed switch the list may have changed.
+        self.sync_portfolio_ui();
+        self.rebuild_sidebar();
+        self.select(Selection::Overview);
+    }
+
+    fn rename_portfolio(self: &Rc<Self>, id: i64, name: &str) {
+        let saved = self.state.borrow_mut().store.rename_portfolio(id, name);
+        if let Err(err) = saved {
+            self.toast(&format!("Couldn’t rename the portfolio: {err}"));
+            return;
+        }
+        self.sync_portfolio_ui();
         self.render();
+    }
+
+    fn show_delete_portfolio_dialog(self: &Rc<Self>) {
+        let (portfolio, wallets) = {
+            let state = self.state.borrow();
+            let portfolio = state.store.active_portfolio().clone();
+            let wallets = state
+                .store
+                .wallets
+                .iter()
+                .filter(|w| w.portfolio == portfolio.id)
+                .count();
+            (portfolio, wallets)
+        };
+        let body = match wallets {
+            0 => "This portfolio has no wallets.".to_owned(),
+            n => format!(
+                "This removes {} from Morlaco, with their saved transactions. Your coins are not \
+                 affected. Coins moved between {} and your other portfolios will count as a sale \
+                 or a purchase there.",
+                if n == 1 {
+                    "its wallet".to_owned()
+                } else {
+                    format!("its {n} wallets")
+                },
+                if n == 1 { "it" } else { "them" },
+            ),
+        };
+        let dialog =
+            adw::AlertDialog::new(Some(&format!("Delete “{}”?", portfolio.name)), Some(&body));
+        dialog.add_responses(&[("cancel", "_Cancel"), ("delete", "_Delete")]);
+        dialog.set_response_appearance("delete", adw::ResponseAppearance::Destructive);
+        dialog.set_default_response(Some("cancel"));
+        dialog.set_close_response("cancel");
+
+        let ui = self.clone();
+        dialog.connect_response(None, move |_, response| {
+            if response == "delete" {
+                ui.delete_portfolio(portfolio.id);
+            }
+        });
+        dialog.present(Some(&self.window));
+    }
+
+    fn delete_portfolio(self: &Rc<Self>, id: i64) {
+        {
+            let mut state = self.state.borrow_mut();
+            match state.store.remove_portfolio(id) {
+                Ok(removed) => {
+                    for wallet in &removed {
+                        state.histories.remove(wallet);
+                        state.errors.remove(wallet);
+                    }
+                    // Wallets elsewhere that were linked to these now see the
+                    // transfers as sales and purchases.
+                    state.recompute();
+                }
+                Err(err) => {
+                    drop(state);
+                    self.toast(&format!("Couldn’t delete the portfolio: {err}"));
+                    return;
+                }
+            }
+        }
+        self.sync_portfolio_ui();
+        self.rebuild_sidebar();
+        self.select(Selection::Overview);
     }
 
     fn add_wallet(self: &Rc<Self>, wallet: &WalletId, label: &str) {
@@ -1230,6 +1552,25 @@ impl Ui {
     // --- Selection and loading ------------------------------------------
 
     fn select(self: &Rc<Self>, selection: Selection) {
+        // A wallet in another portfolio brings that portfolio on screen.
+        if let Selection::Wallet(i) = selection {
+            let target = {
+                let state = self.state.borrow();
+                state
+                    .store
+                    .wallets
+                    .get(i)
+                    .map(|w| w.portfolio)
+                    .filter(|portfolio| *portfolio != state.store.active_portfolio().id)
+            };
+            if let Some(portfolio) = target {
+                if let Err(err) = self.state.borrow_mut().store.set_active(portfolio) {
+                    self.toast(&format!("Couldn’t save the setting: {err}"));
+                }
+                self.sync_portfolio_ui();
+                self.rebuild_sidebar();
+            }
+        }
         self.state.borrow_mut().selection = selection;
         self.lots.reset();
         self.history.reset();
@@ -1459,7 +1800,14 @@ impl Ui {
     }
 
     fn show_overview(&self, state: &State, hidden: bool) {
-        let wallets = &state.store.wallets;
+        // The wallets of the portfolio on screen, with their place in the
+        // store.
+        let wallets: Vec<(usize, &Wallet)> = state
+            .store
+            .visible_wallets()
+            .into_iter()
+            .map(|index| (index, &state.store.wallets[index]))
+            .collect();
         if wallets.is_empty() {
             self.pages.set_visible_child_name("empty");
             return;
@@ -1467,7 +1815,7 @@ impl Ui {
 
         let loaded: Vec<(&Wallet, &Portfolio)> = wallets
             .iter()
-            .filter_map(|w| state.portfolios.get(&w.id).map(|p| (w, p)))
+            .filter_map(|(_, w)| state.portfolios.get(&w.id).map(|p| (*w, p)))
             .collect();
         let Some((_, first)) = loaded.first() else {
             self.show_error(state.errors.values().next());
@@ -1490,8 +1838,13 @@ impl Ui {
                 balance_units: loaded.iter().map(|(_, p)| p.balance_units).sum(),
                 price_usd: first.price_now_usd,
             });
-        self.overview
-            .update("All Wallets", &count, &total, coin, hidden);
+        self.overview.update(
+            &state.store.active_portfolio().name,
+            &count,
+            &total,
+            coin,
+            hidden,
+        );
 
         let failed = wallets.len() - loaded.len();
         self.overview_warning.set_visible(failed > 0);
@@ -1501,7 +1854,7 @@ impl Ui {
         ));
 
         clear(&self.overview_wallets);
-        for (index, wallet) in wallets.iter().enumerate() {
+        for (index, wallet) in wallets.iter().copied() {
             let row = adw::ActionRow::builder()
                 .title(wallet.display_name())
                 .use_markup(false)
@@ -1609,6 +1962,28 @@ impl Ui {
         if let Some(p) = state.portfolios.get(&wallet.id) {
             f(wallet, p, state.store.hidden);
         }
+    }
+}
+
+/// A dialog with a single name field.
+struct NameDialog {
+    dialog: adw::AlertDialog,
+    entry: adw::EntryRow,
+}
+
+impl NameDialog {
+    /// Calls `f` with the name when the user confirms.
+    fn connect_name_chosen(&self, f: impl Fn(&str) + 'static) {
+        let entry = self.entry.clone();
+        self.dialog.connect_response(None, move |_, response| {
+            if response == "save" {
+                f(entry.text().as_str());
+            }
+        });
+    }
+
+    fn present(&self, parent: &adw::ApplicationWindow) {
+        self.dialog.present(Some(parent));
     }
 }
 

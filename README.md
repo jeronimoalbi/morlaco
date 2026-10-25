@@ -16,11 +16,14 @@ your coins arrived, and shows your estimated gain or loss.
 
 - Your balance and what it's worth in US dollars.
 - Your gain or loss, for each wallet and for all of them together.
+- Portfolios, to group your wallets (personal, business, …). Switch between
+  them from the name at the top of the sidebar, where you can also create,
+  rename and delete them.
 - Your coins, listed by the day they arrived and the price back then.
 - A button that hides every number, for when someone is looking over your
   shoulder.
 - Moves between your own wallets aren't treated as selling, so they don't mess
-  up your numbers.
+  up your numbers, even when the wallets are in different portfolios.
 - Your saved data is encrypted on your computer.
 
 ## Install

@@ -4,12 +4,13 @@
 //! through to the database first, so a failed write never leaves the screen
 //! showing something that was not saved.
 
-use morlaco_core::Result;
 use morlaco_core::chain::{Chain, WalletId};
 use morlaco_core::db::Database;
 use morlaco_core::portfolio::{History, SETTING_ETHERSCAN_KEY};
+use morlaco_core::{Error, Result};
 
 const HIDDEN_KEY: &str = "hidden";
+const ACTIVE_PORTFOLIO_KEY: &str = "active_portfolio";
 
 /// A tracked wallet with an optional user label.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -18,6 +19,17 @@ pub struct Wallet {
     pub id: WalletId,
     /// Name chosen by the user; may be empty.
     pub label: String,
+    /// The [`Portfolio::id`] of the portfolio the wallet is in.
+    pub portfolio: i64,
+}
+
+/// A named group of wallets.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Portfolio {
+    /// Stable identifier.
+    pub id: i64,
+    /// Name chosen by the user.
+    pub name: String,
 }
 
 impl Wallet {
@@ -33,8 +45,12 @@ impl Wallet {
 
 /// Everything the app remembers between runs.
 pub struct Store {
-    /// Tracked wallets in the order they were added.
+    /// Tracked wallets in the order they were added, in every portfolio.
     pub wallets: Vec<Wallet>,
+    /// The portfolios in the order they were created. Never empty.
+    pub portfolios: Vec<Portfolio>,
+    /// The [`Portfolio::id`] of the portfolio on screen.
+    active: i64,
     /// Whether amounts are masked.
     pub hidden: bool,
     db: Database,
@@ -49,14 +65,112 @@ impl Store {
             .map(|w| Wallet {
                 id: w.id,
                 label: w.label,
+                portfolio: w.portfolio,
             })
             .collect();
+        let portfolios: Vec<Portfolio> = db
+            .portfolios()?
+            .into_iter()
+            .map(|p| Portfolio {
+                id: p.id,
+                name: p.name,
+            })
+            .collect();
+        let first = portfolios
+            .first()
+            .map(|p| p.id)
+            .ok_or(Error::NoSuchPortfolio)?;
+        // The saved choice may be gone, for example after a restore.
+        let active = db
+            .setting(ACTIVE_PORTFOLIO_KEY)?
+            .and_then(|saved| saved.parse().ok())
+            .filter(|id| portfolios.iter().any(|p| p.id == *id))
+            .unwrap_or(first);
         let hidden = db.setting(HIDDEN_KEY)?.as_deref() == Some("1");
         Ok(Self {
             wallets,
+            portfolios,
+            active,
             hidden,
             db,
         })
+    }
+
+    /// The portfolio on screen.
+    pub fn active_portfolio(&self) -> &Portfolio {
+        self.portfolios
+            .iter()
+            .find(|p| p.id == self.active)
+            .unwrap_or(&self.portfolios[0])
+    }
+
+    /// The indices, in [`wallets`](Self::wallets), of the wallets of the
+    /// portfolio on screen.
+    pub fn visible_wallets(&self) -> Vec<usize> {
+        let active = self.active_portfolio().id;
+        (0..self.wallets.len())
+            .filter(|&i| self.wallets[i].portfolio == active)
+            .collect()
+    }
+
+    /// Puts another portfolio on screen and remembers the choice.
+    pub fn set_active(&mut self, id: i64) -> Result<()> {
+        if !self.portfolios.iter().any(|p| p.id == id) {
+            return Err(Error::NoSuchPortfolio);
+        }
+        self.db.set_setting(ACTIVE_PORTFOLIO_KEY, &id.to_string())?;
+        self.active = id;
+        Ok(())
+    }
+
+    /// Creates a portfolio and returns its id. It is not put on screen.
+    pub fn add_portfolio(&mut self, name: &str) -> Result<i64> {
+        let name = clean_label(name);
+        let id = self.db.add_portfolio(&name)?;
+        self.portfolios.push(Portfolio {
+            id,
+            name: name.trim().to_owned(),
+        });
+        Ok(id)
+    }
+
+    /// Gives a portfolio a new name.
+    pub fn rename_portfolio(&mut self, id: i64, name: &str) -> Result<()> {
+        let name = clean_label(name);
+        self.db.rename_portfolio(id, &name)?;
+        if let Some(portfolio) = self.portfolios.iter_mut().find(|p| p.id == id) {
+            portfolio.name = name;
+        }
+        Ok(())
+    }
+
+    /// Removes a portfolio and its wallets, and returns the wallets that went.
+    /// If it was on screen, the first remaining portfolio is shown instead.
+    pub fn remove_portfolio(&mut self, id: i64) -> Result<Vec<WalletId>> {
+        self.db.remove_portfolio(id)?;
+        self.portfolios.retain(|p| p.id != id);
+        let mut removed = Vec::new();
+        self.wallets.retain(|w| {
+            let gone = w.portfolio == id;
+            if gone {
+                removed.push(w.id.clone());
+            }
+            !gone
+        });
+        if self.active == id {
+            let first = self.portfolios[0].id;
+            self.set_active(first)?;
+        }
+        Ok(removed)
+    }
+
+    /// Moves the wallet at `index`, if it exists, to another portfolio.
+    pub fn move_wallet(&mut self, index: usize, portfolio: i64) -> Result<()> {
+        if let Some(wallet) = self.wallets.get_mut(index) {
+            self.db.move_wallet(&wallet.id, portfolio)?;
+            wallet.portfolio = portfolio;
+        }
+        Ok(())
     }
 
     /// Index of the wallet with this id.
@@ -74,14 +188,16 @@ impl Store {
             .collect()
     }
 
-    /// Adds a wallet and returns its index. Control characters in the label
-    /// are replaced with spaces.
+    /// Adds a wallet to the portfolio on screen and returns its index.
+    /// Control characters in the label are replaced with spaces.
     pub fn add(&mut self, id: &WalletId, label: &str) -> Result<usize> {
         let label = clean_label(label);
-        self.db.add_wallet(id, &label)?;
+        let portfolio = self.active;
+        self.db.add_wallet_to(id, &label, portfolio)?;
         self.wallets.push(Wallet {
             id: id.clone(),
             label,
+            portfolio,
         });
         Ok(self.wallets.len() - 1)
     }
@@ -314,5 +430,109 @@ mod tests {
         assert_eq!(store.etherscan_key().as_deref(), Some("ABC123"));
         store.set_etherscan_key("").expect("clear");
         assert_eq!(store.etherscan_key(), None);
+    }
+
+    #[test]
+    fn a_new_store_has_one_portfolio_on_screen() {
+        let store = store();
+        assert_eq!(store.portfolios.len(), 1);
+        assert_eq!(store.active_portfolio().name, "Main");
+    }
+
+    #[test]
+    fn wallets_go_to_the_portfolio_on_screen_and_only_those_are_visible() {
+        let mut store = store();
+        store
+            .add(&btc("bc1qaaaaaaaaaaaaaaaa"), "In main")
+            .expect("add");
+        let business = store.add_portfolio("Business").expect("create");
+        store.set_active(business).expect("switch");
+        store
+            .add(&btc("bc1qbbbbbbbbbbbbbbbb"), "In business")
+            .expect("add");
+
+        assert_eq!(store.visible_wallets(), [1]);
+        assert_eq!(store.wallets[1].portfolio, business);
+        store
+            .set_active(store.portfolios[0].id)
+            .expect("switch back");
+        assert_eq!(store.visible_wallets(), [0]);
+    }
+
+    #[test]
+    fn the_portfolio_on_screen_is_remembered() {
+        let mut store = store();
+        let business = store.add_portfolio("Business").expect("create");
+        store.set_active(business).expect("switch");
+
+        // Open the same database again: the choice comes back.
+        let reopened = Store::open(store.db).expect("reopens");
+        assert_eq!(reopened.active_portfolio().name, "Business");
+    }
+
+    #[test]
+    fn a_remembered_portfolio_that_no_longer_exists_falls_back_to_the_first() {
+        let store = store();
+        store
+            .db
+            .set_setting(ACTIVE_PORTFOLIO_KEY, "999")
+            .expect("save");
+        let reopened = Store::open(store.db).expect("reopens");
+        assert_eq!(reopened.active_portfolio().name, "Main");
+    }
+
+    #[test]
+    fn portfolios_can_be_renamed_and_names_are_checked() {
+        let mut store = store();
+        let id = store.add_portfolio("  Business\t").expect("create");
+        assert_eq!(store.portfolios[1].name, "Business");
+        store.rename_portfolio(id, " Work ").expect("rename");
+        assert_eq!(store.portfolios[1].name, "Work");
+        assert!(matches!(
+            store.add_portfolio("work"),
+            Err(Error::PortfolioNameTaken)
+        ));
+        assert!(matches!(
+            store.rename_portfolio(id, "  "),
+            Err(Error::EmptyPortfolioName)
+        ));
+        assert_eq!(store.portfolios.len(), 2);
+    }
+
+    #[test]
+    fn removing_a_portfolio_removes_its_wallets_and_moves_the_screen_off_it() {
+        let mut store = store();
+        store
+            .add(&btc("bc1qaaaaaaaaaaaaaaaa"), "keep")
+            .expect("add");
+        let business = store.add_portfolio("Business").expect("create");
+        store.set_active(business).expect("switch");
+        store
+            .add(&btc("bc1qbbbbbbbbbbbbbbbb"), "drop")
+            .expect("add");
+
+        let removed = store.remove_portfolio(business).expect("remove");
+        assert_eq!(removed, [btc("bc1qbbbbbbbbbbbbbbbb")]);
+        assert_eq!(store.wallets.len(), 1);
+        assert_eq!(store.portfolios.len(), 1);
+        assert_eq!(store.active_portfolio().name, "Main");
+
+        let only = store.portfolios[0].id;
+        assert!(matches!(
+            store.remove_portfolio(only),
+            Err(Error::LastPortfolio)
+        ));
+    }
+
+    #[test]
+    fn a_wallet_can_move_to_another_portfolio() {
+        let mut store = store();
+        store.add(&btc("bc1qaaaaaaaaaaaaaaaa"), "").expect("add");
+        let business = store.add_portfolio("Business").expect("create");
+        store.move_wallet(0, business).expect("move");
+        assert_eq!(store.wallets[0].portfolio, business);
+        assert!(store.visible_wallets().is_empty());
+        let reopened = Store::open(store.db).expect("reopens");
+        assert_eq!(reopened.wallets[0].portfolio, business);
     }
 }
