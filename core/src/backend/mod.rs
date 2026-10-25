@@ -2,3 +2,4 @@
 //! [`ChainBackend`](crate::chain::ChainBackend).
 
 pub mod bitcoin;
+pub mod ethereum;

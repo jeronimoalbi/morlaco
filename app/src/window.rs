@@ -17,7 +17,7 @@ use morlaco_core::db::Database;
 use morlaco_core::lots::{Lot, Summary};
 use morlaco_core::paths;
 use morlaco_core::portfolio::{self, Entry, History, Portfolio};
-use morlaco_core::price::{CachedPrices, MempoolPrices, PriceSource};
+use morlaco_core::price::{CachedPrices, LivePrices, PriceSource};
 use morlaco_core::util::date_string;
 
 use crate::encryption;
@@ -1739,7 +1739,7 @@ fn fetch_all(wallets: Vec<WalletId>, key: &str, done: &AtomicUsize, txs: &Atomic
         Ok(cache) => cache,
         Err(message) => return Fetched::failed(wallets, &message),
     };
-    let prices = CachedPrices::new(MempoolPrices, &cache);
+    let prices = CachedPrices::new(LivePrices, &cache);
 
     // One price lookup per chain, however many wallets it has.
     let mut now: HashMap<Chain, Result<f64, String>> = HashMap::new();

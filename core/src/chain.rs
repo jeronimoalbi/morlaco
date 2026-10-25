@@ -18,6 +18,7 @@
 //! Tokens are not supported yet: a wallet holds only its chain's native coin.
 
 use crate::backend::bitcoin::BitcoinBackend;
+use crate::backend::ethereum::EthereumBackend;
 use crate::{Error, Result};
 
 /// A blockchain network whose native coin can be tracked.
@@ -25,6 +26,8 @@ use crate::{Error, Result};
 pub enum Chain {
     /// Bitcoin.
     Bitcoin,
+    /// Ethereum, with its native coin ether.
+    Ethereum,
     /// A second chain with 18 decimals, so tests can cover several chains.
     #[cfg(test)]
     Fake,
@@ -32,12 +35,13 @@ pub enum Chain {
 
 impl Chain {
     /// Every chain the app can track.
-    pub const ALL: &'static [Chain] = &[Chain::Bitcoin];
+    pub const ALL: &'static [Chain] = &[Chain::Bitcoin, Chain::Ethereum];
 
     /// Stable identifier used when saving data.
     pub fn key(self) -> &'static str {
         match self {
             Chain::Bitcoin => "bitcoin",
+            Chain::Ethereum => "ethereum",
             #[cfg(test)]
             Chain::Fake => "fake",
         }
@@ -47,6 +51,7 @@ impl Chain {
     pub fn from_key(key: &str) -> Option<Chain> {
         match key {
             "bitcoin" => Some(Chain::Bitcoin),
+            "ethereum" => Some(Chain::Ethereum),
             #[cfg(test)]
             "fake" => Some(Chain::Fake),
             _ => None,
@@ -57,6 +62,7 @@ impl Chain {
     pub fn name(self) -> &'static str {
         match self {
             Chain::Bitcoin => "Bitcoin",
+            Chain::Ethereum => "Ethereum",
             #[cfg(test)]
             Chain::Fake => "Fake Chain",
         }
@@ -66,6 +72,7 @@ impl Chain {
     pub fn symbol(self) -> &'static str {
         match self {
             Chain::Bitcoin => "BTC",
+            Chain::Ethereum => "ETH",
             #[cfg(test)]
             Chain::Fake => "FAKE",
         }
@@ -76,6 +83,7 @@ impl Chain {
     pub fn decimals(self) -> u8 {
         match self {
             Chain::Bitcoin => 8,
+            Chain::Ethereum => 18,
             #[cfg(test)]
             Chain::Fake => 18,
         }
@@ -97,6 +105,11 @@ impl Chain {
                 (14..=90).contains(&address.len())
                     && address.chars().all(|c| c.is_ascii_alphanumeric())
             }
+            Chain::Ethereum => {
+                address.len() == 42
+                    && address.starts_with("0x")
+                    && address[2..].chars().all(|c| c.is_ascii_hexdigit())
+            }
             #[cfg(test)]
             Chain::Fake => !address.is_empty(),
         };
@@ -111,6 +124,7 @@ impl Chain {
     pub fn explorer_tx_url(self, txid: &str) -> String {
         match self {
             Chain::Bitcoin => format!("https://mempool.space/tx/{txid}"),
+            Chain::Ethereum => format!("https://etherscan.io/tx/{txid}"),
             #[cfg(test)]
             Chain::Fake => format!("https://fake.example/tx/{txid}"),
         }
@@ -120,6 +134,7 @@ impl Chain {
     pub fn backend(self) -> &'static dyn ChainBackend {
         match self {
             Chain::Bitcoin => &BitcoinBackend,
+            Chain::Ethereum => &EthereumBackend,
             #[cfg(test)]
             Chain::Fake => &FakeBackend,
         }
@@ -139,12 +154,15 @@ pub struct WalletId {
 }
 
 impl WalletId {
-    /// Creates an id.
+    /// Creates an id. Ethereum addresses are written in lowercase, so the same
+    /// address typed in two ways is one wallet.
     pub fn new(chain: Chain, address: impl Into<String>) -> Self {
-        Self {
-            chain,
-            address: address.into(),
-        }
+        let address = address.into();
+        let address = match chain {
+            Chain::Ethereum => address.to_ascii_lowercase(),
+            _ => address,
+        };
+        Self { chain, address }
     }
 }
 
@@ -212,7 +230,7 @@ mod tests {
 
     #[test]
     fn keys_round_trip_for_every_chain() {
-        for chain in [Chain::Bitcoin, Chain::Fake] {
+        for chain in [Chain::Bitcoin, Chain::Ethereum, Chain::Fake] {
             assert_eq!(Chain::from_key(chain.key()), Some(chain));
         }
         assert_eq!(Chain::from_key("dogecoin"), None);
@@ -259,5 +277,47 @@ mod tests {
             WalletId::new(Chain::Bitcoin, "x"),
             WalletId::new(Chain::Fake, "x")
         );
+    }
+
+    #[test]
+    fn ethereum_addresses_need_0x_and_forty_hex_digits() {
+        let eth = Chain::Ethereum;
+        assert!(
+            eth.check_address("0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045")
+                .is_ok()
+        );
+        assert!(eth.check_address("").is_err());
+        assert!(
+            eth.check_address("d8dA6BF26964aF9D7eEd9e03E53415D37aA96045")
+                .is_err()
+        );
+        assert!(
+            eth.check_address("0xd8dA6BF26964aF9D7eEd9e03E53415D37aA9604")
+                .is_err()
+        );
+        assert!(
+            eth.check_address("0xzzdA6BF26964aF9D7eEd9e03E53415D37aA96045")
+                .is_err()
+        );
+        // A Bitcoin address is not an Ethereum address, and the other way.
+        assert!(
+            eth.check_address("bc1qar0srrr7xfkvy5l643lydnw9re59gtzzwf5mdq")
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn ethereum_addresses_are_kept_in_lowercase() {
+        let mixed = WalletId::new(
+            Chain::Ethereum,
+            "0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045",
+        );
+        let lower = WalletId::new(
+            Chain::Ethereum,
+            "0xd8da6bf26964af9d7eed9e03e53415d37aa96045",
+        );
+        assert_eq!(mixed, lower);
+        // Bitcoin addresses are case sensitive and stay as typed.
+        assert_eq!(WalletId::new(Chain::Bitcoin, "AbC").address, "AbC");
     }
 }

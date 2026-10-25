@@ -169,4 +169,18 @@ mod tests {
         );
         assert_eq!(showing_of(50, 120, "lots"), "Showing 50 of 120 lots");
     }
+
+    #[test]
+    fn ether_amounts_are_rounded_to_eight_decimals() {
+        let eth = Chain::Ethereum;
+        // 1.5 ETH plus a few wei that are too small to show.
+        assert_eq!(
+            amount(1_500_000_000_000_000_007, eth, false),
+            "1.50000000 ETH"
+        );
+        assert_eq!(
+            signed_amount(-2_000_000_000_000_000_000, eth, false),
+            "−2.00000000 ETH"
+        );
+    }
 }
