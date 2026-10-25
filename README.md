@@ -107,9 +107,16 @@ Just want to try it? `cargo run` works from the checkout, no install needed.
   recovery key: the passphrase is the key.
 - **Clear Local Data…** in the same menu deletes the file and the key.
 - To read the blockchain and coin prices, Morlaco asks public websites. For
-  Bitcoin that's [mempool.space](https://mempool.space). So that site sees
-  which addresses you look up, along with the usual things any website sees,
-  like your IP address.
+  Bitcoin that's [mempool.space](https://mempool.space). For Ethereum it's
+  [Blockscout](https://eth.blockscout.com) for the history and
+  [Coinbase](https://www.coinbase.com) for prices. Those sites see which
+  addresses you look up, along with the usual things any website sees, like
+  your IP address.
+- Ethereum prices are one estimate per day, so they are coarser than Bitcoin's.
+- Blockscout needs no account but can be slow for busy Ethereum addresses. If
+  you have a free [Etherscan](https://etherscan.io/apis) API key, enter it
+  under **Data Providers…** in the main menu and Morlaco uses Etherscan
+  instead. The key is kept in your encrypted data.
 
 ## Development
 

@@ -9,7 +9,7 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::Result;
-use crate::chain::{Activity, Chain, WalletId};
+use crate::chain::{Activity, Chain, FetchOptions, WalletId};
 use crate::db::Database;
 use crate::lots::{Ledger, Lot, Move, Summary};
 use crate::price::PriceSource;
@@ -62,6 +62,9 @@ pub struct Portfolio {
     pub history: Vec<Entry>,
 }
 
+/// The setting that holds the Etherscan API key, if the user entered one.
+pub const SETTING_ETHERSCAN_KEY: &str = "etherscan_api_key";
+
 /// Blocks this deep can still be replaced by a chain reorganization, so
 /// they are always fetched again.
 const REORG_DEPTH: u64 = 6;
@@ -82,10 +85,15 @@ pub fn fetch(
     let saved = db.history(wallet)?;
     let since = refetch_above(&saved);
 
+    let options = FetchOptions {
+        etherscan_key: db
+            .setting(SETTING_ETHERSCAN_KEY)?
+            .filter(|key| !key.trim().is_empty()),
+    };
     let fresh = wallet
         .chain
         .backend()
-        .fetch(&wallet.address, since, &mut on_progress)?
+        .fetch(&wallet.address, since, &options, &mut on_progress)?
         .into_iter()
         .map(|activity| {
             prices

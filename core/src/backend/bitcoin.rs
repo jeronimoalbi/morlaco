@@ -3,7 +3,7 @@
 use serde::Deserialize;
 
 use crate::Result;
-use crate::chain::{Activity, Chain, ChainBackend};
+use crate::chain::{Activity, Chain, ChainBackend, FetchOptions};
 
 const BASE_URL: &str = "https://mempool.space/api";
 
@@ -19,6 +19,7 @@ impl ChainBackend for BitcoinBackend {
         &self,
         address: &str,
         since_height: u64,
+        _options: &FetchOptions,
         on_progress: &mut dyn FnMut(usize),
     ) -> Result<Vec<Activity>> {
         Chain::Bitcoin.check_address(address)?;

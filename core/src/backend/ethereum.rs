@@ -17,7 +17,8 @@ use std::time::Duration;
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
 
-use crate::chain::{Activity, Chain, ChainBackend};
+use crate::backend::etherscan;
+use crate::chain::{Activity, Chain, ChainBackend, FetchOptions};
 use crate::util::parse_iso_utc;
 use crate::{Error, Result};
 
@@ -42,10 +43,14 @@ impl ChainBackend for EthereumBackend {
         &self,
         address: &str,
         since_height: u64,
+        options: &FetchOptions,
         on_progress: &mut dyn FnMut(usize),
     ) -> Result<Vec<Activity>> {
         Chain::Ethereum.check_address(address)?;
         let address = address.to_ascii_lowercase();
+        if let Some(key) = &options.etherscan_key {
+            return etherscan::fetch(&address, since_height, key, on_progress);
+        }
         let list = |path: &str| format!("{BASE_URL}/addresses/{address}/{path}");
 
         let mut found = 0;
@@ -255,11 +260,6 @@ impl InBlock for RawWithdrawal {
     }
 }
 
-fn is(address: &str, side: &Option<RawAddress>) -> bool {
-    side.as_ref()
-        .is_some_and(|side| side.hash.eq_ignore_ascii_case(address))
-}
-
 fn wei(text: &str) -> Result<u128> {
     text.parse()
         .map_err(|_| Error::BadResponse("an amount is not a number"))
@@ -276,103 +276,181 @@ fn time_of(timestamp: &Option<String>) -> Result<i64> {
         .ok_or(Error::BadResponse("a block time is missing"))
 }
 
-/// Combines the three lists into one activity per transaction hash, oldest
-/// first.
+/// A transaction in the form both providers are turned into. Addresses are
+/// in lowercase.
+pub(crate) struct Tx {
+    pub hash: String,
+    pub height: u64,
+    /// Position inside the block.
+    pub index: Option<u32>,
+    pub time: i64,
+    /// Wei sent along. Zero for a failed transaction, which moves no ether.
+    pub value: u128,
+    /// Wei paid for gas.
+    pub fee: u128,
+    pub from: String,
+    pub to: String,
+}
+
+/// Ether moved by a contract while it ran a transaction. Failed calls are
+/// left out before this point.
+pub(crate) struct Transfer {
+    pub hash: String,
+    pub height: u64,
+    pub time: i64,
+    pub value: u128,
+    pub from: String,
+    pub to: String,
+}
+
+/// Ether paid out by the staking system, which belongs to no transaction.
+pub(crate) struct Withdrawal {
+    pub index: u64,
+    pub height: u64,
+    pub time: i64,
+    pub wei: u128,
+}
+
+/// Turns Blockscout's entries into the common form, skipping what is not in
+/// a block yet, failed calls and the call entry that repeats a transaction's
+/// own value.
 fn merge(
     address: &str,
     transactions: &[RawTx],
     internal: &[RawInternal],
     withdrawals: &[RawWithdrawal],
 ) -> Result<Vec<Activity>> {
+    let mut txs = Vec::new();
+    for tx in transactions {
+        let Some(height) = tx.block_number else {
+            continue;
+        };
+        let failed = tx.status.as_deref() == Some("error");
+        txs.push(Tx {
+            hash: tx.hash.clone(),
+            height,
+            index: tx.position,
+            time: time_of(&tx.timestamp)?,
+            value: if failed { 0 } else { wei(&tx.value)? },
+            fee: match &tx.fee {
+                Some(fee) => wei(&fee.value)?,
+                None => 0,
+            },
+            from: lowercase(&tx.from),
+            to: lowercase(&tx.to),
+        });
+    }
+
+    let mut transfers = Vec::new();
+    for transfer in internal {
+        let Some(height) = transfer.block_number else {
+            continue;
+        };
+        // The first internal entry of a transaction is the call itself, whose
+        // value is already counted from the transaction.
+        if transfer.index == Some(0) || transfer.success == Some(false) {
+            continue;
+        }
+        transfers.push(Transfer {
+            hash: transfer.transaction_hash.clone(),
+            height,
+            time: time_of(&transfer.timestamp)?,
+            value: wei(&transfer.value)?,
+            from: lowercase(&transfer.from),
+            to: lowercase(&transfer.to),
+        });
+    }
+
+    let mut payouts = Vec::new();
+    for withdrawal in withdrawals {
+        let Some(height) = withdrawal.block_number else {
+            continue;
+        };
+        payouts.push(Withdrawal {
+            index: withdrawal.index,
+            height,
+            time: time_of(&withdrawal.timestamp)?,
+            wei: wei(&withdrawal.amount)? * WEI_PER_GWEI,
+        });
+    }
+
+    Ok(combine(address, &txs, &transfers, &payouts))
+}
+
+fn lowercase(side: &Option<RawAddress>) -> String {
+    side.as_ref()
+        .map(|side| side.hash.to_ascii_lowercase())
+        .unwrap_or_default()
+}
+
+/// Combines transactions, internal transfers and withdrawals into one
+/// activity per transaction hash, oldest first. `address` is in lowercase.
+pub(crate) fn combine(
+    address: &str,
+    transactions: &[Tx],
+    internal: &[Transfer],
+    withdrawals: &[Withdrawal],
+) -> Vec<Activity> {
     let mut by_hash: BTreeMap<String, Activity> = BTreeMap::new();
 
     for tx in transactions {
-        let (Some(height), sent, received) =
-            (tx.block_number, is(address, &tx.from), is(address, &tx.to))
-        else {
-            continue;
-        };
+        let (sent, received) = (tx.from == address, tx.to == address);
         if !sent && !received {
             continue;
         }
-        // A failed transaction moves no ether, but its fee is still paid.
-        let value = if tx.status.as_deref() == Some("error") {
-            0
-        } else {
-            wei(&tx.value)?
-        };
         let mut amount = 0;
         if received {
-            amount += signed(value);
+            amount += signed(tx.value);
         }
         if sent {
-            amount -= signed(value);
+            amount -= signed(tx.value);
         }
-        // The fee is paid by whoever sent the transaction.
-        let fee = match (&tx.fee, sent) {
-            (Some(fee), true) => wei(&fee.value)?,
-            _ => 0,
-        };
         by_hash.insert(
             tx.hash.clone(),
             Activity {
                 txid: tx.hash.clone(),
-                height,
-                index: tx.position,
-                time: time_of(&tx.timestamp)?,
+                height: tx.height,
+                index: tx.index,
+                time: tx.time,
                 amount,
-                fee,
+                // The fee is paid by whoever sent the transaction.
+                fee: if sent { tx.fee } else { 0 },
                 parents: Vec::new(),
             },
         );
     }
 
     for transfer in internal {
-        let Some(height) = transfer.block_number else {
-            continue;
-        };
-        // The first internal entry of a transaction is the call itself, whose
-        // value is already counted from the transaction. Failed calls move
-        // nothing.
-        if transfer.index == Some(0) || transfer.success == Some(false) {
-            continue;
-        }
-        let value = signed(wei(&transfer.value)?);
-        let change = match (is(address, &transfer.to), is(address, &transfer.from)) {
+        let value = signed(transfer.value);
+        let change = match (transfer.to == address, transfer.from == address) {
             (true, false) => value,
             (false, true) => -value,
             _ => continue,
         };
-        let activity = match by_hash.get_mut(&transfer.transaction_hash) {
-            Some(activity) => activity,
-            None => by_hash
-                .entry(transfer.transaction_hash.clone())
-                .or_insert(Activity {
-                    txid: transfer.transaction_hash.clone(),
-                    height,
-                    index: None,
-                    time: time_of(&transfer.timestamp)?,
-                    amount: 0,
-                    fee: 0,
-                    parents: Vec::new(),
-                }),
-        };
-        activity.amount += change;
+        by_hash
+            .entry(transfer.hash.clone())
+            .or_insert(Activity {
+                txid: transfer.hash.clone(),
+                height: transfer.height,
+                index: None,
+                time: transfer.time,
+                amount: 0,
+                fee: 0,
+                parents: Vec::new(),
+            })
+            .amount += change;
     }
 
     for withdrawal in withdrawals {
-        let Some(height) = withdrawal.block_number else {
-            continue;
-        };
         let id = format!("withdrawal-{}", withdrawal.index);
         by_hash.insert(
             id.clone(),
             Activity {
                 txid: id,
-                height,
+                height: withdrawal.height,
                 index: None,
-                time: time_of(&withdrawal.timestamp)?,
-                amount: signed(wei(&withdrawal.amount)? * WEI_PER_GWEI),
+                time: withdrawal.time,
+                amount: signed(withdrawal.wei),
                 fee: 0,
                 parents: Vec::new(),
             },
@@ -384,7 +462,7 @@ fn merge(
     // received) change no balance and are not worth a row.
     found.retain(|a| a.amount != 0 || a.fee != 0);
     found.sort_by_key(|a| (a.height, a.index));
-    Ok(found)
+    found
 }
 
 #[cfg(test)]

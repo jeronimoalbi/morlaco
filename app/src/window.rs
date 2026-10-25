@@ -499,6 +499,7 @@ impl Ui {
         let data = gio::Menu::new();
         data.append(Some("_Encryption…"), Some("win.encryption"));
         data.append(Some("_Recovery Key…"), Some("win.recovery-key"));
+        data.append(Some("_Data Providers…"), Some("win.data-providers"));
         data.append(Some("_Clear Local Data…"), Some("win.clear-data"));
         menu.append_section(None, &data);
         let app_menu = gio::Menu::new();
@@ -606,6 +607,7 @@ impl Ui {
         });
         self.add_action("encryption", |ui| ui.show_encryption_dialog());
         self.add_action("recovery-key", |ui| ui.show_recovery_key_dialog());
+        self.add_action("data-providers", |ui| ui.show_data_providers_dialog());
         self.add_action("clear-data", |ui| ui.confirm_clear_data());
         let ui = self.clone();
         self.history
@@ -985,6 +987,56 @@ impl Ui {
             }
             Err(message) => self.toast(&format!("Couldn’t change the encryption: {message}")),
         }
+    }
+
+    /// Lets the user enter an Etherscan API key, which makes Ethereum wallets
+    /// load from Etherscan instead of the keyless service.
+    fn show_data_providers_dialog(self: &Rc<Self>) {
+        let current = self
+            .state
+            .borrow()
+            .store
+            .etherscan_key()
+            .unwrap_or_default();
+        let dialog = adw::AlertDialog::new(
+            Some("Data Providers"),
+            Some(
+                "Ethereum history comes from Blockscout, which needs no key but can be slow \
+                 for busy addresses. With an Etherscan API key (free at etherscan.io/apis), \
+                 Morlaco uses Etherscan instead, and Etherscan then sees your key and the \
+                 addresses you look up. The key is saved in your encrypted data. Leave it \
+                 empty to use Blockscout.",
+            ),
+        );
+        dialog.add_responses(&[("cancel", "_Cancel"), ("save", "_Save")]);
+        dialog.set_response_appearance("save", adw::ResponseAppearance::Suggested);
+        dialog.set_default_response(Some("save"));
+        dialog.set_close_response("cancel");
+
+        let entry = adw::PasswordEntryRow::builder()
+            .title("Etherscan API key")
+            .text(&current)
+            .build();
+        let fields = boxed_list();
+        fields.append(&entry);
+        dialog.set_extra_child(Some(&fields));
+
+        let ui = self.clone();
+        dialog.connect_response(None, move |_, response| {
+            if response != "save" {
+                return;
+            }
+            let key = entry.text().trim().to_owned();
+            let saved = ui.state.borrow().store.set_etherscan_key(&key);
+            match saved {
+                Ok(()) if key.is_empty() => {
+                    ui.toast("Using Blockscout. Refresh to reload Ethereum wallets.")
+                }
+                Ok(()) => ui.toast("Key saved. Refresh to reload Ethereum wallets with it."),
+                Err(err) => ui.toast(&format!("Could not save the key: {err}")),
+            }
+        });
+        dialog.present(Some(&self.window));
     }
 
     fn show_recovery_key_dialog(self: &Rc<Self>) {

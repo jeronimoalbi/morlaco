@@ -191,6 +191,14 @@ pub struct Activity {
     pub parents: Vec<String>,
 }
 
+/// Choices that change where a backend reads a history from.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct FetchOptions {
+    /// An Etherscan API key. With one, Ethereum is read from Etherscan, which
+    /// is faster for busy addresses than the keyless service used otherwise.
+    pub etherscan_key: Option<String>,
+}
+
 /// Reads one chain's history.
 pub trait ChainBackend: Sync {
     /// The chain this backend reads.
@@ -205,6 +213,7 @@ pub trait ChainBackend: Sync {
         &self,
         address: &str,
         since_height: u64,
+        options: &FetchOptions,
         on_progress: &mut dyn FnMut(usize),
     ) -> Result<Vec<Activity>>;
 }
@@ -219,7 +228,13 @@ impl ChainBackend for FakeBackend {
         Chain::Fake
     }
 
-    fn fetch(&self, _: &str, _: u64, _: &mut dyn FnMut(usize)) -> Result<Vec<Activity>> {
+    fn fetch(
+        &self,
+        _: &str,
+        _: u64,
+        _: &FetchOptions,
+        _: &mut dyn FnMut(usize),
+    ) -> Result<Vec<Activity>> {
         Ok(Vec::new())
     }
 }

@@ -7,7 +7,7 @@
 use morlaco_core::Result;
 use morlaco_core::chain::{Chain, WalletId};
 use morlaco_core::db::Database;
-use morlaco_core::portfolio::History;
+use morlaco_core::portfolio::{History, SETTING_ETHERSCAN_KEY};
 
 const HIDDEN_KEY: &str = "hidden";
 
@@ -135,6 +135,20 @@ impl Store {
     pub fn set_last_price(&self, chain: Chain, usd: f64) -> Result<()> {
         self.db
             .set_setting(&last_price_key(chain), &usd.to_string())
+    }
+
+    /// The Etherscan API key the user entered, if any.
+    pub fn etherscan_key(&self) -> Option<String> {
+        self.db
+            .setting(SETTING_ETHERSCAN_KEY)
+            .ok()?
+            .filter(|key| !key.is_empty())
+    }
+
+    /// Saves the Etherscan API key. An empty key goes back to the keyless
+    /// service.
+    pub fn set_etherscan_key(&self, key: &str) -> Result<()> {
+        self.db.set_setting(SETTING_ETHERSCAN_KEY, key)
     }
 
     /// Re-encrypts the database with a new key. See [`Database::rekey`].
@@ -290,5 +304,15 @@ mod tests {
         let store = Store::open(db).expect("store opens");
         assert_eq!(store.wallets[0].label, "Saved");
         assert!(store.hidden);
+    }
+
+    #[test]
+    fn the_etherscan_key_is_kept_and_can_be_removed() {
+        let store = Store::open(Database::in_memory().expect("db")).expect("open");
+        assert_eq!(store.etherscan_key(), None);
+        store.set_etherscan_key("ABC123").expect("save");
+        assert_eq!(store.etherscan_key().as_deref(), Some("ABC123"));
+        store.set_etherscan_key("").expect("clear");
+        assert_eq!(store.etherscan_key(), None);
     }
 }

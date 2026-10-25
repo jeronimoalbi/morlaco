@@ -10,6 +10,10 @@ pub enum Error {
     /// The request failed or the response could not be decoded.
     #[error("request failed: {0}")]
     Http(Box<ureq::Error>),
+    /// A data provider refused the request and said why, for example that
+    /// the API key is wrong.
+    #[error("the data provider said: {0}")]
+    Provider(String),
     /// A data provider answered with something this version cannot read.
     #[error("unexpected response from the data provider: {0}")]
     BadResponse(&'static str),
