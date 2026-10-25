@@ -6,8 +6,10 @@
 
 Morlaco is a small GNOME app. It reads the public blockchain, looks up what
 the coin cost on the days your coins arrived, and shows your estimated gain or
-loss. Your saved data is encrypted on your computer. Bitcoin works today, and
-other coins are planned.
+loss.
+
+
+> Bitcoin works today, and other coins are planned
 
 <p align="center">
   <img src="docs/screenshots/overview.png" alt="Morlaco overview with two example wallets" width="70%">
@@ -22,8 +24,12 @@ other coins are planned.
   shoulder.
 - Moves between your own wallets aren't treated as selling, so they don't mess
   up your numbers.
+- Your saved data is encrypted on your computer.
 
 ## Install
+
+It requires Rust 1.92 or newer, GTK 4, libadwaita 1.5 or newer, libsecret,
+OpenSSL, a C compiler and pkgconf.
 
 **Arch Linux:**
 
@@ -31,12 +37,17 @@ other coins are planned.
 cd contrib/arch/local && makepkg -si
 ```
 
-That builds the latest committed version and installs it with pacman. To remove
-it later: `sudo pacman -R morlaco-git`.
+That builds the latest committed version and installs it with pacman.
+To remove it later: `sudo pacman -R morlaco-git`.
 
-**From source** (Rust 1.92 or newer, GTK 4, libadwaita 1.5 or newer, libsecret,
-OpenSSL, a C compiler and pkgconf; on Arch,
-`sudo pacman -S base-devel rust gtk4 libadwaita libsecret openssl`):
+**From source**
+
+On Arch first run:
+```sh
+sudo pacman -S base-devel rust gtk4 libadwaita libsecret openssl
+```
+
+Anywhere, once you have the dependencies:
 
 ```sh
 cargo build --release
@@ -48,17 +59,7 @@ sudo install -Dm644 app/data/icons/hicolor/symbolic/apps/io.github.jeronimoalbi.
 
 Just want to try it? `cargo run` works from the checkout, no install needed.
 
-## Using it
-
-1. Open Morlaco and add a wallet: press **Ctrl+N**, paste an address, and give
-   it a name if you like.
-2. Give it a moment to read the blockchain. The first time takes the longest.
-   After that, Morlaco shows what it saved right away and updates in the
-   background.
-3. Click **Overview** in the sidebar for the total across all your wallets, or
-   click a wallet to see its details.
-
-Handy keys:
+## Handy keys
 
 | Key | What it does |
 | --- | --- |
@@ -67,8 +68,6 @@ Handy keys:
 | Ctrl+H | Hide or show amounts |
 | F9 | Hide or show the sidebar |
 | Ctrl+Q | Quit |
-
-Use the pencil and trash buttons next to a wallet to rename or remove it.
 
 ## Your data and privacy
 
@@ -106,15 +105,8 @@ Use the pencil and trash buttons next to a wallet to rename or remove it.
 ```sh
 just check                   # format, lints, tests and the dependency checks
 cargo run                    # run the app from the checkout
-cargo run --example gate_fit # check that the unlock pages show all their content
 cargo run --example screenshot # redraw docs/screenshots/overview.png (example data)
 ```
-
-`just check` needs [`just`](https://github.com/casey/just) and
-[`cargo-deny`](https://embarkstudios.github.io/cargo-deny/). The `gate_fit`
-and `screenshot` examples open real windows, so they need a display and don't
-run in CI. The screenshot uses made-up wallets and never touches your data. The
-packaging files are in `contrib/`.
 
 ## License
 
