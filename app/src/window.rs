@@ -26,10 +26,6 @@ use crate::migrate;
 use crate::store::{Store, Wallet};
 use crate::unlock;
 
-/// The app's own symbolic wallet icon, which the Adwaita theme lacks.
-/// See `app/data/icons`.
-const WALLET_ICON: &str = "morlaco-wallet-symbolic";
-
 /// What the content area is showing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Selection {
@@ -406,7 +402,7 @@ impl Ui {
 
         // Page states: empty, loading, error, overview, data
         let empty_page = adw::StatusPage::builder()
-            .icon_name(WALLET_ICON)
+            .icon_name(crate::SYMBOLIC_ICON)
             .title("No Wallets Yet")
             .description("Add a Bitcoin address to see its holdings and estimated gains.")
             .child(
@@ -1522,6 +1518,7 @@ fn sync_hide_button(btn: &gtk::ToggleButton) {
 fn show_about(parent: &adw::ApplicationWindow) {
     let about = adw::AboutDialog::builder()
         .application_name("Morlaco")
+        .application_icon(crate::APP_ID)
         .version(env!("CARGO_PKG_VERSION"))
         .comments("Track a Bitcoin wallet and see its estimated gains and losses.")
         .developer_name("Jerónimo Albi")

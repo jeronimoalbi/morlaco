@@ -1,0 +1,49 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="128" height="128" viewBox="0 0 128 128">
+  <defs>
+    <linearGradient id="coin" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#f9f06b"/>
+      <stop offset="1" stop-color="#f6d32d"/>
+    </linearGradient>
+    <linearGradient id="noteBack" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#8ff0a4"/>
+      <stop offset="1" stop-color="#57e389"/>
+    </linearGradient>
+    <linearGradient id="noteFront" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#57e389"/>
+      <stop offset="0.5" stop-color="#33d17a"/>
+      <stop offset="1" stop-color="#26a269"/>
+    </linearGradient>
+    <filter id="shadow" x="-20%" y="-20%" width="140%" height="150%">
+      <feDropShadow dx="0" dy="2" stdDeviation="2" flood-color="#241f31" flood-opacity="0.35"/>
+    </filter>
+    <filter id="coinShadow" x="-20%" y="-20%" width="140%" height="150%">
+      <feDropShadow dx="0" dy="2" stdDeviation="2.500" flood-color="#241f31" flood-opacity="0.35"/>
+    </filter>
+  </defs>
+
+  <!-- coin container -->
+  <circle cx="64" cy="64" r="58" fill="url(#coin)" filter="url(#coinShadow)"/>
+  <circle cx="64" cy="64" r="54.500" fill="none" stroke="#ffffff" stroke-width="1.500" opacity="0.45"/>
+  <circle cx="64" cy="64" r="51" fill="none" stroke="#e5a50a" stroke-width="1.500" opacity="0.45"/>
+
+  <!-- bills inside the coin -->
+  <g transform="translate(64 64) scale(0.70) translate(-64 -61)">
+    <!-- back note -->
+    <g transform="rotate(-14 64 60)" filter="url(#shadow)">
+      <rect x="16" y="26" width="96" height="54" rx="7" fill="url(#noteBack)"/>
+      <rect x="21" y="31" width="86" height="44" rx="4" fill="none" stroke="#26a269" stroke-width="1.500" opacity="0.6"/>
+    </g>
+
+    <!-- front note -->
+    <g transform="rotate(6 64 70)" filter="url(#shadow)">
+      <rect x="12" y="40" width="104" height="58" rx="7" fill="url(#noteFront)"/>
+      <rect x="17" y="45" width="94" height="48" rx="4" fill="none" stroke="#1b6a46" stroke-width="1.500" opacity="0.55"/>
+      <circle cx="27" cy="57" r="4" fill="none" stroke="#1b6a46" stroke-width="1.500" opacity="0.55"/>
+      <circle cx="101" cy="81" r="4" fill="none" stroke="#1b6a46" stroke-width="1.500" opacity="0.55"/>
+      <!-- center medallion with M -->
+      <circle cx="64" cy="69" r="17" fill="#2ec27e" stroke="#1b6a46" stroke-width="1.500" opacity="0.9"/>
+      <circle cx="64" cy="69" r="13.500" fill="none" stroke="#8ff0a4" stroke-width="1.200" opacity="0.7"/>
+      <path d="M56 77.500 V61.500 L64 71.500 L72 61.500 V77.500" fill="none" stroke="#1b6a46" stroke-width="4.500" stroke-linecap="round" stroke-linejoin="round"/>
+    </g>
+  </g>
+</svg>

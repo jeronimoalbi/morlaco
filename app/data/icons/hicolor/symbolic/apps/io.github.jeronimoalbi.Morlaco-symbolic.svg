@@ -1,0 +1,10 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 16 16">
+  <!-- note -->
+  <path fill="#bebebe" d="M3 3h10a2 2 0 0 1 2 2v5a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2zm0 1.5a.5.5 0 0 0-.5.5v5a.5.5 0 0 0 .5.5h10a.5.5 0 0 0 .5-.5V5a.5.5 0 0 0-.5-.5z"/>
+  <!-- M, drawn with filled shapes: GTK recolours symbolic icons by filling paths, which turns an open outline into a solid block -->
+  <path fill="#bebebe" d="M6.2 10L6.2 6A0.7 0.7 0 0 0 4.8 6L4.8 10A0.7 0.7 0 0 0 6.2 10Z"/>
+  <path fill="#bebebe" d="M5.005 6.495L7.505 8.995A0.7 0.7 0 0 0 8.495 8.005L5.995 5.505A0.7 0.7 0 0 0 5.005 6.495Z"/>
+  <path fill="#bebebe" d="M8.495 8.995L10.995 6.495A0.7 0.7 0 0 0 10.005 5.505L7.505 8.005A0.7 0.7 0 0 0 8.495 8.995Z"/>
+  <path fill="#bebebe" d="M9.8 6L9.8 10A0.7 0.7 0 0 0 11.2 10L11.2 6A0.7 0.7 0 0 0 9.8 6Z"/>
+  <rect x="3" y="13" width="10" height="1.200" rx=".6" fill="#bebebe"/>
+</svg>
