@@ -137,9 +137,10 @@ impl SummaryView {
             .css_classes(["title-2"])
             .wrap(true)
             .build();
+        // Not selectable: it is a short summary, and a selectable label takes
+        // the window's first keyboard focus and shows a text caret.
         let subtitle = gtk::Label::builder()
             .css_classes(["dim-label", "caption"])
-            .selectable(true)
             .build();
         let caption = gtk::Label::builder()
             .label("Unrealized gain / loss")
@@ -247,8 +248,10 @@ struct CoinFigures {
     price_usd: f64,
 }
 
-struct Ui {
-    window: adw::ApplicationWindow,
+/// The main window and everything behind it. Built by [`build_main_window`].
+pub struct Ui {
+    /// The window. The caller presents it.
+    pub window: adw::ApplicationWindow,
     toasts: adw::ToastOverlay,
     split: adw::OverlaySplitView,
     wallet_list: gtk::ListBox,
@@ -292,13 +295,33 @@ pub fn present(app: &adw::Application) {
     );
 }
 
+/// Builds the main window around `store` without presenting it.
+///
+/// With `refresh_on_start` the app fetches fresh data in the background, as
+/// it does normally. Without it the window only shows what is already in the
+/// store, which is what the screenshot example needs: no network.
+pub fn build_main_window(
+    app: &adw::Application,
+    store: Store,
+    keys: Keys,
+    refresh_on_start: bool,
+) -> Rc<Ui> {
+    let ui = Ui::new(app, store, keys);
+    ui.connect_signals();
+    ui.rebuild_sidebar();
+    ui.start(refresh_on_start);
+    // Start with the sidebar focused, so no label grabs the focus and shows a
+    // text caret. A focus ring only appears once the keyboard is used.
+    if let Some(row) = ui.wallet_list.selected_row() {
+        GtkWindowExt::set_focus(&ui.window, Some(&row));
+    }
+    ui
+}
+
 fn open_main_window(app: &adw::Application, unlocked: unlock::Unlocked) {
     match open_store(unlocked.db) {
         Ok(store) => {
-            let ui = Ui::new(app, store, unlocked.keys);
-            ui.connect_signals();
-            ui.rebuild_sidebar();
-            ui.start();
+            let ui = build_main_window(app, store, unlocked.keys, true);
             ui.window.present();
             if let Some(aside) = unlocked.set_aside {
                 ui.toast_until_dismissed(&format!(
@@ -1316,8 +1339,9 @@ impl Ui {
         state.recompute();
     }
 
-    /// Shows what is saved at once, then refreshes it.
-    fn start(self: &Rc<Self>) {
+    /// Shows what is saved at once, then refreshes it from the network when
+    /// `refresh` is set.
+    fn start(self: &Rc<Self>, refresh: bool) {
         self.restore_saved_data();
         self.sync_sidebar_selection();
         self.sync_chrome();
@@ -1330,7 +1354,9 @@ impl Ui {
         if ready {
             self.show_current();
         }
-        self.refresh();
+        if refresh {
+            self.refresh();
+        }
     }
 
     // --- Rendering -------------------------------------------------------

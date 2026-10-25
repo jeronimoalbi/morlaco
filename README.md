@@ -9,6 +9,10 @@ the coin cost on the days your coins arrived, and shows your estimated gain or
 loss. Your saved data is encrypted on your computer. Bitcoin works today, and
 other coins are planned.
 
+<p align="center">
+  <img src="docs/screenshots/overview.png" alt="Morlaco overview with two example wallets" width="70%">
+</p>
+
 ## What you get
 
 - Your balance and what it's worth in US dollars.
@@ -103,11 +107,13 @@ Use the pencil and trash buttons next to a wallet to rename or remove it.
 just check                   # format, lints, tests and the dependency checks
 cargo run                    # run the app from the checkout
 cargo run --example gate_fit # check that the unlock pages show all their content
+cargo run --example screenshot # redraw docs/screenshots/overview.png (example data)
 ```
 
 `just check` needs [`just`](https://github.com/casey/just) and
 [`cargo-deny`](https://embarkstudios.github.io/cargo-deny/). The `gate_fit`
-example opens real windows, so it needs a display and doesn't run in CI. The
+and `screenshot` examples open real windows, so they need a display and don't
+run in CI. The screenshot uses made-up wallets and never touches your data. The
 packaging files are in `contrib/`.
 
 ## License
