@@ -24,6 +24,7 @@ use crate::encryption;
 use crate::format;
 use crate::keys::{Keyring, Keys, MIN_PASSPHRASE_ONLY_CHARS, Mode, format_recovery_key};
 use crate::migrate;
+use crate::shell::Shell;
 use crate::store::{Store, Wallet};
 use crate::system_keyring::PlatformKeyring;
 use crate::unlock;
@@ -287,27 +288,29 @@ pub fn present(app: &adw::Application) {
         window.present();
         return;
     }
-    let main_app = app.clone();
-    // The database may need a passphrase first, so the main window is built
-    // once it is open.
+    // The database may need a passphrase first. The window shows that as its
+    // first screen, then the app once the data is open.
+    let shell = Shell::new(app);
+    let for_app = shell.clone();
     unlock::start(
-        app,
-        Rc::new(move |unlocked| open_main_window(&main_app, unlocked)),
+        &shell,
+        Rc::new(move |unlocked| open_main_window(&for_app, unlocked)),
     );
 }
 
-/// Builds the main window around `store` without presenting it.
+/// Builds the app around `store` inside `shell`'s window, which may be
+/// showing the unlock page, without presenting it.
 ///
 /// With `refresh_on_start` the app fetches fresh data in the background, as
 /// it does normally. Without it the window only shows what is already in the
 /// store, which is what the screenshot example needs: no network.
 pub fn build_main_window(
-    app: &adw::Application,
+    shell: &Rc<Shell>,
     store: Store,
     keys: Keys,
     refresh_on_start: bool,
 ) -> Rc<Ui> {
-    let ui = Ui::new(app, store, keys);
+    let ui = Ui::new(shell, store, keys);
     ui.connect_signals();
     ui.rebuild_sidebar();
     ui.start(refresh_on_start);
@@ -319,10 +322,10 @@ pub fn build_main_window(
     ui
 }
 
-fn open_main_window(app: &adw::Application, unlocked: unlock::Unlocked) {
+fn open_main_window(shell: &Rc<Shell>, unlocked: unlock::Unlocked) {
     match open_store(unlocked.db) {
         Ok(store) => {
-            let ui = build_main_window(app, store, unlocked.keys, true);
+            let ui = build_main_window(shell, store, unlocked.keys, true);
             ui.window.present();
             if let Some(aside) = unlocked.set_aside {
                 ui.toast_until_dismissed(&format!(
@@ -341,7 +344,7 @@ fn open_main_window(app: &adw::Application, unlocked: unlock::Unlocked) {
                 ui.suggest_recovery_key();
             }
         }
-        Err(message) => unlock::show_error(app, "Couldn’t Open Your Data", &message),
+        Err(message) => unlock::show_error(shell, "Couldn’t Open Your Data", &message),
     }
 }
 
@@ -358,7 +361,7 @@ fn open_store(db: Database) -> Result<Store, String> {
 }
 
 impl Ui {
-    fn new(app: &adw::Application, store: Store, keys: Keys) -> Rc<Self> {
+    fn new(shell: &Rc<Shell>, store: Store, keys: Keys) -> Rc<Self> {
         let hidden = store.hidden;
 
         // Sidebar
@@ -547,14 +550,9 @@ impl Ui {
         let toasts = adw::ToastOverlay::new();
         toasts.set_child(Some(&split));
 
-        let window = adw::ApplicationWindow::builder()
-            .application(app)
-            .title("Morlaco")
-            .default_width(900)
-            .default_height(640)
-            .width_request(360)
-            .content(&toasts)
-            .build();
+        // The app takes the place of the unlock page, in the same window.
+        let window = shell.window.clone();
+        shell.show_app(&toasts);
 
         // Narrow layout: the sidebar becomes an overlay and the tabs move to
         // the bottom bar.

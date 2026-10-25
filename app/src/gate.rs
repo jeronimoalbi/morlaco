@@ -4,34 +4,15 @@
 //! This file only builds widgets. It has no behaviour and depends on nothing
 //! but GTK.
 //!
-//! # Why the windows are not resizable
-//!
-//! A window's minimum size is computed without knowing how wrapped text will
-//! reflow at the width the window really has, so a resizable window can be
-//! made too short for its content, hiding the buttons at the bottom. That
-//! happens even when nothing scrolls: measured with plain boxes, most pages
-//! reported a minimum height smaller than they needed. A window that is not
-//! resizable has no such freedom: GTK gives it its natural size, working out
-//! the width first and then the height needed at that width, so everything is
-//! shown at any text size, wording or translation. The window is built with
-//! no fixed height for the same reason.
-//!
-//! The pages stay `adw::StatusPage`s, which scroll as a last resort. If a
-//! screen is shorter than a page, the content is still reachable instead of
-//! being cut off.
+//! The pages are shown inside the app's one window (see `shell`), as its first
+//! screen. They are plain `adw::StatusPage`s, which scroll if the window is
+//! too small for them, so the buttons stay reachable at any text size.
 
 use gtk::gio;
 use gtk4 as gtk;
 use libadwaita as adw;
 
 use adw::prelude::*;
-
-/// Width the windows open at. Not a limit: the window grows if the content
-/// needs more room.
-///
-/// `unlock::gate_window` builds the windows with this width, not resizable
-/// and with no height.
-pub const WINDOW_WIDTH: i32 = 480;
 
 /// Names of the window actions behind the "⋮" menu on the unlock page, without
 /// the `win.` prefix. The menu and the code that registers the actions both
@@ -57,17 +38,25 @@ impl GatePage {
     }
 }
 
-/// Builds a page. The compact style keeps the window short.
+/// Builds a page: an icon, a title, a description and the page's own widgets.
+/// The compact style keeps the tallest page, the passphrase setup, inside the
+/// window's default height.
 pub fn gate_page(icon_name: &str, title: &str, description: &str) -> GatePage {
     let body = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
         .spacing(18)
         .build();
+    // The entry and buttons keep a sensible width in a wide window.
+    let clamp = adw::Clamp::builder()
+        .maximum_size(380)
+        .tightening_threshold(300)
+        .child(&body)
+        .build();
     let root = adw::StatusPage::builder()
         .icon_name(icon_name)
         .title(title)
         .description(description)
-        .child(&body)
+        .child(&clamp)
         .css_classes(["compact"])
         .build();
     GatePage { root, body }
@@ -131,7 +120,7 @@ fn more_menu(show_try_again: bool) -> gio::Menu {
 
 /// Builds the unlock prompt.
 pub fn prompt_layout(description: &str, show_try_again: bool) -> PromptLayout {
-    let page = gate_page("dialog-password-symbolic", "Unlock Morlaco", description);
+    let page = gate_page(crate::APP_ID, "Unlock Morlaco", description);
 
     let entry = adw::PasswordEntryRow::builder().title("Passphrase").build();
     let fields = boxed_fields();
@@ -182,11 +171,7 @@ pub struct SetupLayout {
 
 /// Builds the passphrase setup page.
 pub fn setup_layout(description: &str) -> SetupLayout {
-    let page = gate_page(
-        "dialog-password-symbolic",
-        "Choose a Passphrase",
-        description,
-    );
+    let page = gate_page(crate::APP_ID, "Choose a Passphrase", description);
 
     let new = adw::PasswordEntryRow::builder().title("Passphrase").build();
     let confirm = adw::PasswordEntryRow::builder()

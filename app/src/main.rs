@@ -6,6 +6,7 @@ mod gate;
 mod icons;
 mod keys;
 mod migrate;
+mod shell;
 mod store;
 mod system_keyring;
 #[cfg(test)]

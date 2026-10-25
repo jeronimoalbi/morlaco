@@ -1,8 +1,9 @@
 //! Opening the encrypted database at startup.
 //!
-//! Normally this finishes at once: the key comes from the keyring. A window
-//! is shown only when the user must act: a passphrase is needed, a passphrase
-//! has to be chosen because there is no keyring, or something failed.
+//! Normally this finishes at once: the key comes from the keyring. A page is
+//! shown, in the app's window, only when the user must act: a passphrase is
+//! needed, a passphrase has to be chosen because there is no keyring, or
+//! something failed.
 
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
@@ -17,8 +18,9 @@ use morlaco_core::db::Database;
 use morlaco_core::paths;
 
 use crate::encryption::{self, PassphraseProblem};
-use crate::gate::{self, GatePage, PromptLayout, SetupLayout, WINDOW_WIDTH, boxed_fields};
+use crate::gate::{self, GatePage, PromptLayout, SetupLayout, boxed_fields};
 use crate::keys::{self, Keyring, Keys, MIN_PASSPHRASE_ONLY_CHARS};
+use crate::shell::Shell;
 use crate::system_keyring::PlatformKeyring;
 
 /// An open database and what happened while opening it.
@@ -225,46 +227,46 @@ fn restore_secret(keyring: &dyn Keyring, keys: &Keys) -> Option<String> {
 
 /// Opens the database and calls `ready`, possibly after the user has
 /// entered a passphrase.
-pub fn start(app: &adw::Application, ready: Ready) {
+pub fn start(shell: &Rc<Shell>, ready: Ready) {
     let Some(path) = paths::data_file() else {
         return show_error(
-            app,
+            shell,
             "Couldn’t Open Your Data",
             "No data directory is available.",
         );
     };
     let file = match file_state(&path) {
         Ok(file) => file,
-        Err(err) => return show_error(app, "Couldn’t Open Your Data", &err.to_string()),
+        Err(err) => return show_error(shell, "Couldn’t Open Your Data", &err.to_string()),
     };
 
     match plan(&PlatformKeyring.lookup(), file) {
-        Next::OpenWithSecret(secret) => open_with_secret(app, path, secret, false, ready),
-        Next::CreateSecret => create_secret(app, path, file, ready),
+        Next::OpenWithSecret(secret) => open_with_secret(shell, path, secret, false, ready),
+        Next::CreateSecret => create_secret(shell, path, file, ready),
         Next::Prompt { keyring_reachable } => {
-            show_passphrase_prompt(app, path, None, keyring_reachable, ready);
+            show_passphrase_prompt(shell, path, None, keyring_reachable, ready);
         }
-        Next::SetupPassphrase => show_setup(app, path, file, None, ready),
+        Next::SetupPassphrase => show_setup(shell, path, file, None, ready),
     }
 }
 
 /// Makes a secret for a new install. If the keyring will not keep it the
 /// user can still choose a passphrase instead.
-fn create_secret(app: &adw::Application, path: PathBuf, file: FileState, ready: Ready) {
+fn create_secret(shell: &Rc<Shell>, path: PathBuf, file: FileState, ready: Ready) {
     let secret = match keys::generate_secret() {
         Ok(secret) => secret,
-        Err(message) => return show_error(app, "Couldn’t Create the Key", &message),
+        Err(message) => return show_error(shell, "Couldn’t Create the Key", &message),
     };
     // Save the key before using it, so data is never encrypted with a key
     // that was not kept.
     if let Err(message) = PlatformKeyring.store(&secret) {
-        return show_setup(app, path, file, Some(message), ready);
+        return show_setup(shell, path, file, Some(message), ready);
     }
-    open_with_secret(app, path, secret, true, ready);
+    open_with_secret(shell, path, secret, true, ready);
 }
 
 fn open_with_secret(
-    app: &adw::Application,
+    shell: &Rc<Shell>,
     path: PathBuf,
     secret: String,
     created_new_secret: bool,
@@ -272,7 +274,7 @@ fn open_with_secret(
 ) {
     // A file from an earlier version has no encryption yet.
     if let Err(err) = Database::encrypt_plain_file(&path, &secret) {
-        return show_error(app, "Couldn’t Encrypt Your Data", &err.to_string());
+        return show_error(shell, "Couldn’t Encrypt Your Data", &err.to_string());
     }
     match open_database(&path, &secret) {
         Ok((db, set_aside)) => ready(Unlocked {
@@ -283,38 +285,22 @@ fn open_with_secret(
             notice: None,
         }),
         // The secret alone does not open it, so a passphrase was added.
-        Err(Error::WrongKey) => show_passphrase_prompt(app, path, Some(secret), true, ready),
-        Err(err) => show_error(app, "Couldn’t Open Your Data", &err.to_string()),
+        Err(Error::WrongKey) => show_passphrase_prompt(shell, path, Some(secret), true, ready),
+        Err(err) => show_error(shell, "Couldn’t Open Your Data", &err.to_string()),
     }
 }
 
 // --- Windows ---------------------------------------------------------------
 
-/// A window that holds one page. It is not resizable and has no fixed height,
-/// so it always gets the natural size of its content and nothing is cut off,
-/// at any text size. See the `gate` module for why.
-fn gate_window(app: &adw::Application, page: &GatePage) -> adw::ApplicationWindow {
-    let toolbar = adw::ToolbarView::new();
-    toolbar.add_top_bar(&adw::HeaderBar::new());
-    toolbar.set_content(Some(&page.root));
-    adw::ApplicationWindow::builder()
-        .application(app)
-        .title("Morlaco")
-        .resizable(false)
-        .default_width(WINDOW_WIDTH)
-        .content(&toolbar)
-        .build()
-}
-
 /// Shows a message instead of the app.
-pub fn show_error(app: &adw::Application, title: &str, message: &str) {
-    gate_window(app, &gate::error_layout(title, message)).present();
+pub fn show_error(shell: &Rc<Shell>, title: &str, message: &str) {
+    shell.show_gate(&gate::error_layout(title, message));
 }
 
 /// The setup page for a machine without a usable keyring: the user chooses
 /// the passphrase that will be the only protection.
 fn show_setup(
-    app: &adw::Application,
+    shell: &Rc<Shell>,
     path: PathBuf,
     file: FileState,
     reason: Option<String>,
@@ -335,7 +321,8 @@ fn show_setup(
          at least {MIN_PASSPHRASE_ONLY_CHARS} characters. If you forget it, your data \
          can’t be recovered."
     ));
-    let window = gate_window(app, &page);
+    shell.show_gate(&page);
+    let window = shell.window.clone();
 
     // Saying what is wrong only once the user has typed something.
     let validate = {
@@ -362,7 +349,7 @@ fn show_setup(
     confirm.connect_changed(move |_| on_confirm());
 
     let attempt = {
-        let (new, problem, window) = (new.clone(), problem.clone(), window.clone());
+        let (new, problem) = (new.clone(), problem.clone());
         Rc::new(move || {
             let passphrase = new.text().to_string();
             let result = (|| -> Result<(Database, Option<PathBuf>), Error> {
@@ -380,7 +367,6 @@ fn show_setup(
                         created_new_secret: false,
                         notice: None,
                     });
-                    window.close();
                 }
                 Err(err) => problem.set_label(&err.to_string()),
             }
@@ -406,7 +392,7 @@ fn show_setup(
 /// Try Again, Use Recovery Key and Start Over are window actions, reached
 /// from the "⋮" menu next to Unlock.
 fn show_passphrase_prompt(
-    app: &adw::Application,
+    shell: &Rc<Shell>,
     path: PathBuf,
     secret: Option<String>,
     keyring_reachable: bool,
@@ -430,10 +416,11 @@ fn show_passphrase_prompt(
         unlock,
     } = gate::prompt_layout(description, !keyring_reachable);
     let page = Rc::new(page);
-    let window = gate_window(app, &page);
+    shell.show_gate(&page);
+    let window = shell.window.clone();
 
     let attempt = {
-        let (entry, page, window) = (entry.clone(), page.clone(), window.clone());
+        let (entry, page) = (entry.clone(), page.clone());
         let path = path.clone();
         let ready = ready.clone();
         Rc::new(move || {
@@ -447,7 +434,6 @@ fn show_passphrase_prompt(
                         created_new_secret: false,
                         notice: None,
                     });
-                    window.close();
                 }
                 Err(Error::WrongKey) => {
                     entry.add_css_class("error");
@@ -466,12 +452,9 @@ fn show_passphrase_prompt(
     // The actions behind the "⋮" menu. Try Again is in the menu only when the
     // keyring could not be reached, so it is registered only then.
     if !keyring_reachable {
-        let (retry_app, retry_ready, retry_window) = (app.clone(), ready.clone(), window.clone());
+        let (retry_shell, retry_ready) = (shell.clone(), ready.clone());
         let try_again = gio::SimpleAction::new(gate::ACTION_TRY_AGAIN, None);
-        try_again.connect_activate(move |_, _| {
-            start(&retry_app, retry_ready.clone());
-            retry_window.close();
-        });
+        try_again.connect_activate(move |_, _| start(&retry_shell, retry_ready.clone()));
         window.add_action(&try_again);
     }
 
@@ -488,10 +471,10 @@ fn show_passphrase_prompt(
     });
     window.add_action(&use_recovery_key);
 
-    let (over_app, over_window) = (app.clone(), window.clone());
+    let (over_shell, over_window) = (shell.clone(), window.clone());
     let start_over = gio::SimpleAction::new(gate::ACTION_START_OVER, None);
     start_over.connect_activate(move |_, _| {
-        confirm_start_over(&over_app, path.clone(), ready.clone(), &over_window);
+        confirm_start_over(&over_shell, path.clone(), ready.clone(), &over_window);
     });
     window.add_action(&start_over);
 
@@ -531,7 +514,7 @@ fn show_recovery_dialog(
         enabler.set_response_enabled("open", !entry.text().trim().is_empty());
     });
 
-    let (page, window) = (page.clone(), parent.clone());
+    let page = page.clone();
     dialog.connect_response(None, move |_, response| {
         if response != "open" {
             return;
@@ -546,7 +529,6 @@ fn show_recovery_dialog(
                     created_new_secret: false,
                     notice,
                 });
-                window.close();
             }
             Err(problem) => page.set_description(&problem.to_string()),
         }
@@ -556,7 +538,7 @@ fn show_recovery_dialog(
 
 /// Asks whether to delete the saved data, and if so does it and starts again.
 fn confirm_start_over(
-    app: &adw::Application,
+    shell: &Rc<Shell>,
     path: PathBuf,
     ready: Ready,
     parent: &adw::ApplicationWindow,
@@ -572,16 +554,13 @@ fn confirm_start_over(
     dialog.set_response_appearance("delete", adw::ResponseAppearance::Destructive);
     dialog.set_close_response("cancel");
 
-    let (app, window) = (app.clone(), parent.clone());
+    let shell = shell.clone();
     dialog.connect_response(None, move |_, response| {
         if response != "delete" {
             return;
         }
         match delete_database_files(&path) {
-            Ok(()) => {
-                start(&app, ready.clone());
-                window.close();
-            }
+            Ok(()) => start(&shell, ready.clone()),
             Err(message) => glib::g_warning!("morlaco", "could not delete the data: {message}"),
         }
     });

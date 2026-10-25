@@ -25,6 +25,8 @@ mod icons;
 mod keys;
 #[path = "../src/migrate.rs"]
 mod migrate;
+#[path = "../src/shell.rs"]
+mod shell;
 #[path = "../src/store.rs"]
 mod store;
 #[path = "../src/system_keyring.rs"]
@@ -195,7 +197,7 @@ fn main() -> glib::ExitCode {
         let keys = Keys::Keyring {
             secret: "0".repeat(64),
         };
-        let ui = window::build_main_window(app, example_store(), keys, false);
+        let ui = window::build_main_window(&shell::Shell::new(app), example_store(), keys, false);
         ui.window.set_default_size(WINDOW_SIZE.0, WINDOW_SIZE.1);
         ui.window.present();
 
