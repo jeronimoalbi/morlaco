@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Morlaco
+GenericName=Crypto Wallet Tracker
+Comment=Track wallet holdings and unrealized gains
+Exec=morlaco
+Icon=io.github.jeronimoalbi.Morlaco
+Terminal=false
+Categories=Office;Finance;GTK;GNOME;
+Keywords=bitcoin;crypto;wallet;portfolio;
+StartupNotify=true

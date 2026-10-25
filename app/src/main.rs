@@ -30,9 +30,11 @@ fn main() -> glib::ExitCode {
 }
 
 /// Lets GTK find the icons shipped in `app/data/icons` when running from a
-/// source checkout. An installed app finds them in the system icon theme, in
-/// which case this path simply does not exist.
+/// source checkout. Only debug builds do this: a release build is meant to
+/// be installed, where the icons are in the system icon theme, and must not
+/// contain the build machine's source path.
 fn register_icons() {
+    #[cfg(debug_assertions)]
     if let Some(display) = gtk4::gdk::Display::default() {
         gtk4::IconTheme::for_display(&display)
             .add_search_path(concat!(env!("CARGO_MANIFEST_DIR"), "/data/icons"));

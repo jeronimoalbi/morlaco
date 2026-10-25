@@ -1,1 +1,7 @@
 /target
+
+# makepkg output
+/packaging/arch/src
+/packaging/arch/pkg
+/packaging/arch/morlaco
+*.pkg.tar.*
