@@ -82,6 +82,32 @@ pub struct Summary {
     pub realized_usd: f64,
 }
 
+impl Summary {
+    /// Adds several summaries together, e.g. one per wallet.
+    ///
+    /// The percentage is recomputed from the combined cost, not averaged.
+    pub fn combine<'a>(items: impl IntoIterator<Item = &'a Summary>) -> Summary {
+        let mut total = Summary {
+            balance_sats: 0,
+            cost_basis_usd: 0.0,
+            value_usd: 0.0,
+            unrealized_usd: 0.0,
+            unrealized_pct: None,
+            realized_usd: 0.0,
+        };
+        for s in items {
+            total.balance_sats += s.balance_sats;
+            total.cost_basis_usd += s.cost_basis_usd;
+            total.value_usd += s.value_usd;
+            total.unrealized_usd += s.unrealized_usd;
+            total.realized_usd += s.realized_usd;
+        }
+        total.unrealized_pct = (total.cost_basis_usd > 0.0)
+            .then(|| total.unrealized_usd / total.cost_basis_usd * 100.0);
+        total
+    }
+}
+
 impl Position {
     /// Totals the open lots at the current price.
     pub fn summarize(&self, price_now_usd: f64) -> Summary {
@@ -219,6 +245,27 @@ mod tests {
         // The 0.5 BTC sent breaks even; the fee loses 0.01 * 10k = 100.
         assert!((pos.realized_usd + 100.0).abs() < 1e-9);
         assert_eq!(pos.open_lots[0].sats, (BTC / 2 - fee) as u64);
+    }
+
+    #[test]
+    fn combined_summary_adds_up_and_reweights_the_percentage() {
+        // 1 BTC bought at 10k (+100%) and 1 BTC bought at 30k (-33%), price 20k.
+        let a = fifo(&[delta(BTC, 0, 10_000.0)]).summarize(20_000.0);
+        let b = fifo(&[delta(BTC, 0, 30_000.0)]).summarize(20_000.0);
+
+        let total = Summary::combine([&a, &b]);
+        assert_eq!(total.balance_sats, 2 * BTC as u64);
+        assert_eq!(total.cost_basis_usd, 40_000.0);
+        assert_eq!(total.value_usd, 40_000.0);
+        assert_eq!(total.unrealized_usd, 0.0);
+        assert_eq!(total.unrealized_pct, Some(0.0));
+    }
+
+    #[test]
+    fn combining_nothing_is_empty() {
+        let total = Summary::combine([]);
+        assert_eq!(total.balance_sats, 0);
+        assert_eq!(total.unrealized_pct, None);
     }
 
     #[test]

@@ -1,10 +1,9 @@
 //! `morlaco <address>`: print holdings and estimated gain/loss for a Bitcoin address.
 
-use std::path::PathBuf;
-
 use anyhow::{Context, Result, bail};
 use morlaco_core::cache::Cache;
 use morlaco_core::lots::SATS_PER_BTC;
+use morlaco_core::paths;
 use morlaco_core::portfolio::{self, Portfolio};
 use morlaco_core::price::{CachedPrices, MempoolPrices};
 use morlaco_core::util::date_string;
@@ -14,7 +13,7 @@ fn main() -> Result<()> {
         bail!("usage: morlaco <bitcoin-address>");
     };
 
-    let path = cache_path().context("cannot locate a cache directory (set HOME)")?;
+    let path = paths::cache_file().context("cannot locate a cache directory (set HOME)")?;
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
     }
@@ -29,14 +28,6 @@ fn main() -> Result<()> {
 
     print_portfolio(&portfolio);
     Ok(())
-}
-
-/// `$XDG_CACHE_HOME/morlaco/cache.sqlite3`, falling back to `~/.cache`.
-fn cache_path() -> Option<PathBuf> {
-    let base = std::env::var_os("XDG_CACHE_HOME")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".cache")))?;
-    Some(base.join("morlaco").join("cache.sqlite3"))
 }
 
 fn print_portfolio(p: &Portfolio) {

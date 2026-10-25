@@ -7,6 +7,7 @@ pub mod cache;
 pub mod chain;
 mod error;
 pub mod lots;
+pub mod paths;
 pub mod portfolio;
 pub mod price;
 pub mod util;
