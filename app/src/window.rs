@@ -163,7 +163,7 @@ impl SummaryView {
         let value = Figure::new("Current value");
         let cost = Figure::new("Cost basis");
         let realized = Figure::new("Realized gain / loss");
-        let price = Figure::new("BTC price");
+        let price = Figure::new("Price");
         let totals = adw::PreferencesGroup::new();
         for f in [&balance, &value, &cost, &realized, &price] {
             totals.add(&f.row);
@@ -378,8 +378,8 @@ impl Ui {
         holdings_box.append(&holdings.root);
         holdings_box.append(&lots_group);
         holdings_box.append(&note(
-            "Cost basis is the BTC price when coins arrived at this address. \
-             It is an estimate, not what you paid.",
+            "Cost basis is the market price of the coin on the day it arrived at \
+             this address. It is an estimate, not what you paid.",
         ));
 
         let history_list = boxed_list();
@@ -404,7 +404,7 @@ impl Ui {
         let empty_page = adw::StatusPage::builder()
             .icon_name(crate::SYMBOLIC_ICON)
             .title("No Wallets Yet")
-            .description("Add a Bitcoin address to see its holdings and estimated gains.")
+            .description("Add a wallet address to see its holdings and estimated gains.")
             .child(
                 &gtk::Button::builder()
                     .label("Add Wallet")
@@ -1520,7 +1520,7 @@ fn show_about(parent: &adw::ApplicationWindow) {
         .application_name("Morlaco")
         .application_icon(crate::APP_ID)
         .version(env!("CARGO_PKG_VERSION"))
-        .comments("Track a Bitcoin wallet and see its estimated gains and losses.")
+        .comments("Track your crypto wallets and see their estimated gains and losses.")
         .developer_name("Jerónimo Albi")
         .build();
     about.present(Some(parent));

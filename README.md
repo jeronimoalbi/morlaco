@@ -4,12 +4,13 @@
 [![Audit](https://github.com/jeronimoalbi/morlaco/actions/workflows/audit.yml/badge.svg?branch=main)](https://github.com/jeronimoalbi/morlaco/actions/workflows/audit.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-Paste in a Bitcoin address and see what's in it, what it's worth, and whether
+Add a wallet address and see what's in it, what it's worth, and whether
 you're up or down.
 
 Morlaco is a small GNOME app. It reads the public blockchain, looks up what
-Bitcoin cost on the days your coins arrived, and shows your estimated gain or
-loss. Your saved data is encrypted on your computer.
+the coin cost on the days your coins arrived, and shows your estimated gain or
+loss. Your saved data is encrypted on your computer. Bitcoin works today, and
+other coins are planned.
 
 ## What you get
 
@@ -79,18 +80,18 @@ Use the pencil and trash buttons next to a wallet to rename or remove it.
   will then ask for it every time it starts. If you forget it, your saved data
   can't be recovered.
 - **Clear Local Data…** in the same menu deletes the file and the key.
-- To read the blockchain and the price of Bitcoin, Morlaco asks
-  [mempool.space](https://mempool.space). So that site sees which addresses
-  you look up, along with the usual things any website sees, like your IP
-  address.
+- To read the blockchain and coin prices, Morlaco asks public websites. For
+  Bitcoin that's [mempool.space](https://mempool.space). So that site sees
+  which addresses you look up, along with the usual things any website sees,
+  like your IP address.
 
 ## Good to know
 
-- It's Bitcoin only for now. The code is ready for other coins, but they
+- Bitcoin is the only coin so far. The code is ready for others, but they
   aren't there yet.
-- The gain or loss is an estimate. A coin's "cost" is Bitcoin's price on the day
-  it arrived at the address, which isn't always what you paid. If you bought on
-  an exchange and withdrew later, those can differ.
+- The gain or loss is an estimate. A coin's "cost" is its price on the day it
+  arrived at the address, which isn't always what you paid. If you bought on an
+  exchange and withdrew later, those can differ.
 - Payments that haven't been confirmed yet are left out until they are.
 - These are rough numbers to help you understand your wallets, not tax or
   financial advice.

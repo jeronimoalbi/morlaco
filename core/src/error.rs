@@ -2,7 +2,7 @@
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     /// The address was rejected locally or by the API.
-    #[error("not a valid Bitcoin address")]
+    #[error("not a valid address for this network")]
     InvalidAddress,
     /// The API answered with HTTP 429.
     #[error("rate limited by the API, try again in a moment")]
