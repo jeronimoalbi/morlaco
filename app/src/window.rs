@@ -365,7 +365,8 @@ impl Ui {
         let split = adw::OverlaySplitView::builder()
             .sidebar(&sidebar_toolbar)
             .content(&content_toolbar)
-            .min_sidebar_width(220.0)
+            .min_sidebar_width(240.0)
+            .max_sidebar_width(360.0)
             .build();
         split
             .bind_property("show-sidebar", &sidebar_btn, "active")
