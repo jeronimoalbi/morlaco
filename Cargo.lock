@@ -720,6 +720,32 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "65cd87c9a6d60536580b316ad985726104730a5151c99845f2490428ef91240a"
 
 [[package]]
+name = "libsecret"
+version = "0.9.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b531fb2284b303e0f6d214043e641e5da56053a886413c726e69384f9c8d2335"
+dependencies = [
+ "gio",
+ "glib",
+ "libc",
+ "libsecret-sys",
+]
+
+[[package]]
+name = "libsecret-sys"
+version = "0.9.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "80477411ab81517171559cbb6d48fc024122df02787551ada766c709ffa2859a"
+dependencies = [
+ "gio-sys",
+ "glib-sys",
+ "gobject-sys",
+ "libc",
+ "pkg-config",
+ "system-deps 7.0.8",
+]
+
+[[package]]
 name = "libsqlite3-sys"
 version = "0.39.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -727,6 +753,7 @@ checksum = "14a5f01b87b92705d07b433c06f96cbc764637d81a0bffb5734ce17cf0f9a2b3"
 dependencies = [
  "cc",
  "pkg-config",
+ "sqlcipher-src",
  "vcpkg",
 ]
 
@@ -779,6 +806,7 @@ version = "0.1.0"
 dependencies = [
  "gtk4",
  "libadwaita",
+ "libsecret",
  "morlaco-core",
 ]
 
@@ -1051,6 +1079,12 @@ name = "smallvec"
 version = "1.16.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d0d5d4b1981b8bbbb7aed204cae5726d683d5d6ac7e74ec54122ea28f315e7c8"
+
+[[package]]
+name = "sqlcipher-src"
+version = "419.0.6+sqlcipher-4.19.0-sqlite-3.53.4-libtomcrypt-1.18.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ab732d48ebf2a1449e94d071b26544f99845834c75c3c210e927ace097b49aa4"
 
 [[package]]
 name = "sqlite-wasm-rs"

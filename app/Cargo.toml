@@ -8,4 +8,5 @@ publish.workspace = true
 [dependencies]
 gtk4 = "0.11.5"
 libadwaita = { version = "0.9.2", features = ["v1_5"] }
+libsecret = "0.9.0"
 morlaco-core = { version = "0.1.0", path = "../core" }

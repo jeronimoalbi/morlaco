@@ -1,8 +1,10 @@
 //! Morlaco: a GNOME app that tracks a Bitcoin wallet and estimates gains.
 
 mod format;
+mod keys;
 mod migrate;
 mod store;
+mod unlock;
 mod window;
 
 use gtk4::glib;

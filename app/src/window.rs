@@ -21,8 +21,10 @@ use morlaco_core::price::{CachedPrices, MempoolPrices, PriceSource};
 use morlaco_core::util::date_string;
 
 use crate::format;
+use crate::keys::{self, Keys};
 use crate::migrate;
 use crate::store::{Store, Wallet};
+use crate::unlock;
 
 const EXPLORER_TX_URL: &str = "https://mempool.space/tx/";
 
@@ -48,6 +50,9 @@ struct State {
     portfolios: HashMap<String, Portfolio>,
     /// Why a wallet failed to load, by address.
     errors: HashMap<String, String>,
+    /// What opens the database; worker threads need it for their own
+    /// connections.
+    keys: Keys,
 }
 
 impl State {
@@ -228,22 +233,30 @@ pub fn present(app: &adw::Application) {
         window.present();
         return;
     }
-    match open_store() {
+    let main_app = app.clone();
+    // The database may need a passphrase first, so the main window is built
+    // once it is open.
+    unlock::start(
+        app,
+        Rc::new(move |db, keys| open_main_window(&main_app, db, keys)),
+    );
+}
+
+fn open_main_window(app: &adw::Application, db: Database, keys: Keys) {
+    match open_store(db) {
         Ok(store) => {
-            let ui = Ui::new(app, store);
+            let ui = Ui::new(app, store, keys);
             ui.connect_signals();
             ui.rebuild_sidebar();
             ui.select(Selection::Overview);
             ui.window.present();
         }
-        Err(message) => show_startup_error(app, &message),
+        Err(message) => unlock::show_error(app, "Couldn’t Open Your Data", &message),
     }
 }
 
-/// Opens the database and loads the saved wallets and settings.
-fn open_store() -> Result<Store, String> {
-    let path = paths::data_file().ok_or("no data directory available")?;
-    let db = Database::open(&path).map_err(|e| e.to_string())?;
+/// Loads the saved wallets and settings from the open database.
+fn open_store(db: Database) -> Result<Store, String> {
     let mut store = Store::open(db).map_err(|e| e.to_string())?;
 
     // A failed import is not fatal: the old files are kept and tried again
@@ -254,29 +267,8 @@ fn open_store() -> Result<Store, String> {
     Ok(store)
 }
 
-/// Shown instead of the main window when the database cannot be opened.
-fn show_startup_error(app: &adw::Application, message: &str) {
-    let toolbar = adw::ToolbarView::new();
-    toolbar.add_top_bar(&adw::HeaderBar::new());
-    toolbar.set_content(Some(
-        &adw::StatusPage::builder()
-            .icon_name("dialog-error-symbolic")
-            .title("Couldn’t Open Your Data")
-            .description(message)
-            .build(),
-    ));
-    adw::ApplicationWindow::builder()
-        .application(app)
-        .title("Morlaco")
-        .default_width(480)
-        .default_height(360)
-        .content(&toolbar)
-        .build()
-        .present();
-}
-
 impl Ui {
-    fn new(app: &adw::Application, store: Store) -> Rc<Self> {
+    fn new(app: &adw::Application, store: Store, keys: Keys) -> Rc<Self> {
         let hidden = store.hidden;
 
         // Sidebar
@@ -414,8 +406,14 @@ impl Ui {
         sync_hide_button(&hide_btn);
 
         let menu = gio::Menu::new();
-        menu.append(Some("_About Morlaco"), Some("app.about"));
-        menu.append(Some("_Quit"), Some("app.quit"));
+        let data = gio::Menu::new();
+        data.append(Some("_Passphrase…"), Some("win.passphrase"));
+        data.append(Some("_Clear Local Data…"), Some("win.clear-data"));
+        menu.append_section(None, &data);
+        let app_menu = gio::Menu::new();
+        app_menu.append(Some("_About Morlaco"), Some("app.about"));
+        app_menu.append(Some("_Quit"), Some("app.quit"));
+        menu.append_section(None, &app_menu);
         let menu_btn = gtk::MenuButton::builder()
             .icon_name("open-menu-symbolic")
             .menu_model(&menu)
@@ -488,6 +486,7 @@ impl Ui {
             history_list,
             state: RefCell::new(State {
                 store,
+                keys,
                 selection: Selection::Overview,
                 histories: HashMap::new(),
                 price_now: None,
@@ -510,6 +509,8 @@ impl Ui {
         self.add_action("toggle-privacy", |ui| {
             ui.hide_btn.set_active(!ui.hide_btn.is_active());
         });
+        self.add_action("passphrase", |ui| ui.show_passphrase_dialog());
+        self.add_action("clear-data", |ui| ui.confirm_clear_data());
         self.add_action("toggle-sidebar", |ui| {
             ui.split.set_show_sidebar(!ui.split.shows_sidebar());
         });
@@ -662,6 +663,137 @@ impl Ui {
             }
         });
         dialog.present(Some(&self.window));
+    }
+
+    // --- Encryption ------------------------------------------------------
+
+    fn show_passphrase_dialog(self: &Rc<Self>) {
+        if self.loading.get() {
+            self.toast("Wait for the refresh to finish first");
+            return;
+        }
+        let has_passphrase = self.state.borrow().keys.has_passphrase();
+
+        let dialog = adw::AlertDialog::new(
+            Some(if has_passphrase {
+                "Change Passphrase"
+            } else {
+                "Set Passphrase"
+            }),
+            Some(
+                "Your data is encrypted with a key kept in your system keyring. A \
+                 passphrase adds a second lock that is asked for every time Morlaco \
+                 starts. If you forget it, the data can’t be recovered.",
+            ),
+        );
+        dialog.add_response("cancel", "_Cancel");
+        if has_passphrase {
+            dialog.add_response("remove", "_Remove Passphrase");
+            dialog.set_response_appearance("remove", adw::ResponseAppearance::Destructive);
+        }
+        dialog.add_response("save", "_Save");
+        dialog.set_response_appearance("save", adw::ResponseAppearance::Suggested);
+        dialog.set_response_enabled("save", false);
+        dialog.set_default_response(Some("save"));
+        dialog.set_close_response("cancel");
+
+        let new = adw::PasswordEntryRow::builder()
+            .title("New passphrase")
+            .build();
+        let confirm = adw::PasswordEntryRow::builder()
+            .title("Confirm passphrase")
+            .build();
+        let fields = boxed_list();
+        fields.append(&new);
+        fields.append(&confirm);
+        dialog.set_extra_child(Some(&fields));
+
+        // Saving is possible once both fields are filled and match.
+        let validate: Rc<dyn Fn()> = {
+            let (new, confirm, dialog) = (new.clone(), confirm.clone(), dialog.clone());
+            Rc::new(move || {
+                let ok = !new.text().is_empty() && new.text() == confirm.text();
+                dialog.set_response_enabled("save", ok);
+            })
+        };
+        let on_new = validate.clone();
+        new.connect_changed(move |_| on_new());
+        confirm.connect_changed(move |_| validate());
+
+        let ui = self.clone();
+        dialog.connect_response(None, move |_, response| match response {
+            "save" => ui.set_passphrase(Some(new.text().to_string())),
+            "remove" => ui.set_passphrase(None),
+            _ => {}
+        });
+        dialog.present(Some(&self.window));
+    }
+
+    fn set_passphrase(self: &Rc<Self>, passphrase: Option<String>) {
+        // No other connection may use the file while it is re-encrypted.
+        if self.loading.get() {
+            self.toast("Wait for the refresh to finish first");
+            return;
+        }
+        let mut state = self.state.borrow_mut();
+        let keys = state.keys.with_passphrase(passphrase);
+        let result = state.store.rekey(&keys.database_key());
+        let message = match result {
+            Ok(()) => {
+                let message = if keys.has_passphrase() {
+                    "Passphrase set"
+                } else {
+                    "Passphrase removed"
+                };
+                state.keys = keys;
+                message.to_owned()
+            }
+            Err(err) => format!("Couldn’t change the passphrase: {err}"),
+        };
+        drop(state);
+        self.toast(&message);
+    }
+
+    fn confirm_clear_data(self: &Rc<Self>) {
+        let dialog = adw::AlertDialog::new(
+            Some("Clear All Local Data?"),
+            Some(
+                "This deletes your tracked wallets, saved settings and the encryption \
+                 key, then closes Morlaco. Nothing on the blockchain is affected. \
+                 This can’t be undone.",
+            ),
+        );
+        dialog.add_responses(&[("cancel", "_Cancel"), ("clear", "_Clear Data")]);
+        dialog.set_response_appearance("clear", adw::ResponseAppearance::Destructive);
+        dialog.set_close_response("cancel");
+
+        let ui = self.clone();
+        dialog.connect_response(None, move |_, response| {
+            if response == "clear" {
+                ui.clear_data();
+            }
+        });
+        dialog.present(Some(&self.window));
+    }
+
+    fn clear_data(self: &Rc<Self>) {
+        let Some(path) = paths::data_file() else {
+            self.toast("No data directory is available");
+            return;
+        };
+        if let Err(message) = unlock::delete_database_files(&path) {
+            self.toast(&format!("Couldn’t delete the data: {message}"));
+            return;
+        }
+        // The data goes first. If the key then cannot be removed, the next
+        // start finds a key and no data and simply begins again, whereas the
+        // other order could leave data without its key.
+        if let Err(message) = keys::clear() {
+            glib::g_warning!("morlaco", "could not remove the key: {message}");
+        }
+        if let Some(app) = self.window.application() {
+            app.quit();
+        }
     }
 
     fn show_rename_dialog(self: &Rc<Self>, index: usize) {
@@ -852,10 +984,12 @@ impl Ui {
             glib::ControlFlow::Continue
         });
 
+        let key = self.state.borrow().keys.database_key();
         let ui = self.clone();
         glib::spawn_future_local(async move {
             let names = addresses.clone();
-            let outcome = gio::spawn_blocking(move || fetch_all(addresses, &done, &txs)).await;
+            let outcome =
+                gio::spawn_blocking(move || fetch_all(addresses, &key, &done, &txs)).await;
             ticker.remove();
             let fetched =
                 outcome.unwrap_or_else(|_| Fetched::failed(names, "the worker thread crashed"));
@@ -1097,8 +1231,8 @@ impl Fetched {
 ///
 /// `done` counts finished wallets and `txs` the transactions fetched so far
 /// for the current one.
-fn fetch_all(addresses: Vec<String>, done: &AtomicUsize, txs: &AtomicUsize) -> Fetched {
-    let cache = match open_database() {
+fn fetch_all(addresses: Vec<String>, key: &str, done: &AtomicUsize, txs: &AtomicUsize) -> Fetched {
+    let cache = match open_database(key) {
         Ok(cache) => cache,
         Err(message) => return Fetched::failed(addresses, &message),
     };
@@ -1126,9 +1260,9 @@ fn fetch_all(addresses: Vec<String>, done: &AtomicUsize, txs: &AtomicUsize) -> F
 }
 
 /// Opens a connection for the worker thread; the main thread keeps its own.
-fn open_database() -> Result<Database, String> {
+fn open_database(key: &str) -> Result<Database, String> {
     let path = paths::data_file().ok_or("no data directory available")?;
-    Database::open(&path).map_err(|e| e.to_string())
+    Database::open(&path, key).map_err(|e| e.to_string())
 }
 
 fn boxed_list() -> gtk::ListBox {

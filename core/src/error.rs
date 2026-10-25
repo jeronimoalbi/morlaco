@@ -16,6 +16,9 @@ pub enum Error {
     /// The local database failed.
     #[error("database error: {0}")]
     Database(#[from] rusqlite::Error),
+    /// The key does not open the database file.
+    #[error("the database could not be unlocked with this key")]
+    WrongKey,
     /// Creating the data directory or setting permissions failed.
     #[error("file error: {0}")]
     Io(#[from] std::io::Error),

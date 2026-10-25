@@ -57,6 +57,11 @@ impl Store {
         })
     }
 
+    /// Re-encrypts the database with a new key. See [`Database::rekey`].
+    pub fn rekey(&self, key: &str) -> Result<()> {
+        self.db.rekey(key)
+    }
+
     /// The underlying database, to check what was written in tests.
     #[cfg(test)]
     pub fn database(&self) -> &Database {
