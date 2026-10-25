@@ -61,8 +61,12 @@ brew install gtk4 libadwaita pkgconf openssl@3
 OPENSSL_DIR="$(brew --prefix openssl@3)" cargo run --release
 ```
 
+To get an app with its own icon in the Dock and the Launchpad, also install
+`librsvg` (`brew install librsvg`) and run `contrib/macos/bundle.sh`. It builds
+`target/Morlaco.app`, which you can drag into Applications.
+
 Your database key is kept in the Keychain, which may ask for permission the
-first time. This is new and has only been built in CI so far.
+first time. macOS support is new and has only been built in CI so far.
 
 Just want to try it? `cargo run` works from the checkout, no install needed.
 
