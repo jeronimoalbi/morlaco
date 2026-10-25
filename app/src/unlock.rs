@@ -427,7 +427,6 @@ fn show_passphrase_prompt(
         page,
         entry,
         unlock,
-        more: _,
     } = gate::prompt_layout(description, !keyring_reachable);
     let page = Rc::new(page);
     let window = gate_window(app, &page);

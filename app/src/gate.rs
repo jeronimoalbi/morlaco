@@ -2,8 +2,7 @@
 //! passphrase setup and error messages.
 //!
 //! This file only builds widgets. It has no behaviour and depends on nothing
-//! but GTK, so `examples/gate_fit.rs` can include it and check, in real
-//! windows, that every button is visible.
+//! but GTK.
 //!
 //! # Why the windows are not resizable
 //!
@@ -31,8 +30,7 @@ use adw::prelude::*;
 /// needs more room.
 ///
 /// `unlock::gate_window` builds the windows with this width, not resizable
-/// and with no height; `examples/gate_fit.rs` repeats exactly that sizing to
-/// check it, so change them together.
+/// and with no height.
 pub const WINDOW_WIDTH: i32 = 480;
 
 /// Names of the window actions behind the "⋮" menu on the unlock page, without
@@ -104,11 +102,6 @@ pub struct PromptLayout {
     pub entry: adw::PasswordEntryRow,
     /// Opens the data.
     pub unlock: gtk::Button,
-    /// The "⋮" button that opens the menu of secondary actions. The app does
-    /// not need the handle (the menu works through window actions);
-    /// `examples/gate_fit.rs` uses it to check the button is visible.
-    #[allow(dead_code)]
-    pub more: gtk::MenuButton,
 }
 
 /// The menu behind the "⋮" button. "Try Again" is only offered when the
@@ -170,7 +163,6 @@ pub fn prompt_layout(description: &str, show_try_again: bool) -> PromptLayout {
         page,
         entry,
         unlock,
-        more,
     }
 }
 

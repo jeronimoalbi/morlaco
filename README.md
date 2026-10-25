@@ -103,8 +103,8 @@ Just want to try it? `cargo run` works from the checkout, no install needed.
 ## Development
 
 ```sh
-just check                   # format, lints, tests and the dependency checks
-cargo run                    # run the app from the checkout
+just check                     # format, lints, tests and the dependency checks
+cargo run                      # run the app from the checkout
 cargo run --example screenshot # redraw docs/screenshots/overview.png (example data)
 ```
 
