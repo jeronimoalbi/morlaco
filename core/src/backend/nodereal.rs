@@ -3,13 +3,20 @@
 //! A node cannot list the transactions of an address, and no explorer's
 //! free keyless service covers BNB Smart Chain, so the history comes from
 //! NodeReal's `nr_getAssetTransfers`, which needs a (free) API key. It lists
-//! the normal and the internal transfers of an address, which are turned into
-//! the same neutral rows as Ethereum's and merged by
+//! the normal ("external") and the internal transfers of an address, which
+//! are turned into the same neutral rows as Ethereum's and merged by
 //! [`combine`](crate::backend::ethereum::combine).
 //!
-//! The method looks at no more than 100,000 blocks per request, and for one
-//! direction at a time (sent or received), so a history is read window by
-//! window, from the first block that is not saved yet to the newest.
+//! Asked with no block range, the method reads the whole history page by page
+//! and can give it newest first. Two things shape the queries, both found by
+//! trying the service:
+//!
+//! - It filters by sender or by recipient, not both, so each is a pass of its
+//!   own.
+//! - Asked for both categories at once it returns all the external transfers
+//!   and only then the internal ones, so a page is not in block order across
+//!   them. Each category is a pass of its own, newest first, and a pass stops
+//!   at the first block that is already saved.
 
 use std::time::Duration;
 
@@ -20,8 +27,6 @@ use crate::backend::ethereum::{Transfer, Tx, combine};
 use crate::chain::{Activity, Chain, ChainBackend, FetchOptions};
 use crate::{Error, Result};
 
-/// Most blocks one request may cover.
-const WINDOW: u64 = 100_000;
 /// Rows per page, the most the API gives (1000 in hexadecimal).
 const PAGE_SIZE: &str = "0x3e8";
 /// Wait after each request, to stay within a free key's rate limit.
@@ -113,49 +118,46 @@ enum Side {
 }
 
 /// Reads the history of `address` (in lowercase) in blocks above
-/// `since_height`, up to the newest block.
+/// `since_height`.
 fn scan(
     rpc: &dyn Rpc,
     address: &str,
     since_height: u64,
     on_progress: &mut dyn FnMut(usize),
 ) -> Result<Vec<Activity>> {
-    let head = parse_hex_u64(
-        rpc.call("eth_blockNumber", json!([]))?
-            .as_str()
-            .ok_or(Error::BadResponse("the newest block is not text"))?,
-    )?;
-
     let mut txs = Vec::new();
     let mut transfers = Vec::new();
-    let mut start = since_height + 1;
-    while start <= head {
-        let end = (start + WINDOW - 1).min(head);
+    for category in ["external", "internal"] {
         for side in [Side::Sender, Side::Recipient] {
-            read_window(rpc, address, (start, end), side, &mut txs, &mut transfers)?;
+            read_pass(
+                rpc,
+                address,
+                (category, side),
+                since_height,
+                &mut txs,
+                &mut transfers,
+            )?;
+            on_progress(txs.len() + transfers.len());
         }
-        on_progress(txs.len() + transfers.len());
-        start = end + 1;
     }
     Ok(combine(address, &txs, &transfers, &[]))
 }
 
-/// Reads every page of one side of one window of blocks.
-fn read_window(
+/// Reads one category of transfers on one side of the address, newest first,
+/// until the blocks that are already saved or the end.
+fn read_pass(
     rpc: &dyn Rpc,
     address: &str,
-    (from_block, to_block): (u64, u64),
-    side: Side,
+    (category, side): (&str, Side),
+    since_height: u64,
     txs: &mut Vec<Tx>,
     transfers: &mut Vec<Transfer>,
 ) -> Result<()> {
     let mut page_key: Option<String> = None;
     loop {
         let mut query = json!({
-            "category": ["external", "internal"],
-            "fromBlock": format!("{from_block:#x}"),
-            "toBlock": format!("{to_block:#x}"),
-            "order": "asc",
+            "category": [category],
+            "order": "desc",
             "maxCount": PAGE_SIZE,
         });
         query[match side {
@@ -169,7 +171,12 @@ fn read_window(
         let result = rpc.call("nr_getAssetTransfers", json!([query]))?;
         let page: Page = serde_json::from_value(result)
             .map_err(|_| Error::BadResponse("the list of transfers is malformed"))?;
+        let mut reached_known_blocks = false;
         for row in page.transfers {
+            if row.height()? <= since_height {
+                reached_known_blocks = true;
+                continue;
+            }
             // A transfer from the address to itself is in both sides.
             if matches!(side, Side::Recipient) && row.from.eq_ignore_ascii_case(address) {
                 continue;
@@ -177,8 +184,8 @@ fn read_window(
             row.sort_into(txs, transfers)?;
         }
         match page.page_key.filter(|key| !key.is_empty()) {
-            Some(key) => page_key = Some(key),
-            None => return Ok(()),
+            Some(key) if !reached_known_blocks => page_key = Some(key),
+            _ => return Ok(()),
         }
     }
 }
@@ -237,6 +244,11 @@ impl Row {
         })
     }
 
+    fn height(&self) -> Result<u64> {
+        u64::try_from(parse_hex_or_decimal(&self.block_num)?)
+            .map_err(|_| Error::BadResponse("a block number is too large"))
+    }
+
     fn time(&self) -> Result<i64> {
         let seconds = self
             .time
@@ -249,8 +261,7 @@ impl Row {
     /// Files the row as a transaction or an internal transfer. Other kinds
     /// (tokens) were not asked for and are ignored.
     fn sort_into(&self, txs: &mut Vec<Tx>, transfers: &mut Vec<Transfer>) -> Result<()> {
-        let height = u64::try_from(parse_hex_or_decimal(&self.block_num)?)
-            .map_err(|_| Error::BadResponse("a block number is too large"))?;
+        let height = self.height()?;
         let from = self.from.to_ascii_lowercase();
         let to = self.to.clone().unwrap_or_default().to_ascii_lowercase();
         match self.category.as_str() {
@@ -295,11 +306,6 @@ impl Row {
     }
 }
 
-fn parse_hex_u64(text: &str) -> Result<u64> {
-    u64::try_from(parse_hex_or_decimal(text)?)
-        .map_err(|_| Error::BadResponse("a number is too large"))
-}
-
 /// Reads `0x…` as hexadecimal and anything else as decimal. `0x` alone is 0.
 fn parse_hex_or_decimal(text: &str) -> Result<u128> {
     let bad = Error::BadResponse("a number is malformed");
@@ -339,51 +345,57 @@ mod tests {
         })
     }
 
-    /// A fake NodeReal: the newest block, a list of rows, and the page size.
+    /// A fake NodeReal: a list of rows and the page size. It answers like the
+    /// real one: one category and one side at a time, newest first, and it
+    /// refuses a block range (the code must not send one).
     struct Fake {
-        head: u64,
         rows: Vec<Value>,
         page_size: usize,
-        windows: RefCell<Vec<(u64, u64)>>,
+        /// The first query of every pass, in order.
+        passes: RefCell<Vec<Value>>,
+        /// How many requests were made in all.
+        requests: RefCell<usize>,
     }
 
     impl Fake {
-        fn new(head: u64, rows: Vec<Value>) -> Self {
+        fn new(rows: Vec<Value>) -> Self {
             Self {
-                head,
                 rows,
                 page_size: 1000,
-                windows: RefCell::new(Vec::new()),
+                passes: RefCell::new(Vec::new()),
+                requests: RefCell::new(0),
             }
         }
     }
 
+    fn block_of(row: &Value) -> u64 {
+        u64::try_from(parse_hex_or_decimal(row["blockNum"].as_str().expect("block")).expect("hex"))
+            .expect("fits")
+    }
+
     impl Rpc for Fake {
         fn call(&self, method: &str, params: Value) -> Result<Value> {
-            if method == "eth_blockNumber" {
-                return Ok(json!(hex(u128::from(self.head))));
-            }
             assert_eq!(method, "nr_getAssetTransfers");
+            *self.requests.borrow_mut() += 1;
             let q = &params[0];
-            let block = |name: &str| parse_hex_u64(q[name].as_str().expect("block")).expect("hex");
-            let (from_block, to_block) = (block("fromBlock"), block("toBlock"));
-            assert!(to_block - from_block < WINDOW, "window too large");
+            assert!(q.get("fromBlock").is_none() && q.get("toBlock").is_none());
+            assert_eq!(q["order"], "desc");
+            let categories = q["category"].as_array().expect("categories");
+            assert_eq!(categories.len(), 1, "one category per pass");
             let offset: usize = q["pageKey"].as_str().map_or(0, |k| k.parse().expect("key"));
             if offset == 0 {
-                self.windows.borrow_mut().push((from_block, to_block));
+                self.passes.borrow_mut().push(q.clone());
             }
-            let side_matches = |row: &Value| {
-                q["fromAddress"].as_str().is_none_or(|a| row["from"] == a)
-                    && q["toAddress"].as_str().is_none_or(|a| row["to"] == a)
-            };
-            let matching: Vec<&Value> = self
+            let mut matching: Vec<&Value> = self
                 .rows
                 .iter()
-                .filter(|r| {
-                    let b = parse_hex_u64(r["blockNum"].as_str().expect("block")).expect("hex");
-                    (from_block..=to_block).contains(&b) && side_matches(r)
+                .filter(|row| {
+                    row["category"] == categories[0]
+                        && q["fromAddress"].as_str().is_none_or(|a| row["from"] == a)
+                        && q["toAddress"].as_str().is_none_or(|a| row["to"] == a)
                 })
                 .collect();
+            matching.sort_by_key(|row| std::cmp::Reverse(block_of(row)));
             let page: Vec<&Value> = matching
                 .iter()
                 .skip(offset)
@@ -405,13 +417,10 @@ mod tests {
 
     #[test]
     fn incoming_and_outgoing_payments_and_their_fee() {
-        let fake = Fake::new(
-            1_000,
-            vec![
-                external("0x1", 10, OTHER, ME, 2 * BNB, 1),
-                external("0x2", 20, ME, OTHER, BNB, 1),
-            ],
-        );
+        let fake = Fake::new(vec![
+            external("0x1", 10, OTHER, ME, 2 * BNB, 1),
+            external("0x2", 20, ME, OTHER, BNB, 1),
+        ]);
         let found = run(&fake, 0);
         assert_eq!(found.len(), 2);
         assert_eq!(
@@ -428,14 +437,14 @@ mod tests {
 
     #[test]
     fn a_failed_transaction_costs_gas_but_moves_nothing() {
-        let fake = Fake::new(100, vec![external("0x3", 10, ME, OTHER, BNB, 0)]);
+        let fake = Fake::new(vec![external("0x3", 10, ME, OTHER, BNB, 0)]);
         let found = run(&fake, 0);
         assert_eq!((found[0].amount, found[0].fee), (0, 21_000 * 5_000_000_000));
     }
 
     #[test]
     fn a_payment_to_yourself_is_counted_once() {
-        let fake = Fake::new(100, vec![external("0x4", 10, ME, ME, BNB, 1)]);
+        let fake = Fake::new(vec![external("0x4", 10, ME, ME, BNB, 1)]);
         let found = run(&fake, 0);
         // Value out and in cancel; only the gas is left.
         assert_eq!(found.len(), 1);
@@ -445,13 +454,10 @@ mod tests {
     #[test]
     fn internal_transfers_join_their_transaction() {
         // ME sends 1 BNB to a contract, which pays 0.4 back inside the call.
-        let fake = Fake::new(
-            100,
-            vec![
-                external("0x5", 10, ME, OTHER, BNB, 1),
-                internal("0x5", 10, OTHER, ME, BNB * 4 / 10),
-            ],
-        );
+        let fake = Fake::new(vec![
+            external("0x5", 10, ME, OTHER, BNB, 1),
+            internal("0x5", 10, OTHER, ME, BNB * 4 / 10),
+        ]);
         let found = run(&fake, 0);
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].amount, -(BNB as i128) * 6 / 10);
@@ -459,7 +465,7 @@ mod tests {
 
     #[test]
     fn a_payout_from_a_contract_is_a_receipt_of_its_own() {
-        let fake = Fake::new(100, vec![internal("0x6", 10, OTHER, ME, BNB)]);
+        let fake = Fake::new(vec![internal("0x6", 10, OTHER, ME, BNB)]);
         let found = run(&fake, 0);
         assert_eq!((found[0].amount, found[0].fee), (BNB as i128, 0));
     }
@@ -468,7 +474,7 @@ mod tests {
     fn a_failed_internal_call_moves_nothing() {
         let mut failed = internal("0x7", 10, OTHER, ME, BNB);
         failed["receiptsStatus"] = json!(0);
-        let fake = Fake::new(100, vec![failed]);
+        let fake = Fake::new(vec![failed]);
         assert!(run(&fake, 0).is_empty());
     }
 
@@ -477,34 +483,69 @@ mod tests {
         let rows: Vec<Value> = (1..=7)
             .map(|n| external(&format!("0x{n}"), n * 10, OTHER, ME, BNB, 1))
             .collect();
-        let mut fake = Fake::new(1_000, rows);
+        let mut fake = Fake::new(rows);
         fake.page_size = 2;
         assert_eq!(run(&fake, 0).len(), 7);
     }
 
     #[test]
-    fn blocks_are_read_in_windows_with_no_gap_and_no_overlap() {
-        let fake = Fake::new(250_050, vec![]);
+    fn each_category_and_side_is_a_pass_of_its_own() {
+        let fake = Fake::new(vec![]);
         run(&fake, 0);
-        let windows = fake.windows.borrow();
-        // Each window is asked for on both sides, in order.
-        let distinct: Vec<(u64, u64)> = windows.iter().step_by(2).copied().collect();
+        let passes = fake.passes.borrow();
+        let seen: Vec<(String, &str)> = passes
+            .iter()
+            .map(|q| {
+                (
+                    q["category"][0].as_str().expect("category").to_owned(),
+                    if q.get("fromAddress").is_some() {
+                        "from"
+                    } else {
+                        "to"
+                    },
+                )
+            })
+            .collect();
         assert_eq!(
-            distinct,
-            [(1, 100_000), (100_001, 200_000), (200_001, 250_050)]
+            seen,
+            [
+                ("external".to_owned(), "from"),
+                ("external".to_owned(), "to"),
+                ("internal".to_owned(), "from"),
+                ("internal".to_owned(), "to"),
+            ]
         );
-        assert_eq!(windows.len(), 6);
+        // No page key on the first request of a pass.
+        assert!(passes.iter().all(|q| q.get("pageKey").is_none()));
     }
 
     #[test]
-    fn known_blocks_are_not_asked_for_again() {
-        let fake = Fake::new(300, vec![]);
-        run(&fake, 250);
-        assert_eq!(fake.windows.borrow()[0], (251, 300));
-        // Nothing newer than what is saved means no window at all.
-        let none = Fake::new(250, vec![]);
-        run(&none, 250);
-        assert!(none.windows.borrow().is_empty());
+    fn a_pass_stops_at_the_first_block_that_is_already_saved() {
+        // Ten receipts, blocks 10, 20 .. 100, two to a page: with blocks up to
+        // 75 saved, the second page (80 and 70) reaches them and ends the pass.
+        let rows: Vec<Value> = (1..=10)
+            .map(|n| external(&format!("0x{n}"), n * 10, OTHER, ME, BNB, 1))
+            .collect();
+        let mut fake = Fake::new(rows);
+        fake.page_size = 2;
+        let found = run(&fake, 75);
+        assert_eq!(
+            found.iter().map(|a| a.height).collect::<Vec<_>>(),
+            [80, 90, 100]
+        );
+        // Two pages for the receipts, and one request for each other pass.
+        assert_eq!(*fake.requests.borrow(), 2 + 1 + 1 + 1);
+    }
+
+    #[test]
+    fn a_block_that_is_already_saved_is_not_taken_again() {
+        let fake = Fake::new(vec![
+            external("0x1", 50, OTHER, ME, BNB, 1),
+            external("0x2", 51, OTHER, ME, BNB, 1),
+        ]);
+        let found = run(&fake, 50);
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].txid, "0x2");
     }
 
     #[test]

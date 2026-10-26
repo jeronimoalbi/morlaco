@@ -117,8 +117,8 @@ Just want to try it? `cargo run` works from the checkout, no install needed.
   instead. The key is kept in your encrypted data.
 - BNB Smart Chain has no free keyless history service, so BNB wallets need a
   free [NodeReal](https://nodereal.io) API key, entered in the same place. The
-  first load of a BNB wallet reads the whole history and can take a few
-  minutes. BNB prices come from Binance and are in USDT, which stands in for
+  first load of a BNB wallet reads its whole history, which takes about half a
+  minute for a wallet with ten thousand transactions. BNB prices come from Binance and are in USDT, which stands in for
   US dollars.
 
 ## Development
