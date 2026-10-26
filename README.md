@@ -55,8 +55,8 @@ Anywhere, once you have the dependencies:
 cargo build --release
 sudo install -Dm755 target/release/morlaco /usr/bin/morlaco
 sudo install -Dm644 contrib/desktop/io.github.jeronimoalbi.Morlaco.desktop /usr/share/applications/io.github.jeronimoalbi.Morlaco.desktop
-sudo install -Dm644 app/data/icons/hicolor/scalable/apps/io.github.jeronimoalbi.Morlaco.svg /usr/share/icons/hicolor/scalable/apps/io.github.jeronimoalbi.Morlaco.svg
-sudo install -Dm644 app/data/icons/hicolor/symbolic/apps/io.github.jeronimoalbi.Morlaco-symbolic.svg /usr/share/icons/hicolor/symbolic/apps/io.github.jeronimoalbi.Morlaco-symbolic.svg
+sudo install -Dm644 data/icons/hicolor/scalable/apps/io.github.jeronimoalbi.Morlaco.svg /usr/share/icons/hicolor/scalable/apps/io.github.jeronimoalbi.Morlaco.svg
+sudo install -Dm644 data/icons/hicolor/symbolic/apps/io.github.jeronimoalbi.Morlaco-symbolic.svg /usr/share/icons/hicolor/symbolic/apps/io.github.jeronimoalbi.Morlaco-symbolic.svg
 ```
 
 **macOS:** install the libraries with [Homebrew](https://brew.sh), then build:
@@ -133,5 +133,5 @@ cargo run --example screenshot # redraw docs/screenshots/overview.png (example d
 
 MIT. See `LICENSE`.
 
-The symbolic icons in `app/data/adwaita-icons` come from the GNOME Adwaita icon
+The symbolic icons in `data/adwaita-icons` come from the GNOME Adwaita icon
 theme (CC-BY-SA-3.0 or LGPL-3.0-only). Their licences are in that folder.

@@ -13,9 +13,9 @@ use gtk4 as gtk;
 use libadwaita as adw;
 
 use adw::prelude::*;
-use morlaco_core::Error;
-use morlaco_core::db::Database;
-use morlaco_core::paths;
+use morlaco::Error;
+use morlaco::db::Database;
+use morlaco::paths;
 
 use crate::encryption::{self, PassphraseProblem};
 use crate::gate::{self, GatePage, PromptLayout, SetupLayout, boxed_fields};
@@ -606,7 +606,7 @@ pub fn delete_database_files(path: &Path) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
-    use morlaco_core::chain::{Chain, WalletId};
+    use morlaco::chain::{Chain, WalletId};
 
     use super::*;
     use crate::keys::{MemoryKeyring, Mode};

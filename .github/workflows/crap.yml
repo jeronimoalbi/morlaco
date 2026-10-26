@@ -6,8 +6,10 @@ on:
   push:
     branches: [master]
     paths:
-      - "core/**"
-      - "app/**"
+      - "src/**"
+      - "data/**"
+      - "examples/**"
+      - "build.rs"
       - "Cargo.toml"
       - "Cargo.lock"
       - ".cargo-crap.toml"
@@ -16,8 +18,10 @@ on:
   pull_request:
     types: [opened, synchronize, reopened]
     paths:
-      - "core/**"
-      - "app/**"
+      - "src/**"
+      - "data/**"
+      - "examples/**"
+      - "build.rs"
       - "Cargo.toml"
       - "Cargo.lock"
       - ".cargo-crap.toml"

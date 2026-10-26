@@ -13,13 +13,13 @@ use gtk4 as gtk;
 use libadwaita as adw;
 
 use adw::prelude::*;
-use morlaco_core::chain::{Chain, WalletId};
-use morlaco_core::db::Database;
-use morlaco_core::lots::{Lot, Summary};
-use morlaco_core::paths;
-use morlaco_core::portfolio::{self, Entry, History, Portfolio};
-use morlaco_core::price::{CachedPrices, LivePrices, PriceSource};
-use morlaco_core::util::date_string;
+use morlaco::chain::{Chain, WalletId};
+use morlaco::db::Database;
+use morlaco::lots::{Lot, Summary};
+use morlaco::paths;
+use morlaco::portfolio::{self, Entry, History, Portfolio};
+use morlaco::price::{CachedPrices, LivePrices, PriceSource};
+use morlaco::util::date_string;
 
 use crate::encryption;
 use crate::format;
@@ -129,7 +129,7 @@ impl State {
 
     /// Removes the wallet at `index` and what was loaded for it. Returns the
     /// selection to go to.
-    fn remove_wallet(&mut self, index: usize) -> morlaco_core::Result<Selection> {
+    fn remove_wallet(&mut self, index: usize) -> morlaco::Result<Selection> {
         let removed = self.store.wallets.get(index).map(|w| w.id.clone());
         self.store.remove(index)?;
         if let Some(id) = removed {
@@ -2527,8 +2527,8 @@ fn show_about(parent: &adw::ApplicationWindow) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use morlaco_core::chain::Activity;
-    use morlaco_core::portfolio::PricedTx;
+    use morlaco::chain::Activity;
+    use morlaco::portfolio::PricedTx;
 
     fn state() -> State {
         let db = Database::in_memory().expect("in-memory db opens");

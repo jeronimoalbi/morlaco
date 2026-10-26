@@ -166,9 +166,9 @@ mod tests {
     use std::cell::Cell;
     use std::path::Path;
 
-    use morlaco_core::Error;
-    use morlaco_core::chain::{Chain, WalletId};
-    use morlaco_core::db::Database;
+    use morlaco::Error;
+    use morlaco::chain::{Chain, WalletId};
+    use morlaco::db::Database;
 
     use super::*;
     use crate::keys::MemoryKeyring;

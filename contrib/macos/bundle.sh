@@ -11,7 +11,7 @@ set -eu
 root=$(cd "$(dirname "$0")/../.." && pwd)
 brew_prefix=$(brew --prefix)
 version=$(sed -n 's/^version = "\(.*\)"/\1/p' "$root/Cargo.toml" | head -n 1)
-icon_svg="$root/app/data/icons/hicolor/scalable/apps/io.github.jeronimoalbi.Morlaco.svg"
+icon_svg="$root/data/icons/hicolor/scalable/apps/io.github.jeronimoalbi.Morlaco.svg"
 app="$root/target/Morlaco.app"
 
 OPENSSL_DIR=$(brew --prefix openssl@3) cargo build --release --locked -p morlaco \

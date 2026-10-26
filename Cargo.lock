@@ -823,15 +823,8 @@ dependencies = [
  "gtk4",
  "libadwaita",
  "libsecret",
- "morlaco-core",
- "security-framework",
-]
-
-[[package]]
-name = "morlaco-core"
-version = "0.1.0"
-dependencies = [
  "rusqlite",
+ "security-framework",
  "serde",
  "serde_json",
  "thiserror",

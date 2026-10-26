@@ -4,10 +4,10 @@
 //! through to the database first, so a failed write never leaves the screen
 //! showing something that was not saved.
 
-use morlaco_core::chain::{Chain, WalletId};
-use morlaco_core::db::Database;
-use morlaco_core::portfolio::{History, SETTING_ETHERSCAN_KEY, SETTING_NODEREAL_KEY};
-use morlaco_core::{Error, Result};
+use morlaco::chain::{Chain, WalletId};
+use morlaco::db::Database;
+use morlaco::portfolio::{History, SETTING_ETHERSCAN_KEY, SETTING_NODEREAL_KEY};
+use morlaco::{Error, Result};
 
 const HIDDEN_KEY: &str = "hidden";
 const ACTIVE_PORTFOLIO_KEY: &str = "active_portfolio";

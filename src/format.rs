@@ -1,7 +1,7 @@
 //! Display formatting. Every amount goes through here so privacy mode can
 //! mask it in one place.
 
-use morlaco_core::chain::Chain;
+use morlaco::chain::Chain;
 
 /// Shown in place of any masked number.
 pub const MASK: &str = "•••••";

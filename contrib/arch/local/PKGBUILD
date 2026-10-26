@@ -79,9 +79,9 @@ package() {
   install -Dm755 target/release/morlaco "$pkgdir/usr/bin/morlaco"
   install -Dm644 contrib/desktop/io.github.jeronimoalbi.Morlaco.desktop \
     "$pkgdir/usr/share/applications/io.github.jeronimoalbi.Morlaco.desktop"
-  install -Dm644 app/data/icons/hicolor/scalable/apps/io.github.jeronimoalbi.Morlaco.svg \
+  install -Dm644 data/icons/hicolor/scalable/apps/io.github.jeronimoalbi.Morlaco.svg \
     "$pkgdir/usr/share/icons/hicolor/scalable/apps/io.github.jeronimoalbi.Morlaco.svg"
-  install -Dm644 app/data/icons/hicolor/symbolic/apps/io.github.jeronimoalbi.Morlaco-symbolic.svg \
+  install -Dm644 data/icons/hicolor/symbolic/apps/io.github.jeronimoalbi.Morlaco-symbolic.svg \
     "$pkgdir/usr/share/icons/hicolor/symbolic/apps/io.github.jeronimoalbi.Morlaco-symbolic.svg"
   install -Dm644 LICENSE "$pkgdir/usr/share/licenses/morlaco/LICENSE"
 }

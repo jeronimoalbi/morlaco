@@ -6,9 +6,9 @@
 
 use std::path::Path;
 
-use morlaco_core::Result;
-use morlaco_core::chain::{Chain, WalletId};
-use morlaco_core::paths;
+use morlaco::Result;
+use morlaco::chain::{Chain, WalletId};
+use morlaco::paths;
 
 use crate::store::Store;
 
@@ -115,7 +115,7 @@ mod tests {
 
     #[test]
     fn import_moves_wallets_into_the_store_and_removes_the_old_files() {
-        use morlaco_core::db::Database;
+        use morlaco::db::Database;
 
         let dir = temp_dir("import");
         let wallets = dir.join("wallets.tsv");

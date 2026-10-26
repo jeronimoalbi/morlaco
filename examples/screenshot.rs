@@ -43,9 +43,9 @@ use gtk::prelude::*;
 use gtk::{gdk, glib, graphene, gsk};
 use gtk4 as gtk;
 use libadwaita as adw;
-use morlaco_core::chain::{Activity, Chain, WalletId};
-use morlaco_core::db::Database;
-use morlaco_core::portfolio::PricedTx;
+use morlaco::chain::{Activity, Chain, WalletId};
+use morlaco::db::Database;
+use morlaco::portfolio::PricedTx;
 
 use crate::keys::Keys;
 use crate::store::Store;

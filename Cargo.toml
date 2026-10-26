@@ -1,15 +1,28 @@
-[workspace]
-resolver = "3"
-members = ["core", "app"]
-
-[workspace.package]
+[package]
+name = "morlaco"
+description = "GNOME app that tracks wallet holdings and unrealized gains"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.92"
 license = "MIT"
 publish = false
 
-[workspace.lints.clippy]
+[dependencies]
+gtk4 = { version = "0.11.5", features = ["v4_10"] }
+libadwaita = { version = "0.9.2", features = ["v1_5"] }
+rusqlite = { version = "0.41.0", features = ["bundled-sqlcipher"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+thiserror = "2.0.21"
+ureq = { version = "3.5.0", features = ["json"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libsecret = "0.9.0"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+security-framework = "3.7.0"
+
+[lints.clippy]
 cognitive_complexity = "warn"
 too_many_lines = "warn"
 excessive_nesting = "warn"
