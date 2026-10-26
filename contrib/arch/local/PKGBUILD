@@ -32,7 +32,19 @@ conflicts=(morlaco)
 # "undefined symbol: sqlite3_errstr" and friends.
 options=(!lto)
 # The checkout is three levels up: contrib/arch/local -> repository root.
-source=("$pkgname::git+file://${startdir%/contrib/arch/local}")
+#
+# The branch is named in the source, from the checkout's current branch.
+# Without it makepkg builds whatever `origin/HEAD` pointed to when the build
+# directory was first made, and keeps building it after the branch is renamed
+# (main to master, say), so the package stays on an old commit while
+# `cargo run` builds the new one. A detached HEAD is built by its commit.
+_repo=${startdir%/contrib/arch/local}
+if _branch=$(git -C "$_repo" symbolic-ref --short -q HEAD); then
+  _ref="branch=$_branch"
+else
+  _ref="commit=$(git -C "$_repo" rev-parse HEAD)"
+fi
+source=("$pkgname::git+file://$_repo#$_ref")
 sha256sums=('SKIP')
 
 pkgver() {
