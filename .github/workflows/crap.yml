@@ -1,0 +1,64 @@
+name: CRAP
+
+# Only changes that can move a score run it: it runs the tests twice on pull
+# requests (head and base commit), with coverage.
+on:
+  push:
+    branches: [master]
+    paths:
+      - "core/**"
+      - "app/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".cargo-crap.toml"
+      - "clippy.toml"
+      - ".github/workflows/crap.yml"
+  pull_request:
+    types: [opened, synchronize, reopened]
+    paths:
+      - "core/**"
+      - "app/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".cargo-crap.toml"
+      - "clippy.toml"
+      - ".github/workflows/crap.yml"
+
+# Needed to post the score comment on pull requests.
+permissions:
+  contents: read
+  pull-requests: write
+
+concurrency:
+  group: crap-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # Scores each function by complexity and test coverage (CRAP). On a pull
+  # request it compares with the base commit, comments the changes and fails
+  # when a score rose. On push it writes the report to the job summary.
+  # Threshold and other settings come from .cargo-crap.toml.
+  crap:
+    name: CRAP score
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      # Ubuntu 24.04 ships GTK 4.14 and libadwaita 1.5, the oldest morlaco needs.
+      - name: Install libraries
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libgtk-4-dev libadwaita-1-dev libsecret-1-dev libssl-dev pkg-config
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      # A regression turns the check red and is commented on the pull request.
+      # It only blocks merging if the check is marked as required in the branch
+      # protection rules.
+      - name: cargo crap
+        uses: minikin/cargo-crap@v1

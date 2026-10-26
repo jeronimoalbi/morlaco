@@ -5,3 +5,5 @@
 /contrib/arch/local/src/
 /contrib/arch/local/pkg/
 /contrib/arch/local/*.pkg.tar.*
+
+lcov.info
