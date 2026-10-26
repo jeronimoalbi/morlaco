@@ -269,7 +269,23 @@ pub trait ChainBackend: Sync {
     ) -> Result<Vec<Activity>>;
 }
 
-/// Backend of the test-only chain: it never has any history.
+/// What the test-only chain answers and what it was asked, per test thread.
+#[cfg(test)]
+#[derive(Default)]
+pub(crate) struct FakeScript {
+    /// The whole history of every address; a fetch returns the part above its
+    /// `since_height`.
+    pub history: Vec<Activity>,
+    /// `since_height` and keys of each fetch, in order.
+    pub asked: Vec<(u64, Option<String>, Option<String>)>,
+}
+
+#[cfg(test)]
+thread_local! {
+    pub(crate) static FAKE: std::cell::RefCell<FakeScript> = Default::default();
+}
+
+/// Backend of the test-only chain: it answers from [`FAKE`].
 #[cfg(test)]
 struct FakeBackend;
 
@@ -282,11 +298,24 @@ impl ChainBackend for FakeBackend {
     fn fetch(
         &self,
         _: &str,
-        _: u64,
-        _: &FetchOptions,
-        _: &mut dyn FnMut(usize),
+        since_height: u64,
+        options: &FetchOptions,
+        on_progress: &mut dyn FnMut(usize),
     ) -> Result<Vec<Activity>> {
-        Ok(Vec::new())
+        let fresh: Vec<Activity> = FAKE.with_borrow_mut(|fake| {
+            fake.asked.push((
+                since_height,
+                options.etherscan_key.clone(),
+                options.nodereal_key.clone(),
+            ));
+            fake.history
+                .iter()
+                .filter(|a| a.height > since_height)
+                .cloned()
+                .collect()
+        });
+        on_progress(fresh.len());
+        Ok(fresh)
     }
 }
 

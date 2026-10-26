@@ -51,33 +51,84 @@ impl ChainBackend for EthereumBackend {
         if let Some(key) = &options.etherscan_key {
             return etherscan::fetch(&address, since_height, key, on_progress);
         }
-        let list = |path: &str| format!("{BASE_URL}/addresses/{address}/{path}");
+        fetch_blockscout(&Http { address: &address }, since_height, on_progress)
+    }
+}
 
-        let mut found = 0;
-        let transactions: Vec<RawTx> =
-            walk(page_fetcher(list("transactions")), since_height, |n| {
-                on_progress(found + n)
-            })?;
-        found += transactions.len();
-        let internal: Vec<RawInternal> = walk(
-            page_fetcher(list("internal-transactions")),
+/// Where Blockscout's lists of one address come from.
+trait Lists {
+    fn address(&self) -> &str;
+    fn transactions(&self, cursor: Option<&Params>) -> Result<Page<RawTx>>;
+    fn internal(&self, cursor: Option<&Params>) -> Result<Page<RawInternal>>;
+    fn withdrawals(&self, cursor: Option<&Params>) -> Result<Page<RawWithdrawal>>;
+    /// Whether the address has received staking withdrawals.
+    fn has_withdrawals(&self) -> Result<bool>;
+}
+
+/// The lists of the real service.
+struct Http<'a> {
+    address: &'a str,
+}
+
+impl Http<'_> {
+    fn url(&self, path: &str) -> String {
+        format!("{BASE_URL}/addresses/{}/{path}", self.address)
+    }
+}
+
+impl Lists for Http<'_> {
+    fn address(&self) -> &str {
+        self.address
+    }
+
+    fn transactions(&self, cursor: Option<&Params>) -> Result<Page<RawTx>> {
+        get_page(&self.url("transactions"), cursor)
+    }
+
+    fn internal(&self, cursor: Option<&Params>) -> Result<Page<RawInternal>> {
+        get_page(&self.url("internal-transactions"), cursor)
+    }
+
+    fn withdrawals(&self, cursor: Option<&Params>) -> Result<Page<RawWithdrawal>> {
+        get_page(&self.url("withdrawals"), cursor)
+    }
+
+    fn has_withdrawals(&self) -> Result<bool> {
+        has_withdrawals(self.address)
+    }
+}
+
+/// Reads the three lists of an address and merges them.
+fn fetch_blockscout(
+    lists: &impl Lists,
+    since_height: u64,
+    mut on_progress: impl FnMut(usize),
+) -> Result<Vec<Activity>> {
+    let mut found = 0;
+    let transactions = walk(
+        |c| lists.transactions(c),
+        since_height,
+        |n| on_progress(found + n),
+    )?;
+    found += transactions.len();
+    let internal = walk(
+        |c| lists.internal(c),
+        since_height,
+        |n| on_progress(found + n),
+    )?;
+    found += internal.len();
+    // Asking for the withdrawals of an address that has none takes minutes to
+    // fail, so the address summary says first whether there are any.
+    let withdrawals = if lists.has_withdrawals()? {
+        walk(
+            |c| lists.withdrawals(c),
             since_height,
             |n| on_progress(found + n),
-        )?;
-        found += internal.len();
-        // Asking for the withdrawals of an address that has none takes
-        // minutes to fail, so the address summary says first whether there are
-        // any.
-        let withdrawals: Vec<RawWithdrawal> = if has_withdrawals(&address)? {
-            walk(page_fetcher(list("withdrawals")), since_height, |n| {
-                on_progress(found + n)
-            })?
-        } else {
-            Vec::new()
-        };
-
-        merge(&address, &transactions, &internal, &withdrawals)
-    }
+        )?
+    } else {
+        Vec::new()
+    };
+    merge(lists.address(), &transactions, &internal, &withdrawals)
 }
 
 #[derive(Deserialize)]
@@ -97,13 +148,6 @@ fn has_withdrawals(address: &str) -> Result<bool> {
         Err(ureq::Error::StatusCode(404)) => Ok(false),
         Err(e) => Err(e.into()),
     }
-}
-
-/// Fetches the pages of one list of an address, given the list's URL.
-fn page_fetcher<T: DeserializeOwned>(
-    url: String,
-) -> impl FnMut(Option<&Params>) -> Result<Page<T>> {
-    move |cursor| get_page(&url, cursor)
 }
 
 /// The query parameters that ask for the page after the one just received.
@@ -132,16 +176,25 @@ fn get_page<T: DeserializeOwned>(url: &str, cursor: Option<&Params>) -> Result<P
             request = request.query(key, value);
         }
     }
-    let raw: RawPage<T> = match request.call() {
-        Ok(mut response) => response.body_mut().read_json()?,
-        Err(ureq::Error::StatusCode(404)) => {
-            return Ok(Page {
-                items: Vec::new(),
-                next: None,
-            });
-        }
-        Err(e) => return Err(e.into()),
-    };
+    page_from_answer(request.call())
+}
+
+/// The page an answer holds. "Not found" is an empty page.
+fn page_from_answer<T: DeserializeOwned>(
+    answer: std::result::Result<ureq::http::Response<ureq::Body>, ureq::Error>,
+) -> Result<Page<T>> {
+    match answer {
+        Ok(mut response) => Ok(page_of(response.body_mut().read_json()?)),
+        Err(ureq::Error::StatusCode(404)) => Ok(Page {
+            items: Vec::new(),
+            next: None,
+        }),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// The page, with the cursor of the next one as query parameters.
+fn page_of<T>(raw: RawPage<T>) -> Page<T> {
     let next = raw.next_page_params.map(|map| {
         map.into_iter()
             .filter_map(|(key, value)| match value {
@@ -151,10 +204,10 @@ fn get_page<T: DeserializeOwned>(url: &str, cursor: Option<&Params>) -> Result<P
             })
             .collect()
     });
-    Ok(Page {
+    Page {
         items: raw.items,
         next,
-    })
+    }
 }
 
 /// An entry of one of the lists, which says in which block it happened.
@@ -195,17 +248,17 @@ fn walk<T: InBlock>(
     }
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 struct RawAddress {
     hash: String,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 struct RawFee {
     value: String,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 struct RawTx {
     hash: String,
     block_number: Option<u64>,
@@ -221,7 +274,7 @@ struct RawTx {
     to: Option<RawAddress>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 struct RawInternal {
     transaction_hash: String,
     block_number: Option<u64>,
@@ -233,7 +286,7 @@ struct RawInternal {
     to: Option<RawAddress>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 struct RawWithdrawal {
     index: u64,
     block_number: Option<u64>,
@@ -726,5 +779,118 @@ mod tests {
         .expect("fixture is valid JSON");
         let params = page.next_page_params.expect("has params");
         assert_eq!(params.len(), 3);
+    }
+
+    /// Lists served from memory, newest first, one page per call.
+    struct Memory {
+        transactions: Vec<RawTx>,
+        withdrawals: Vec<RawWithdrawal>,
+        has_withdrawals: bool,
+        asked_withdrawals: std::cell::Cell<bool>,
+    }
+
+    fn only_page<T: Clone>(items: &[T]) -> Result<Page<T>> {
+        Ok(Page {
+            items: items.to_vec(),
+            next: None,
+        })
+    }
+
+    impl Lists for Memory {
+        fn address(&self) -> &str {
+            ME
+        }
+
+        fn transactions(&self, _: Option<&Params>) -> Result<Page<RawTx>> {
+            only_page(&self.transactions)
+        }
+
+        fn internal(&self, _: Option<&Params>) -> Result<Page<RawInternal>> {
+            only_page(&[])
+        }
+
+        fn withdrawals(&self, _: Option<&Params>) -> Result<Page<RawWithdrawal>> {
+            self.asked_withdrawals.set(true);
+            only_page(&self.withdrawals)
+        }
+
+        fn has_withdrawals(&self) -> Result<bool> {
+            Ok(self.has_withdrawals)
+        }
+    }
+
+    fn memory(has_withdrawals: bool) -> Memory {
+        Memory {
+            transactions: one(tx_json("0x1", 100, OTHER, ME, ETH, 0, "ok")),
+            withdrawals: serde_json::from_str(
+                r#"[{"index":7,"block_number":200,"timestamp":"2023-11-14T22:13:20.000000Z","amount":"1000000000"}]"#,
+            )
+            .expect("fixture is valid JSON"),
+            has_withdrawals,
+            asked_withdrawals: std::cell::Cell::new(false),
+        }
+    }
+
+    #[test]
+    fn the_three_lists_are_merged_and_progress_adds_up() {
+        let lists = memory(true);
+        let mut progress = Vec::new();
+        let found = fetch_blockscout(&lists, 0, |n| progress.push(n)).expect("fetch");
+        assert_eq!(found.len(), 2);
+        assert_eq!(progress, [1, 1, 2]);
+    }
+
+    #[test]
+    fn withdrawals_are_not_asked_for_when_the_address_has_none() {
+        let lists = memory(false);
+        let found = fetch_blockscout(&lists, 0, |_| {}).expect("fetch");
+        assert_eq!(found.len(), 1);
+        assert!(!lists.asked_withdrawals.get());
+    }
+
+    #[test]
+    fn the_cursor_of_the_next_page_becomes_query_parameters() {
+        let raw: RawPage<RawTx> = serde_json::from_str(
+            r#"{"items":[],"next_page_params":{"block_number":5,"items_count":50,"label":"x","skip":null}}"#,
+        )
+        .expect("fixture is valid JSON");
+        let mut next = page_of(raw).next.expect("cursor");
+        next.sort();
+        assert_eq!(
+            next,
+            [
+                ("block_number".to_owned(), "5".to_owned()),
+                ("items_count".to_owned(), "50".to_owned()),
+                ("label".to_owned(), "x".to_owned()),
+            ]
+        );
+    }
+
+    #[test]
+    fn the_last_page_has_no_cursor() {
+        let raw: RawPage<RawTx> = serde_json::from_str(r#"{"items":[],"next_page_params":null}"#)
+            .expect("fixture is valid JSON");
+        assert!(page_of(raw).next.is_none());
+    }
+
+    #[test]
+    fn an_address_the_service_never_saw_has_an_empty_page() {
+        let page: Page<RawTx> =
+            page_from_answer(Err(ureq::Error::StatusCode(404))).expect("empty page");
+        assert!(page.items.is_empty() && page.next.is_none());
+    }
+
+    #[test]
+    fn other_failures_are_errors() {
+        let result: Result<Page<RawTx>> = page_from_answer(Err(ureq::Error::StatusCode(500)));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn a_page_is_read_from_the_answer() {
+        let body = r#"{"items":[],"next_page_params":{"block_number":5}}"#;
+        let answer = ureq::http::Response::new(ureq::Body::builder().data(body));
+        let page: Page<RawTx> = page_from_answer(Ok(answer)).expect("page");
+        assert!(page.next.is_some());
     }
 }

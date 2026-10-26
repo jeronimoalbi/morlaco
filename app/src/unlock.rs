@@ -241,19 +241,29 @@ fn restore_secret(keyring: &dyn Keyring, keys: &Keys) -> Option<String> {
 /// Opens the database and calls `ready`, possibly after the user has
 /// entered a passphrase.
 pub fn start(shell: &Rc<Shell>, ready: Ready) {
-    let Some(path) = paths::data_file() else {
-        return show_error(
-            shell,
-            "Couldn’t Open Your Data",
-            "No data directory is available.",
-        );
+    let (path, file) = match locate() {
+        Ok(found) => found,
+        Err(message) => return show_error(shell, "Couldn’t Open Your Data", &message),
     };
-    let file = match file_state(&path) {
-        Ok(file) => file,
-        Err(err) => return show_error(shell, "Couldn’t Open Your Data", &err.to_string()),
-    };
+    follow(
+        shell,
+        plan(&PlatformKeyring.lookup(), file),
+        path,
+        file,
+        ready,
+    );
+}
 
-    match plan(&PlatformKeyring.lookup(), file) {
+/// Where the data file is and what state it is in.
+fn locate() -> Result<(PathBuf, FileState), String> {
+    let path = paths::data_file().ok_or("No data directory is available.")?;
+    let file = file_state(&path).map_err(|err| err.to_string())?;
+    Ok((path, file))
+}
+
+/// Takes the step `plan` chose.
+fn follow(shell: &Rc<Shell>, next: Next, path: PathBuf, file: FileState, ready: Ready) {
+    match next {
         Next::OpenWithSecret(secret) => open_with_secret(shell, path, secret, false, ready),
         Next::CreateSecret => create_secret(shell, path, file, ready),
         Next::Prompt { keyring_reachable } => {

@@ -32,8 +32,21 @@ pub fn fetch(
     key: &str,
     on_progress: &mut dyn FnMut(usize),
 ) -> Result<Vec<Activity>> {
-    let ask = |action: &str, start: u64| request(address, action, start, key);
+    fetch_with(
+        |action, start| request(address, action, start, key),
+        address,
+        since_height,
+        on_progress,
+    )
+}
 
+/// The three lists of `address`, each read through `ask(action, start_block)`.
+fn fetch_with(
+    ask: impl Fn(&str, u64) -> Result<Vec<serde_json::Value>>,
+    address: &str,
+    since_height: u64,
+    on_progress: &mut dyn FnMut(usize),
+) -> Result<Vec<Activity>> {
     let mut found = 0;
     let transactions: Vec<RawTx> = list(
         |start| ask("txlist", start),
@@ -468,5 +481,39 @@ mod tests {
             |_| {},
         );
         assert!(matches!(result, Err(Error::BadResponse(_))));
+    }
+
+    #[test]
+    fn the_three_lists_are_asked_in_turn_and_merged() {
+        let asked = std::cell::RefCell::new(Vec::new());
+        let ask = |action: &str, start: u64| {
+            asked.borrow_mut().push((action.to_owned(), start));
+            Ok(match action {
+                "txlist" => vec![tx_row("0x1", 100, OTHER, ME, 5, "0")],
+                "txlistinternal" => vec![serde_json::json!({
+                    "blockNumber": "101", "timeStamp": "1700000000", "hash": "0x2",
+                    "from": OTHER, "to": ME, "value": "1000", "isError": "0", "traceId": "0_1"
+                })],
+                _ => Vec::new(),
+            })
+        };
+        let mut progress = Vec::new();
+        let found = fetch_with(ask, ME, 40, &mut |n| progress.push(n)).expect("fetch");
+
+        assert_eq!(found.len(), 2);
+        assert_eq!(progress, [1, 2, 2]);
+        let actions: Vec<_> = asked
+            .borrow()
+            .iter()
+            .map(|(a, s)| (a.clone(), *s))
+            .collect();
+        assert_eq!(
+            actions,
+            [
+                ("txlist".to_owned(), 41),
+                ("txlistinternal".to_owned(), 41),
+                ("txsBeaconWithdrawal".to_owned(), 41),
+            ]
+        );
     }
 }

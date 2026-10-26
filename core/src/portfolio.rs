@@ -506,4 +506,131 @@ mod tests {
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].wallet.address, "A");
     }
+
+    /// Prices that can be told to fail after a number of questions.
+    struct Prices {
+        usd: f64,
+        fail: bool,
+    }
+
+    impl PriceSource for Prices {
+        fn usd_at(&self, _: Chain, time: i64) -> Result<f64> {
+            if self.fail {
+                return Err(crate::error::Error::NoPrice(time));
+            }
+            Ok(self.usd)
+        }
+
+        fn usd_now(&self, _: Chain) -> Result<f64> {
+            Ok(self.usd)
+        }
+    }
+
+    fn fake_activity(txid: &str, height: u64) -> Activity {
+        tx(txid, height, BTC, 0, &[]).activity
+    }
+
+    fn script(history: Vec<Activity>) {
+        crate::chain::FAKE.with_borrow_mut(|f| {
+            f.history = history;
+            f.asked.clear();
+        });
+    }
+
+    fn asked() -> Vec<(u64, Option<String>, Option<String>)> {
+        crate::chain::FAKE.with_borrow(|f| f.asked.clone())
+    }
+
+    fn wallet() -> WalletId {
+        WalletId::new(Chain::Fake, "x1")
+    }
+
+    #[test]
+    fn the_first_load_saves_the_priced_history() {
+        let db = Database::in_memory().expect("db");
+        script(vec![fake_activity("a", 10), fake_activity("b", 20)]);
+        let prices = Prices {
+            usd: 5.0,
+            fail: false,
+        };
+
+        let mut progress = Vec::new();
+        let loaded = fetch(&wallet(), &prices, &db, |n| progress.push(n)).expect("fetch");
+
+        assert_eq!(ids(&loaded.txs), ["a", "b"]);
+        assert_eq!(loaded.txs[0].price_usd, 5.0);
+        assert_eq!(db.history(&wallet()).expect("saved").len(), 2);
+        assert_eq!(progress, [2]);
+        assert_eq!(asked()[0].0, 0, "nothing saved: ask for everything");
+    }
+
+    #[test]
+    fn a_later_load_only_asks_above_the_reorg_depth() {
+        let db = Database::in_memory().expect("db");
+        script(vec![fake_activity("a", 10), fake_activity("b", 20)]);
+        let prices = Prices {
+            usd: 5.0,
+            fail: false,
+        };
+        fetch(&wallet(), &prices, &db, |_| {}).expect("first");
+
+        script(vec![
+            fake_activity("a", 10),
+            fake_activity("b", 20),
+            fake_activity("c", 30),
+        ]);
+        let loaded = fetch(&wallet(), &prices, &db, |_| {}).expect("second");
+
+        assert_eq!(asked()[0].0, 20 - REORG_DEPTH);
+        assert_eq!(ids(&loaded.txs), ["a", "b", "c"]);
+        assert_eq!(db.history(&wallet()).expect("saved").len(), 3);
+    }
+
+    #[test]
+    fn a_price_failure_leaves_the_saved_history_alone() {
+        let db = Database::in_memory().expect("db");
+        script(vec![fake_activity("a", 10)]);
+        fetch(
+            &wallet(),
+            &Prices {
+                usd: 5.0,
+                fail: false,
+            },
+            &db,
+            |_| {},
+        )
+        .expect("first");
+
+        script(vec![fake_activity("a", 10), fake_activity("z", 99)]);
+        let failing = Prices {
+            usd: 5.0,
+            fail: true,
+        };
+        assert!(fetch(&wallet(), &failing, &db, |_| {}).is_err());
+
+        let saved = db.history(&wallet()).expect("saved");
+        assert_eq!(ids(&saved), ["a"]);
+    }
+
+    #[test]
+    fn saved_keys_reach_the_backend_trimmed_and_blank_ones_do_not() {
+        let db = Database::in_memory().expect("db");
+        db.set_setting(SETTING_ETHERSCAN_KEY, "  abc \n")
+            .expect("set");
+        db.set_setting(SETTING_NODEREAL_KEY, "   ").expect("set");
+        script(Vec::new());
+
+        fetch(
+            &wallet(),
+            &Prices {
+                usd: 1.0,
+                fail: false,
+            },
+            &db,
+            |_| {},
+        )
+        .expect("fetch");
+
+        assert_eq!(asked(), [(0, Some("abc".to_owned()), None)]);
+    }
 }

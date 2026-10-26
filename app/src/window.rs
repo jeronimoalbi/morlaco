@@ -2,6 +2,7 @@
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
+use std::path::Path;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -36,6 +37,14 @@ enum Selection {
     Overview,
     /// One wallet, by index into the store.
     Wallet(usize),
+}
+
+/// What the user is told after the protection changed.
+struct Adopted {
+    message: &'static str,
+    warning: Option<String>,
+    /// A secret was made that the user has never seen.
+    new_secret: bool,
 }
 
 /// Mutable data behind the widgets.
@@ -84,6 +93,49 @@ impl State {
         }
         self.recompute();
         kept_saved_data
+    }
+
+    /// Loads the saved histories and last known prices.
+    fn restore_saved(&mut self) {
+        let wallets: Vec<WalletId> = self.store.wallets.iter().map(|w| w.id.clone()).collect();
+        for wallet in wallets {
+            match self.store.saved_history(&wallet) {
+                Ok(Some(history)) => {
+                    self.histories.insert(wallet, history);
+                }
+                Ok(None) => {}
+                Err(err) => glib::g_warning!("morlaco", "could not read saved data: {err}"),
+            }
+        }
+        for chain in Chain::ALL {
+            if let Some(price) = self.store.last_price(*chain) {
+                self.prices_now.insert(*chain, price);
+            }
+        }
+        self.recompute();
+    }
+
+    /// Keeps the keys that now open the database.
+    fn adopt_protection(&mut self, changed: encryption::Changed) -> Adopted {
+        let message = protection_message(changed.keys == self.keys, changed.keys.mode());
+        let new_secret = self.keys.secret().is_none() && changed.keys.secret().is_some();
+        self.keys = changed.keys;
+        Adopted {
+            message,
+            warning: changed.warning,
+            new_secret,
+        }
+    }
+
+    /// Removes the wallet at `index` and what was loaded for it. Returns the
+    /// selection to go to.
+    fn remove_wallet(&mut self, index: usize) -> morlaco_core::Result<Selection> {
+        let removed = self.store.wallets.get(index).map(|w| w.id.clone());
+        self.store.remove(index)?;
+        if let Some(id) = removed {
+            self.forget_wallets(&[id]);
+        }
+        Ok(selection_after_removal(self.selection, index))
     }
 
     /// Drops what was loaded for wallets that no longer exist.
@@ -367,25 +419,27 @@ fn open_main_window(shell: &Rc<Shell>, unlocked: unlock::Unlocked) {
         Ok(store) => {
             let ui = build_main_window(shell, store, unlocked.keys, true);
             ui.window.present();
-            if let Some(aside) = unlocked.set_aside {
-                ui.toast_until_dismissed(&format!(
-                    "Data from an earlier version can’t be read. It was kept as {} \
-                     and Morlaco starts empty. Add your wallets again.",
-                    aside.file_name().map_or_else(
-                        || aside.display().to_string(),
-                        |n| n.to_string_lossy().into_owned()
-                    )
-                ));
-            }
-            if let Some(notice) = unlocked.notice {
-                ui.toast(&notice);
-            }
-            if unlocked.created_new_secret {
-                ui.suggest_recovery_key();
-            }
+            ui.announce_start(
+                unlocked.set_aside.as_deref(),
+                unlocked.notice,
+                unlocked.created_new_secret,
+            );
         }
         Err(message) => unlock::show_error(shell, "Couldn’t Open Your Data", &message),
     }
+}
+
+/// The message shown when unreadable data from an earlier version was kept
+/// under another name.
+fn set_aside_message(aside: &Path) -> String {
+    let name = aside.file_name().map_or_else(
+        || aside.display().to_string(),
+        |n| n.to_string_lossy().into_owned(),
+    );
+    format!(
+        "Data from an earlier version can’t be read. It was kept as {name} \
+         and Morlaco starts empty. Add your wallets again."
+    )
 }
 
 /// Loads the saved wallets and settings from the open database.
@@ -401,6 +455,19 @@ fn open_store(db: Database) -> Result<Store, String> {
 }
 
 impl Ui {
+    /// Tells the user what happened while the app started.
+    fn announce_start(&self, set_aside: Option<&Path>, notice: Option<String>, new_secret: bool) {
+        if let Some(aside) = set_aside {
+            self.toast_until_dismissed(&set_aside_message(aside));
+        }
+        if let Some(notice) = notice {
+            self.toast(&notice);
+        }
+        if new_secret {
+            self.suggest_recovery_key();
+        }
+    }
+
     fn new(shell: &Rc<Shell>, store: Store, keys: Keys) -> Rc<Self> {
         let hidden = store.hidden;
 
@@ -922,7 +989,6 @@ impl Ui {
             self.toast("Wait for the refresh to finish first");
             return;
         }
-        let before = self.state.borrow().keys.clone();
         let result = {
             let state = self.state.borrow();
             encryption::change_protection(&PlatformKeyring, &state.keys, target, |key| {
@@ -932,20 +998,22 @@ impl Ui {
 
         match result {
             Ok(changed) => {
-                let message = protection_message(changed.keys == before, changed.keys.mode());
-                let new_secret = before.secret().is_none() && changed.keys.secret().is_some();
-                self.state.borrow_mut().keys = changed.keys;
-                self.toast(message);
-                if let Some(warning) = changed.warning {
-                    self.toast(&warning);
-                }
-                // A secret was just made, and it is the only thing that
-                // opens the data if the keyring is ever lost.
-                if new_secret {
-                    self.suggest_recovery_key();
-                }
+                let adopted = self.state.borrow_mut().adopt_protection(changed);
+                self.tell_adopted(adopted);
             }
             Err(message) => self.toast(&format!("Couldn’t change the encryption: {message}")),
+        }
+    }
+
+    fn tell_adopted(self: &Rc<Self>, adopted: Adopted) {
+        self.toast(adopted.message);
+        if let Some(warning) = adopted.warning {
+            self.toast(&warning);
+        }
+        // A secret was just made, and it is the only thing that opens the
+        // data if the keyring is ever lost.
+        if adopted.new_secret {
+            self.suggest_recovery_key();
         }
     }
 
@@ -1468,29 +1536,14 @@ impl Ui {
     }
 
     fn remove_wallet(self: &Rc<Self>, index: usize) {
-        let selection = {
-            let mut state = self.state.borrow_mut();
-            let removed = state.store.wallets.get(index).map(|w| w.id.clone());
-            if let Err(err) = state.store.remove(index) {
-                drop(state);
-                self.toast(&format!("Couldn’t remove the wallet: {err}"));
-                return;
+        let removed = self.state.borrow_mut().remove_wallet(index);
+        match removed {
+            Ok(selection) => {
+                self.rebuild_sidebar();
+                self.select(selection);
             }
-            if let Some(id) = removed {
-                state.histories.remove(&id);
-                state.errors.remove(&id);
-            }
-            // Wallets that were linked to the removed one now see its
-            // transfers as sales and purchases.
-            state.recompute();
-            match state.selection {
-                Selection::Wallet(s) if s == index => Selection::Overview,
-                Selection::Wallet(s) if s > index => Selection::Wallet(s - 1),
-                other => other,
-            }
-        };
-        self.rebuild_sidebar();
-        self.select(selection);
+            Err(err) => self.toast(&format!("Couldn’t remove the wallet: {err}")),
+        }
     }
 
     // --- Selection and loading ------------------------------------------
@@ -1626,23 +1679,7 @@ impl Ui {
     /// Fills the app from the database so it can be shown before any
     /// network request.
     fn restore_saved_data(&self) {
-        let mut state = self.state.borrow_mut();
-        let wallets: Vec<WalletId> = state.store.wallets.iter().map(|w| w.id.clone()).collect();
-        for wallet in wallets {
-            match state.store.saved_history(&wallet) {
-                Ok(Some(history)) => {
-                    state.histories.insert(wallet, history);
-                }
-                Ok(None) => {}
-                Err(err) => glib::g_warning!("morlaco", "could not read saved data: {err}"),
-            }
-        }
-        for chain in Chain::ALL {
-            if let Some(price) = state.store.last_price(*chain) {
-                state.prices_now.insert(*chain, price);
-            }
-        }
-        state.recompute();
+        self.state.borrow_mut().restore_saved();
     }
 
     /// Shows what is saved at once, then refreshes it from the network when
@@ -1677,23 +1714,21 @@ impl Ui {
     /// Picks the right page for the current selection and fills it.
     fn show_current(&self) {
         self.showing_loading.set(false);
-        let hidden = self.state.borrow().store.hidden;
         let state = self.state.borrow();
-        self.refresh_btn
-            .set_sensitive(!state.store.wallets.is_empty() && self.running.get() == 0);
+        let hidden = state.store.hidden;
+        self.refresh_btn.set_sensitive(refresh_possible(
+            state.store.wallets.len(),
+            self.running.get(),
+        ));
 
-        match state.selection {
-            Selection::Overview => self.show_overview(&state, hidden),
-            Selection::Wallet(i) => match state.store.wallets.get(i) {
-                Some(wallet) => match state.portfolios.get(&wallet.id) {
-                    Some(p) => {
-                        self.show_wallet(wallet, p, hidden);
-                        self.pages.set_visible_child_name("data");
-                    }
-                    None => self.show_error(state.errors.get(&wallet.id)),
-                },
-                None => self.pages.set_visible_child_name("empty"),
-            },
+        match view_of(&state) {
+            View::Empty => self.pages.set_visible_child_name("empty"),
+            View::Error(message) => self.show_error(message),
+            View::Wallet(wallet, p) => {
+                self.show_wallet(wallet, p, hidden);
+                self.pages.set_visible_child_name("data");
+            }
+            View::Overview(data) => self.show_overview(&state, &data, hidden),
         }
     }
 
@@ -1703,88 +1738,26 @@ impl Ui {
         self.pages.set_visible_child_name("error");
     }
 
-    fn show_overview(&self, state: &State, hidden: bool) {
-        // The wallets of the portfolio on screen, with their place in the
-        // store.
-        let wallets: Vec<(usize, &Wallet)> = state
-            .store
-            .visible_wallets()
-            .into_iter()
-            .map(|index| (index, &state.store.wallets[index]))
-            .collect();
-        if wallets.is_empty() {
-            self.pages.set_visible_child_name("empty");
-            return;
-        }
-
-        let loaded: Vec<(&Wallet, &Portfolio)> = wallets
-            .iter()
-            .filter_map(|(_, w)| state.portfolios.get(&w.id).map(|p| (*w, p)))
-            .collect();
-        let Some((_, first)) = loaded.first() else {
-            self.show_error(state.errors.values().next());
-            return;
-        };
-
-        let total = Summary::combine(loaded.iter().map(|(_, p)| &p.summary));
-        let count = match wallets.len() {
-            1 => "1 wallet".to_owned(),
-            n => format!("{n} wallets"),
-        };
-        // Balance and price only make sense when every wallet holds the same
-        // coin.
-        let chain = first.wallet.chain;
-        let coin = loaded
-            .iter()
-            .all(|(w, _)| w.id.chain == chain)
-            .then(|| CoinFigures {
-                chain,
-                balance_units: loaded.iter().map(|(_, p)| p.balance_units).sum(),
-                price_usd: first.price_now_usd,
-            });
+    fn show_overview(&self, state: &State, data: &OverviewData, hidden: bool) {
+        let figures = overview_figures(data);
         self.overview.update(
             &state.store.active_portfolio().name,
-            &count,
-            &total,
-            coin,
+            &figures.count,
+            &figures.total,
+            figures.coin,
             hidden,
         );
 
-        let failed = wallets.len() - loaded.len();
-        self.overview_warning.set_visible(failed > 0);
+        self.overview_warning.set_visible(figures.failed > 0);
         self.overview_warning.set_label(&format!(
-            "{failed} wallet(s) could not be loaded and are not included in the totals. \
-             Use Refresh to try again."
+            "{} wallet(s) could not be loaded and are not included in the totals. \
+             Use Refresh to try again.",
+            figures.failed
         ));
 
         clear(&self.overview_wallets);
-        for (index, wallet) in wallets.iter().copied() {
-            let row = adw::ActionRow::builder()
-                .title(wallet.display_name())
-                .use_markup(false)
-                .activatable(true)
-                .build();
-            match state.portfolios.get(&wallet.id) {
-                Some(p) => {
-                    row.set_subtitle(&format::amount(p.balance_units, wallet.id.chain, hidden));
-                    let gain = gtk::Label::builder().css_classes(["numeric"]).build();
-                    gain.set_label(&format::signed_usd(p.summary.unrealized_usd, hidden));
-                    tone(&gain, p.summary.unrealized_usd, hidden);
-                    row.add_suffix(&gain);
-                }
-                None => {
-                    row.set_subtitle(
-                        state
-                            .errors
-                            .get(&wallet.id)
-                            .map_or("Not loaded", String::as_str),
-                    );
-                    row.add_css_class("error");
-                }
-            }
-            let go = gtk::Image::from_icon_name("go-next-symbolic");
-            row.add_suffix(&go);
-
+        for (index, wallet) in data.wallets.iter().copied() {
+            let row = overview_row(state, wallet, hidden);
             let window = self.window.clone();
             row.connect_activated(move |_| open_wallet(&window, index));
             self.overview_wallets.append(&row);
@@ -2199,6 +2172,140 @@ fn main_menu() -> gio::Menu {
     menu
 }
 
+/// Whether Refresh is available: there is something to refresh and no load
+/// is running.
+fn refresh_possible(wallets: usize, running: u32) -> bool {
+    wallets > 0 && running == 0
+}
+
+/// What the main area shows for the current selection.
+enum View<'a> {
+    /// Nothing to show: no wallets.
+    Empty,
+    /// The wallet(s) could not be loaded; the reason, when known.
+    Error(Option<&'a String>),
+    Wallet(&'a Wallet, &'a Portfolio),
+    Overview(OverviewData<'a>),
+}
+
+/// The wallets behind the overview page.
+struct OverviewData<'a> {
+    /// The wallets of the portfolio on screen, with their place in the store.
+    wallets: Vec<(usize, &'a Wallet)>,
+    /// Those of them that are loaded.
+    loaded: Vec<(&'a Wallet, &'a Portfolio)>,
+}
+
+/// Decides what to show from the state alone.
+fn view_of(state: &State) -> View<'_> {
+    match state.selection {
+        Selection::Overview => overview_view(state),
+        Selection::Wallet(i) => wallet_view(state, i),
+    }
+}
+
+fn wallet_view(state: &State, index: usize) -> View<'_> {
+    let Some(wallet) = state.store.wallets.get(index) else {
+        return View::Empty;
+    };
+    match state.portfolios.get(&wallet.id) {
+        Some(p) => View::Wallet(wallet, p),
+        None => View::Error(state.errors.get(&wallet.id)),
+    }
+}
+
+fn overview_view(state: &State) -> View<'_> {
+    let wallets: Vec<(usize, &Wallet)> = state
+        .store
+        .visible_wallets()
+        .into_iter()
+        .map(|index| (index, &state.store.wallets[index]))
+        .collect();
+    if wallets.is_empty() {
+        return View::Empty;
+    }
+    let loaded: Vec<(&Wallet, &Portfolio)> = wallets
+        .iter()
+        .filter_map(|(_, w)| state.portfolios.get(&w.id).map(|p| (*w, p)))
+        .collect();
+    if loaded.is_empty() {
+        return View::Error(state.errors.values().next());
+    }
+    View::Overview(OverviewData { wallets, loaded })
+}
+
+/// The numbers at the top of the overview.
+struct OverviewFigures {
+    count: String,
+    total: Summary,
+    /// Balance and price, only when every wallet holds the same coin.
+    coin: Option<CoinFigures>,
+    /// Wallets that could not be loaded and are left out of the totals.
+    failed: usize,
+}
+
+fn overview_figures(data: &OverviewData) -> OverviewFigures {
+    let count = match data.wallets.len() {
+        1 => "1 wallet".to_owned(),
+        n => format!("{n} wallets"),
+    };
+    let coin = data.loaded.first().and_then(|(_, first)| {
+        let chain = first.wallet.chain;
+        data.loaded
+            .iter()
+            .all(|(w, _)| w.id.chain == chain)
+            .then(|| CoinFigures {
+                chain,
+                balance_units: data.loaded.iter().map(|(_, p)| p.balance_units).sum(),
+                price_usd: first.price_now_usd,
+            })
+    });
+    OverviewFigures {
+        count,
+        total: Summary::combine(data.loaded.iter().map(|(_, p)| &p.summary)),
+        coin,
+        failed: data.wallets.len() - data.loaded.len(),
+    }
+}
+
+/// One wallet of the overview list.
+fn overview_row(state: &State, wallet: &Wallet, hidden: bool) -> adw::ActionRow {
+    let row = adw::ActionRow::builder()
+        .title(wallet.display_name())
+        .use_markup(false)
+        .activatable(true)
+        .build();
+    match state.portfolios.get(&wallet.id) {
+        Some(p) => {
+            row.set_subtitle(&format::amount(p.balance_units, wallet.id.chain, hidden));
+            let gain = gtk::Label::builder().css_classes(["numeric"]).build();
+            gain.set_label(&format::signed_usd(p.summary.unrealized_usd, hidden));
+            tone(&gain, p.summary.unrealized_usd, hidden);
+            row.add_suffix(&gain);
+        }
+        None => {
+            row.set_subtitle(
+                state
+                    .errors
+                    .get(&wallet.id)
+                    .map_or("Not loaded", String::as_str),
+            );
+            row.add_css_class("error");
+        }
+    }
+    row.add_suffix(&gtk::Image::from_icon_name("go-next-symbolic"));
+    row
+}
+
+/// The selection once the wallet at `removed` is gone.
+fn selection_after_removal(selection: Selection, removed: usize) -> Selection {
+    match selection {
+        Selection::Wallet(s) if s == removed => Selection::Overview,
+        Selection::Wallet(s) if s > removed => Selection::Wallet(s - 1),
+        other => other,
+    }
+}
+
 /// Position in [`Chain::ALL`] to select for a pasted address, when the chosen
 /// network (`current`) cannot hold it.
 fn detected_position(address: &str, current: Option<Chain>) -> Option<u32> {
@@ -2415,4 +2522,323 @@ fn show_about(parent: &adw::ApplicationWindow) {
         .developer_name("Jerónimo Albi")
         .build();
     about.present(Some(parent));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use morlaco_core::chain::Activity;
+    use morlaco_core::portfolio::PricedTx;
+
+    fn state() -> State {
+        let db = Database::in_memory().expect("in-memory db opens");
+        State {
+            store: Store::open(db).expect("store opens"),
+            selection: Selection::Overview,
+            histories: HashMap::new(),
+            prices_now: HashMap::new(),
+            portfolios: HashMap::new(),
+            errors: HashMap::new(),
+            keys: Keys::PassphraseOnly {
+                passphrase: "pass".to_owned(),
+            },
+        }
+    }
+
+    fn wallet() -> WalletId {
+        WalletId::new(Chain::Bitcoin, "bc1qaaaaaaaaaaaaaaaa")
+    }
+
+    fn history() -> History {
+        History {
+            wallet: wallet(),
+            txs: vec![PricedTx {
+                activity: Activity {
+                    txid: "a".to_owned(),
+                    height: 5,
+                    index: None,
+                    time: 1_000,
+                    amount: 100_000_000,
+                    fee: 0,
+                    parents: Vec::new(),
+                },
+                price_usd: 10.0,
+            }],
+        }
+    }
+
+    fn fetched(result: Result<History, String>) -> Fetched {
+        Fetched {
+            prices_now: HashMap::from([(Chain::Bitcoin, 20.0)]),
+            wallets: vec![(wallet(), result)],
+        }
+    }
+
+    #[test]
+    fn a_load_replaces_the_history_clears_the_error_and_saves_the_price() {
+        let mut state = state();
+        state.store.add(&wallet(), "").expect("add");
+        state.errors.insert(wallet(), "old problem".to_owned());
+
+        let kept = state.merge(fetched(Ok(history())));
+
+        assert_eq!(kept, None);
+        assert!(state.histories.contains_key(&wallet()));
+        assert!(!state.errors.contains_key(&wallet()));
+        assert_eq!(state.prices_now[&Chain::Bitcoin], 20.0);
+        assert_eq!(state.store.last_price(Chain::Bitcoin), Some(20.0));
+        assert!(state.portfolios.contains_key(&wallet()));
+    }
+
+    #[test]
+    fn a_failed_refresh_keeps_the_data_we_have() {
+        let mut state = state();
+        state.store.add(&wallet(), "").expect("add");
+        state.merge(fetched(Ok(history())));
+
+        let kept = state.merge(fetched(Err("offline".to_owned())));
+
+        assert_eq!(kept.as_deref(), Some("offline"));
+        assert!(state.histories.contains_key(&wallet()));
+        assert!(state.errors.is_empty());
+    }
+
+    #[test]
+    fn a_failed_first_load_records_the_error() {
+        let mut state = state();
+        state.store.add(&wallet(), "").expect("add");
+
+        let kept = state.merge(fetched(Err("offline".to_owned())));
+
+        assert_eq!(kept, None);
+        assert!(!state.histories.contains_key(&wallet()));
+        assert_eq!(state.errors[&wallet()], "offline");
+    }
+
+    #[test]
+    fn saved_histories_and_prices_are_restored() {
+        let mut state = state();
+        state.store.add(&wallet(), "").expect("add");
+        state
+            .store
+            .set_last_price(Chain::Bitcoin, 30.0)
+            .expect("set");
+        let saved = history();
+        state
+            .store
+            .database()
+            .replace_history_above(&wallet(), 0, &saved.txs)
+            .expect("save");
+
+        state.restore_saved();
+
+        assert_eq!(state.histories[&wallet()].txs.len(), saved.txs.len());
+        assert_eq!(
+            state.histories[&wallet()].txs[0].activity,
+            saved.txs[0].activity
+        );
+        assert_eq!(state.prices_now[&Chain::Bitcoin], 30.0);
+        assert!(state.portfolios.contains_key(&wallet()));
+    }
+
+    #[test]
+    fn forgetting_a_wallet_drops_its_data() {
+        let mut state = state();
+        state.store.add(&wallet(), "").expect("add");
+        state.merge(fetched(Ok(history())));
+
+        state.forget_wallets(&[wallet()]);
+
+        assert!(state.histories.is_empty());
+    }
+
+    fn eth_wallet() -> WalletId {
+        WalletId::new(
+            Chain::Ethereum,
+            "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        )
+    }
+
+    #[test]
+    fn refresh_needs_wallets_and_no_load_running() {
+        assert!(refresh_possible(1, 0));
+        assert!(!refresh_possible(0, 0));
+        assert!(!refresh_possible(1, 1));
+    }
+
+    #[test]
+    fn no_wallets_shows_the_empty_page() {
+        let state = state();
+        assert!(matches!(view_of(&state), View::Empty));
+    }
+
+    #[test]
+    fn the_overview_counts_loaded_and_failed_wallets() {
+        let mut state = state();
+        state.store.add(&wallet(), "").expect("add");
+        state.store.add(&eth_wallet(), "").expect("add");
+        state.merge(fetched(Ok(history())));
+
+        let View::Overview(data) = view_of(&state) else {
+            panic!("expected the overview");
+        };
+        let figures = overview_figures(&data);
+        assert_eq!(figures.count, "2 wallets");
+        assert_eq!(figures.failed, 1);
+        // One wallet is loaded, so its coin is the only one.
+        let coin = figures.coin.expect("one coin");
+        assert_eq!(coin.chain, Chain::Bitcoin);
+        assert_eq!(coin.balance_units, 100_000_000);
+        assert_eq!(coin.price_usd, 20.0);
+    }
+
+    #[test]
+    fn wallets_of_different_coins_have_no_shared_balance() {
+        let mut state = state();
+        state.store.add(&wallet(), "").expect("add");
+        state.store.add(&eth_wallet(), "").expect("add");
+        let mut other = history();
+        other.wallet = eth_wallet();
+        state.merge(Fetched {
+            prices_now: HashMap::from([(Chain::Bitcoin, 20.0), (Chain::Ethereum, 2.0)]),
+            wallets: vec![(wallet(), Ok(history())), (eth_wallet(), Ok(other))],
+        });
+
+        let View::Overview(data) = view_of(&state) else {
+            panic!("expected the overview");
+        };
+        let figures = overview_figures(&data);
+        assert!(figures.coin.is_none());
+        assert_eq!(figures.failed, 0);
+    }
+
+    #[test]
+    fn an_overview_with_nothing_loaded_shows_the_first_error() {
+        let mut state = state();
+        state.store.add(&wallet(), "").expect("add");
+        state.merge(fetched(Err("offline".to_owned())));
+
+        let View::Error(message) = view_of(&state) else {
+            panic!("expected an error");
+        };
+        assert_eq!(message.map(String::as_str), Some("offline"));
+    }
+
+    #[test]
+    fn a_selected_wallet_shows_itself_or_its_error() {
+        let mut state = state();
+        state.store.add(&wallet(), "").expect("add");
+        state.selection = Selection::Wallet(0);
+        state.merge(fetched(Err("offline".to_owned())));
+        assert!(matches!(view_of(&state), View::Error(Some(_))));
+
+        state.merge(fetched(Ok(history())));
+        assert!(matches!(view_of(&state), View::Wallet(..)));
+
+        state.selection = Selection::Wallet(5);
+        assert!(matches!(view_of(&state), View::Empty));
+    }
+
+    #[test]
+    fn removing_a_wallet_moves_the_selection() {
+        assert_eq!(
+            selection_after_removal(Selection::Wallet(1), 1),
+            Selection::Overview
+        );
+        assert_eq!(
+            selection_after_removal(Selection::Wallet(2), 1),
+            Selection::Wallet(1)
+        );
+        assert_eq!(
+            selection_after_removal(Selection::Wallet(0), 1),
+            Selection::Wallet(0)
+        );
+        assert_eq!(
+            selection_after_removal(Selection::Overview, 1),
+            Selection::Overview
+        );
+    }
+
+    #[test]
+    fn removing_a_wallet_forgets_its_data() {
+        let mut state = state();
+        state.store.add(&wallet(), "").expect("add");
+        state.merge(fetched(Ok(history())));
+        state.selection = Selection::Wallet(0);
+
+        let selection = state.remove_wallet(0).expect("removed");
+
+        assert_eq!(selection, Selection::Overview);
+        assert!(state.store.wallets.is_empty());
+        assert!(state.histories.is_empty());
+    }
+
+    #[test]
+    fn adopting_new_keys_says_what_changed() {
+        let mut state = state();
+        let changed = encryption::Changed {
+            keys: Keys::Keyring {
+                secret: "secret".to_owned(),
+            },
+            warning: Some("old entry stayed".to_owned()),
+        };
+
+        let adopted = state.adopt_protection(changed);
+
+        assert_eq!(adopted.message, "Your key is now kept in the keyring");
+        assert_eq!(adopted.warning.as_deref(), Some("old entry stayed"));
+        assert!(adopted.new_secret);
+        assert_eq!(state.keys.mode(), Mode::Keyring);
+    }
+
+    #[test]
+    fn adopting_the_same_keys_changes_nothing() {
+        let mut state = state();
+        let same = encryption::Changed {
+            keys: state.keys.clone(),
+            warning: None,
+        };
+        let adopted = state.adopt_protection(same);
+        assert_eq!(adopted.message, "Nothing changed");
+        assert!(!adopted.new_secret);
+    }
+
+    #[test]
+    fn the_network_follows_a_pasted_address() {
+        let eth = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let btc = "bc1qaaaaaaaaaaaaaaaa";
+        // Bitcoin chosen, an 0x address pasted: switch to Ethereum.
+        let position = detected_position(eth, Some(Chain::Bitcoin)).expect("switches");
+        assert_eq!(Chain::ALL[position as usize], Chain::Ethereum);
+        // Bnb fits the same address, so the choice stays.
+        assert_eq!(detected_position(eth, Some(Chain::Bnb)), None);
+        assert_eq!(detected_position("nonsense", Some(Chain::Bitcoin)), None);
+        assert_eq!(detected_position(btc, Some(Chain::Bitcoin)), None);
+    }
+
+    #[test]
+    fn the_network_row_explains_ambiguity() {
+        let several = [Chain::Ethereum, Chain::Bnb];
+        assert_eq!(network_subtitle(&several, Chain::Bitcoin), "");
+        assert!(network_subtitle(&several, Chain::Bnb).contains("several networks"));
+        assert_eq!(
+            network_subtitle(&[Chain::Bitcoin], Chain::Bitcoin),
+            "Detected from the address"
+        );
+    }
+
+    #[test]
+    fn the_encryption_dialog_hints_follow_the_choice() {
+        assert!(protection_hint(false, Mode::Keyring).contains("only protection"));
+        assert!(
+            protection_hint(true, Mode::KeyringAndPassphrase).contains("remove the passphrase")
+        );
+        assert!(protection_hint(true, Mode::Keyring).contains("Add a passphrase"));
+    }
+
+    #[test]
+    fn the_set_aside_message_names_the_file() {
+        let message = set_aside_message(Path::new("/data/morlaco.db.old"));
+        assert!(message.contains("morlaco.db.old"));
+    }
 }
