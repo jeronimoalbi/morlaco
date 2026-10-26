@@ -57,6 +57,46 @@ struct State {
 }
 
 impl State {
+    /// Keeps what a load brought back. Returns the first failure message of a
+    /// wallet whose saved data stays on screen instead.
+    fn merge(&mut self, fetched: Fetched) -> Option<String> {
+        let mut kept_saved_data = None;
+        for (chain, price) in fetched.prices_now {
+            self.prices_now.insert(chain, price);
+            if let Err(err) = self.store.set_last_price(chain, price) {
+                glib::g_warning!("morlaco", "could not save the price: {err}");
+            }
+        }
+        for (wallet, result) in fetched.wallets {
+            match result {
+                Ok(history) => {
+                    self.errors.remove(&wallet);
+                    self.histories.insert(wallet, history);
+                }
+                // A failed refresh must not throw away data we have.
+                Err(message) if self.histories.contains_key(&wallet) => {
+                    kept_saved_data.get_or_insert(message);
+                }
+                Err(message) => {
+                    self.errors.insert(wallet, message);
+                }
+            }
+        }
+        self.recompute();
+        kept_saved_data
+    }
+
+    /// Drops what was loaded for wallets that no longer exist.
+    fn forget_wallets(&mut self, removed: &[WalletId]) {
+        for wallet in removed {
+            self.histories.remove(wallet);
+            self.errors.remove(wallet);
+        }
+        // Wallets elsewhere that were linked to these now see the transfers
+        // as sales and purchases.
+        self.recompute();
+    }
+
     /// Wallets in the current view that are not loaded yet.
     fn missing_wallets(&self) -> Vec<WalletId> {
         let wanted: Vec<&Wallet> = match self.selection {
@@ -364,112 +404,15 @@ impl Ui {
     fn new(shell: &Rc<Shell>, store: Store, keys: Keys) -> Rc<Self> {
         let hidden = store.hidden;
 
-        // Sidebar
-        let wallet_list = gtk::ListBox::builder()
-            .css_classes(["navigation-sidebar"])
-            .build();
-        let add_btn = gtk::Button::builder()
-            .icon_name("list-add-symbolic")
-            .tooltip_text("Add Wallet (Ctrl+N)")
-            .action_name("win.add-wallet")
-            .build();
-        let portfolio_btn = gtk::MenuButton::builder()
-            .always_show_arrow(true)
-            .css_classes(["flat"])
-            .tooltip_text("Portfolios")
-            .build();
-        let sidebar_header = adw::HeaderBar::new();
-        sidebar_header.pack_start(&add_btn);
-        sidebar_header.set_title_widget(Some(&portfolio_btn));
-        let sidebar_toolbar = adw::ToolbarView::new();
-        sidebar_toolbar.add_top_bar(&sidebar_header);
-        sidebar_toolbar.set_content(Some(
-            &gtk::ScrolledWindow::builder().child(&wallet_list).build(),
-        ));
+        let (sidebar_toolbar, wallet_list, portfolio_btn) = sidebar();
 
-        // Overview page
-        let overview = SummaryView::new();
-        let overview_wallets = boxed_list();
-        let overview_group = adw::PreferencesGroup::builder().title("Wallets").build();
-        overview_group.add(&overview_wallets);
-        let overview_warning = gtk::Label::builder()
-            .css_classes(["warning"])
-            .wrap(true)
-            .xalign(0.0)
-            .visible(false)
-            .build();
-        let overview_note = note(
-            "Coins moved between your wallets keep their original cost basis, even between \
-             portfolios. Coins moved to or from any other wallet count as a sale or a purchase.",
-        );
-        let overview_box = page_box();
-        overview_box.append(&overview.root);
-        overview_box.append(&overview_warning);
-        overview_box.append(&overview_group);
-        overview_box.append(&overview_note);
+        let (overview, overview_wallets, overview_warning, overview_box) = overview_page();
 
-        // Wallet pages
-        let holdings = SummaryView::new();
-        let lots = PagedList::new("lots");
-        let lots_group = adw::PreferencesGroup::builder()
-            .title("Lots")
-            .description("Coins still held, oldest first")
-            .build();
-        lots_group.add(&lots.list);
-        lots_group.add(&lots.footer);
-        let holdings_box = page_box();
-        holdings_box.append(&holdings.root);
-        holdings_box.append(&lots_group);
-        holdings_box.append(&note(
-            "Cost basis is the market price of the coin on the day it arrived at \
-             this address. It is an estimate, not what you paid.",
-        ));
-
-        let history = PagedList::new("transactions");
-        let history_box = page_box();
-        history_box.append(&history.list);
-        history_box.append(&history.footer);
-
-        let view_stack = adw::ViewStack::new();
-        view_stack.add_titled_with_icon(
-            &scrolled_clamp(&holdings_box),
-            Some("holdings"),
-            "Holdings",
-            "view-list-symbolic",
-        );
-        view_stack.add_titled_with_icon(
-            &scrolled_clamp(&history_box),
-            Some("transactions"),
-            "Transactions",
-            "view-sort-descending-symbolic",
-        );
+        let (holdings, lots, history, view_stack) = wallet_pages();
 
         // Page states: empty, loading, error, overview, data
-        let empty_page = adw::StatusPage::builder()
-            .icon_name(crate::SYMBOLIC_ICON)
-            .title("No Wallets Yet")
-            .description("Add a wallet address to see its holdings and estimated gains.")
-            .child(
-                &gtk::Button::builder()
-                    .label("Add Wallet")
-                    .halign(gtk::Align::Center)
-                    .css_classes(["suggested-action", "pill"])
-                    .action_name("win.add-wallet")
-                    .build(),
-            )
-            .build();
-        let loading_label = gtk::Label::builder()
-            .label("Fetching transactions…")
-            .css_classes(["dim-label"])
-            .build();
-        let loading_box = gtk::Box::builder()
-            .orientation(gtk::Orientation::Vertical)
-            .spacing(12)
-            .valign(gtk::Align::Center)
-            .halign(gtk::Align::Center)
-            .build();
-        loading_box.append(&gtk::Spinner::builder().spinning(true).build());
-        loading_box.append(&loading_label);
+        let empty_page = empty_page();
+        let (loading_box, loading_label) = loading_box();
         let error_page = adw::StatusPage::builder()
             .icon_name("dialog-error-symbolic")
             .title("Couldn’t Load Wallet")
@@ -506,22 +449,7 @@ impl Ui {
         let hide_btn = gtk::ToggleButton::builder().active(hidden).build();
         sync_hide_button(&hide_btn);
 
-        let menu = gio::Menu::new();
-        let data = gio::Menu::new();
-        data.append(Some("_Encryption…"), Some("win.encryption"));
-        data.append(Some("_Recovery Key…"), Some("win.recovery-key"));
-        data.append(Some("_Data Providers…"), Some("win.data-providers"));
-        data.append(Some("_Clear Local Data…"), Some("win.clear-data"));
-        menu.append_section(None, &data);
-        let app_menu = gio::Menu::new();
-        app_menu.append(Some("_About Morlaco"), Some("app.about"));
-        app_menu.append(Some("_Quit"), Some("app.quit"));
-        menu.append_section(None, &app_menu);
-        let menu_btn = gtk::MenuButton::builder()
-            .icon_name("open-menu-symbolic")
-            .menu_model(&menu)
-            .tooltip_text("Main Menu")
-            .build();
+        let menu_btn = main_menu_button();
 
         let content_header = adw::HeaderBar::builder().title_widget(&title_stack).build();
         content_header.pack_start(&sidebar_btn);
@@ -554,17 +482,7 @@ impl Ui {
         let window = shell.window.clone();
         shell.show_app(&toasts);
 
-        // Narrow layout: the sidebar becomes an overlay and the tabs move to
-        // the bottom bar.
-        let narrow = adw::Breakpoint::new(adw::BreakpointCondition::new_length(
-            adw::BreakpointConditionLengthType::MaxWidth,
-            600.0,
-            adw::LengthUnit::Sp,
-        ));
-        narrow.add_setter(&split, "collapsed", Some(&true.to_value()));
-        narrow.add_setter(&switcher_bar, "reveal", Some(&true.to_value()));
-        narrow.add_setter(&switcher, "visible", Some(&false.to_value()));
-        window.add_breakpoint(narrow);
+        add_narrow_layout(&window, &split, &switcher_bar, &switcher);
 
         Rc::new(Self {
             window,
@@ -856,42 +774,22 @@ impl Ui {
         // Pasting an address picks its network, unless the one already chosen
         // fits it too (several chains may share an address format).
         let on_address = validate.clone();
-        let detect_network = {
-            let network = network.clone();
-            move |entry: &adw::EntryRow| {
-                let candidates = Chain::detect(entry.text().as_str());
-                let current = Chain::ALL.get(network.selected() as usize).copied();
-                let detected = match (candidates.first(), current) {
-                    (Some(first), Some(now)) if !candidates.contains(&now) => Some(*first),
-                    _ => None,
-                };
-                if let Some(chain) = detected
-                    && let Some(position) = Chain::ALL.iter().position(|c| *c == chain)
-                {
-                    network.set_selected(u32::try_from(position).unwrap_or(0));
-                }
-            }
-        };
+        let network_for_detect = network.clone();
         // Say the network was detected only while the one chosen fits, and ask
         // for a choice when the address fits several.
         let sync_subtitle = {
             let (network, address, chosen_chain) =
                 (network.clone(), address.clone(), chosen_chain.clone());
             Rc::new(move || {
-                let candidates = Chain::detect(address.text().as_str());
-                network.set_subtitle(if !candidates.contains(&chosen_chain()) {
-                    ""
-                } else if candidates.len() > 1 {
-                    // The address looks the same on these networks.
-                    "This address format is used on several networks. Choose yours."
-                } else {
-                    "Detected from the address"
-                });
+                network.set_subtitle(network_subtitle(
+                    &Chain::detect(address.text().as_str()),
+                    chosen_chain(),
+                ));
             })
         };
         let on_address_subtitle = sync_subtitle.clone();
         address.connect_changed(move |entry| {
-            detect_network(entry);
+            select_detected_network(&network_for_detect, entry.text().as_str());
             on_address_subtitle();
             on_address();
         });
@@ -984,19 +882,7 @@ impl Ui {
                 dialog.set_response_enabled("save", checked.is_ok());
 
                 let untouched = new.text().is_empty() && confirm.text().is_empty();
-                let general = match (keeping, mode) {
-                    (false, _) => format!(
-                        "Without the keyring, your passphrase is the only protection. Use at \
-                         least {MIN_PASSPHRASE_ONLY_CHARS} characters. If you forget it, your \
-                         data can’t be recovered."
-                    ),
-                    (true, Mode::KeyringAndPassphrase) => {
-                        "Leave both fields empty to remove the passphrase.".to_owned()
-                    }
-                    (true, _) => {
-                        "Add a passphrase to also require one every time Morlaco starts.".to_owned()
-                    }
-                };
+                let general = protection_hint(keeping, mode);
                 let message = match checked {
                     Err(problem) if !untouched => problem.to_string(),
                     _ => general,
@@ -1046,17 +932,7 @@ impl Ui {
 
         match result {
             Ok(changed) => {
-                let message = if changed.keys == before {
-                    "Nothing changed"
-                } else {
-                    match changed.keys.mode() {
-                        Mode::Keyring => "Your key is now kept in the keyring",
-                        Mode::KeyringAndPassphrase => {
-                            "Your data now needs the keyring and a passphrase"
-                        }
-                        Mode::PassphraseOnly => "Your data now needs a passphrase only",
-                    }
-                };
+                let message = protection_message(changed.keys == before, changed.keys.mode());
                 let new_secret = before.secret().is_none() && changed.keys.secret().is_some();
                 self.state.borrow_mut().keys = changed.keys;
                 self.toast(message);
@@ -1531,19 +1407,32 @@ impl Ui {
         dialog.present(Some(&self.window));
     }
 
+    /// Makes the portfolio holding the wallet at `index` the active one.
+    fn show_portfolio_of_wallet(self: &Rc<Self>, index: usize) {
+        let target = {
+            let state = self.state.borrow();
+            state
+                .store
+                .wallets
+                .get(index)
+                .map(|w| w.portfolio)
+                .filter(|portfolio| *portfolio != state.store.active_portfolio().id)
+        };
+        let Some(portfolio) = target else {
+            return;
+        };
+        if let Err(err) = self.state.borrow_mut().store.set_active(portfolio) {
+            self.toast(&format!("Couldn’t save the setting: {err}"));
+        }
+        self.sync_portfolio_ui();
+        self.rebuild_sidebar();
+    }
+
     fn delete_portfolio(self: &Rc<Self>, id: i64) {
         {
             let mut state = self.state.borrow_mut();
             match state.store.remove_portfolio(id) {
-                Ok(removed) => {
-                    for wallet in &removed {
-                        state.histories.remove(wallet);
-                        state.errors.remove(wallet);
-                    }
-                    // Wallets elsewhere that were linked to these now see the
-                    // transfers as sales and purchases.
-                    state.recompute();
-                }
+                Ok(removed) => state.forget_wallets(&removed),
                 Err(err) => {
                     drop(state);
                     self.toast(&format!("Couldn’t delete the portfolio: {err}"));
@@ -1609,22 +1498,7 @@ impl Ui {
     fn select(self: &Rc<Self>, selection: Selection) {
         // A wallet in another portfolio brings that portfolio on screen.
         if let Selection::Wallet(i) = selection {
-            let target = {
-                let state = self.state.borrow();
-                state
-                    .store
-                    .wallets
-                    .get(i)
-                    .map(|w| w.portfolio)
-                    .filter(|portfolio| *portfolio != state.store.active_portfolio().id)
-            };
-            if let Some(portfolio) = target {
-                if let Err(err) = self.state.borrow_mut().store.set_active(portfolio) {
-                    self.toast(&format!("Couldn’t save the setting: {err}"));
-                }
-                self.sync_portfolio_ui();
-                self.rebuild_sidebar();
-            }
+            self.show_portfolio_of_wallet(i);
         }
         self.state.borrow_mut().selection = selection;
         self.lots.reset();
@@ -1732,32 +1606,7 @@ impl Ui {
 
         // Results are always kept: they are keyed by wallet, so a load that
         // was overtaken by a newer one is still correct.
-        let mut kept_saved_data = None;
-        {
-            let mut state = self.state.borrow_mut();
-            for (chain, price) in fetched.prices_now {
-                state.prices_now.insert(chain, price);
-                if let Err(err) = state.store.set_last_price(chain, price) {
-                    glib::g_warning!("morlaco", "could not save the price: {err}");
-                }
-            }
-            for (wallet, result) in fetched.wallets {
-                match result {
-                    Ok(history) => {
-                        state.errors.remove(&wallet);
-                        state.histories.insert(wallet, history);
-                    }
-                    // A failed refresh must not throw away data we have.
-                    Err(message) if state.histories.contains_key(&wallet) => {
-                        kept_saved_data.get_or_insert(message);
-                    }
-                    Err(message) => {
-                        state.errors.insert(wallet, message);
-                    }
-                }
-            }
-            state.recompute();
-        }
+        let kept_saved_data = self.state.borrow_mut().merge(fetched);
 
         if self.running.get() == 0 {
             self.refresh_spinner.set_spinning(false);
@@ -1937,16 +1786,7 @@ impl Ui {
             row.add_suffix(&go);
 
             let window = self.window.clone();
-            row.connect_activated(move |_| {
-                // Reuse the sidebar's selection path so every view stays in sync.
-                if let Err(err) = gtk::prelude::WidgetExt::activate_action(
-                    &window,
-                    "win.show-wallet",
-                    Some(&(index as u32).to_variant()),
-                ) {
-                    glib::g_warning!("morlaco", "could not open wallet: {err}");
-                }
-            });
+            row.connect_activated(move |_| open_wallet(&window, index));
             self.overview_wallets.append(&row);
         }
         self.pages.set_visible_child_name("overview");
@@ -2187,6 +2027,248 @@ fn history_row(entry: &Entry, chain: Chain, hidden: bool) -> adw::ActionRow {
         let _ = gio::AppInfo::launch_default_for_uri(&uri, None::<&gio::AppLaunchContext>);
     });
     row
+}
+
+/// The sidebar: portfolio switcher, add button and the wallet list.
+fn sidebar() -> (adw::ToolbarView, gtk::ListBox, gtk::MenuButton) {
+    let wallet_list = gtk::ListBox::builder()
+        .css_classes(["navigation-sidebar"])
+        .build();
+    let add_btn = gtk::Button::builder()
+        .icon_name("list-add-symbolic")
+        .tooltip_text("Add Wallet (Ctrl+N)")
+        .action_name("win.add-wallet")
+        .build();
+    let portfolio_btn = gtk::MenuButton::builder()
+        .always_show_arrow(true)
+        .css_classes(["flat"])
+        .tooltip_text("Portfolios")
+        .build();
+    let sidebar_header = adw::HeaderBar::new();
+    sidebar_header.pack_start(&add_btn);
+    sidebar_header.set_title_widget(Some(&portfolio_btn));
+    let sidebar_toolbar = adw::ToolbarView::new();
+    sidebar_toolbar.add_top_bar(&sidebar_header);
+    sidebar_toolbar.set_content(Some(
+        &gtk::ScrolledWindow::builder().child(&wallet_list).build(),
+    ));
+
+    (sidebar_toolbar, wallet_list, portfolio_btn)
+}
+
+/// The overview page: totals, a warning line, the wallet list and a note.
+fn overview_page() -> (SummaryView, gtk::ListBox, gtk::Label, gtk::Box) {
+    let overview = SummaryView::new();
+    let overview_wallets = boxed_list();
+    let overview_group = adw::PreferencesGroup::builder().title("Wallets").build();
+    overview_group.add(&overview_wallets);
+    let overview_warning = gtk::Label::builder()
+        .css_classes(["warning"])
+        .wrap(true)
+        .xalign(0.0)
+        .visible(false)
+        .build();
+    let overview_note = note(
+        "Coins moved between your wallets keep their original cost basis, even between \
+         portfolios. Coins moved to or from any other wallet count as a sale or a purchase.",
+    );
+    let overview_box = page_box();
+    overview_box.append(&overview.root);
+    overview_box.append(&overview_warning);
+    overview_box.append(&overview_group);
+    overview_box.append(&overview_note);
+
+    (overview, overview_wallets, overview_warning, overview_box)
+}
+
+/// The two tabs of a wallet: holdings with lots, and transactions.
+fn wallet_pages() -> (SummaryView, PagedList, PagedList, adw::ViewStack) {
+    let holdings = SummaryView::new();
+    let lots = PagedList::new("lots");
+    let lots_group = adw::PreferencesGroup::builder()
+        .title("Lots")
+        .description("Coins still held, oldest first")
+        .build();
+    lots_group.add(&lots.list);
+    lots_group.add(&lots.footer);
+    let holdings_box = page_box();
+    holdings_box.append(&holdings.root);
+    holdings_box.append(&lots_group);
+    holdings_box.append(&note(
+        "Cost basis is the market price of the coin on the day it arrived at \
+         this address. It is an estimate, not what you paid.",
+    ));
+
+    let history = PagedList::new("transactions");
+    let history_box = page_box();
+    history_box.append(&history.list);
+    history_box.append(&history.footer);
+
+    let view_stack = adw::ViewStack::new();
+    view_stack.add_titled_with_icon(
+        &scrolled_clamp(&holdings_box),
+        Some("holdings"),
+        "Holdings",
+        "view-list-symbolic",
+    );
+    view_stack.add_titled_with_icon(
+        &scrolled_clamp(&history_box),
+        Some("transactions"),
+        "Transactions",
+        "view-sort-descending-symbolic",
+    );
+
+    (holdings, lots, history, view_stack)
+}
+
+/// Shown when no wallet is tracked.
+fn empty_page() -> adw::StatusPage {
+    adw::StatusPage::builder()
+        .icon_name(crate::SYMBOLIC_ICON)
+        .title("No Wallets Yet")
+        .description("Add a wallet address to see its holdings and estimated gains.")
+        .child(
+            &gtk::Button::builder()
+                .label("Add Wallet")
+                .halign(gtk::Align::Center)
+                .css_classes(["suggested-action", "pill"])
+                .action_name("win.add-wallet")
+                .build(),
+        )
+        .build()
+}
+
+/// The spinner with its caption, and the caption to update.
+fn loading_box() -> (gtk::Box, gtk::Label) {
+    let loading_label = gtk::Label::builder()
+        .label("Fetching transactions…")
+        .css_classes(["dim-label"])
+        .build();
+    let loading_box = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .spacing(12)
+        .valign(gtk::Align::Center)
+        .halign(gtk::Align::Center)
+        .build();
+    loading_box.append(&gtk::Spinner::builder().spinning(true).build());
+    loading_box.append(&loading_label);
+    (loading_box, loading_label)
+}
+
+/// Narrow layout: the sidebar becomes an overlay and the tabs move to the
+/// bottom bar.
+fn add_narrow_layout(
+    window: &adw::ApplicationWindow,
+    split: &adw::OverlaySplitView,
+    switcher_bar: &adw::ViewSwitcherBar,
+    switcher: &adw::ViewSwitcher,
+) {
+    let narrow = adw::Breakpoint::new(adw::BreakpointCondition::new_length(
+        adw::BreakpointConditionLengthType::MaxWidth,
+        600.0,
+        adw::LengthUnit::Sp,
+    ));
+    narrow.add_setter(split, "collapsed", Some(&true.to_value()));
+    narrow.add_setter(switcher_bar, "reveal", Some(&true.to_value()));
+    narrow.add_setter(switcher, "visible", Some(&false.to_value()));
+    window.add_breakpoint(narrow);
+}
+
+/// The button that opens the main menu.
+fn main_menu_button() -> gtk::MenuButton {
+    gtk::MenuButton::builder()
+        .icon_name("open-menu-symbolic")
+        .menu_model(&main_menu())
+        .tooltip_text("Main Menu")
+        .build()
+}
+
+/// The main menu.
+fn main_menu() -> gio::Menu {
+    let menu = gio::Menu::new();
+    let data = gio::Menu::new();
+    data.append(Some("_Encryption…"), Some("win.encryption"));
+    data.append(Some("_Recovery Key…"), Some("win.recovery-key"));
+    data.append(Some("_Data Providers…"), Some("win.data-providers"));
+    data.append(Some("_Clear Local Data…"), Some("win.clear-data"));
+    menu.append_section(None, &data);
+    let app_menu = gio::Menu::new();
+    app_menu.append(Some("_About Morlaco"), Some("app.about"));
+    app_menu.append(Some("_Quit"), Some("app.quit"));
+    menu.append_section(None, &app_menu);
+    menu
+}
+
+/// Position in [`Chain::ALL`] to select for a pasted address, when the chosen
+/// network (`current`) cannot hold it.
+fn detected_position(address: &str, current: Option<Chain>) -> Option<u32> {
+    let candidates = Chain::detect(address);
+    let first = *candidates.first()?;
+    if current.is_some_and(|now| candidates.contains(&now)) {
+        return None;
+    }
+    let position = Chain::ALL.iter().position(|c| *c == first)?;
+    u32::try_from(position).ok()
+}
+
+/// Selects the network that fits a pasted address, unless the chosen one does.
+fn select_detected_network(network: &adw::ComboRow, address: &str) {
+    let current = Chain::ALL.get(network.selected() as usize).copied();
+    if let Some(position) = detected_position(address, current) {
+        network.set_selected(position);
+    }
+}
+
+/// What the network row says about the chosen network and the address.
+fn network_subtitle(candidates: &[Chain], chosen: Chain) -> &'static str {
+    if !candidates.contains(&chosen) {
+        ""
+    } else if candidates.len() > 1 {
+        // The address looks the same on these networks.
+        "This address format is used on several networks. Choose yours."
+    } else {
+        "Detected from the address"
+    }
+}
+
+/// What the encryption dialog says about the current choice.
+fn protection_hint(keeping_keyring: bool, mode: Mode) -> String {
+    match (keeping_keyring, mode) {
+        (false, _) => format!(
+            "Without the keyring, your passphrase is the only protection. Use at \
+             least {MIN_PASSPHRASE_ONLY_CHARS} characters. If you forget it, your \
+             data can’t be recovered."
+        ),
+        (true, Mode::KeyringAndPassphrase) => {
+            "Leave both fields empty to remove the passphrase.".to_owned()
+        }
+        (true, _) => "Add a passphrase to also require one every time Morlaco starts.".to_owned(),
+    }
+}
+
+/// The toast shown after the protection changed (or did not).
+fn protection_message(unchanged: bool, mode: Mode) -> &'static str {
+    if unchanged {
+        return "Nothing changed";
+    }
+    match mode {
+        Mode::Keyring => "Your key is now kept in the keyring",
+        Mode::KeyringAndPassphrase => "Your data now needs the keyring and a passphrase",
+        Mode::PassphraseOnly => "Your data now needs a passphrase only",
+    }
+}
+
+/// Opens the wallet at `index` through the sidebar's selection path, so every
+/// view stays in sync.
+fn open_wallet(window: &adw::ApplicationWindow, index: usize) {
+    let target = u32::try_from(index).unwrap_or(0);
+    if let Err(err) = gtk::prelude::WidgetExt::activate_action(
+        window,
+        "win.show-wallet",
+        Some(&target.to_variant()),
+    ) {
+        glib::g_warning!("morlaco", "could not open wallet: {err}");
+    }
 }
 
 /// One wallet's outcome from the worker thread.

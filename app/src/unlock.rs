@@ -45,6 +45,19 @@ pub type Ready = Rc<dyn Fn(Unlocked)>;
 
 /// Opens the database. A file in the layout of version 1 cannot be read, so
 /// it is renamed out of the way and a fresh database takes its place.
+/// Opens the file with a passphrase just chosen, encrypting it first when it
+/// was a plain one.
+fn open_new(
+    file: FileState,
+    path: &Path,
+    passphrase: &str,
+) -> Result<(Database, Option<PathBuf>), Error> {
+    if file == FileState::Plain {
+        Database::encrypt_plain_file(path, passphrase)?;
+    }
+    open_database(path, passphrase)
+}
+
 fn open_database(path: &Path, key: &str) -> Result<(Database, Option<PathBuf>), Error> {
     match Database::open(path, key) {
         Err(Error::OldFormat) => {
@@ -352,24 +365,21 @@ fn show_setup(
         let (new, problem) = (new.clone(), problem.clone());
         Rc::new(move || {
             let passphrase = new.text().to_string();
-            let result = (|| -> Result<(Database, Option<PathBuf>), Error> {
-                if file == FileState::Plain {
-                    Database::encrypt_plain_file(&path, &passphrase)?;
+            let result = open_new(file, &path, &passphrase);
+            let (db, set_aside) = match result {
+                Ok(opened) => opened,
+                Err(err) => {
+                    problem.set_label(&err.to_string());
+                    return;
                 }
-                open_database(&path, &passphrase)
-            })();
-            match result {
-                Ok((db, set_aside)) => {
-                    ready(Unlocked {
-                        db,
-                        keys: Keys::PassphraseOnly { passphrase },
-                        set_aside,
-                        created_new_secret: false,
-                        notice: None,
-                    });
-                }
-                Err(err) => problem.set_label(&err.to_string()),
-            }
+            };
+            ready(Unlocked {
+                db,
+                keys: Keys::PassphraseOnly { passphrase },
+                set_aside,
+                created_new_secret: false,
+                notice: None,
+            });
         })
     };
     // Enter in the last field does what the button does, once it is enabled.
