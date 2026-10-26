@@ -6,7 +6,7 @@
 
 use morlaco_core::chain::{Chain, WalletId};
 use morlaco_core::db::Database;
-use morlaco_core::portfolio::{History, SETTING_ETHERSCAN_KEY};
+use morlaco_core::portfolio::{History, SETTING_ETHERSCAN_KEY, SETTING_NODEREAL_KEY};
 use morlaco_core::{Error, Result};
 
 const HIDDEN_KEY: &str = "hidden";
@@ -265,6 +265,20 @@ impl Store {
     /// service.
     pub fn set_etherscan_key(&self, key: &str) -> Result<()> {
         self.db.set_setting(SETTING_ETHERSCAN_KEY, key)
+    }
+
+    /// The NodeReal API key the user entered, if any. BNB Smart Chain needs
+    /// one.
+    pub fn nodereal_key(&self) -> Option<String> {
+        self.db
+            .setting(SETTING_NODEREAL_KEY)
+            .ok()?
+            .filter(|key| !key.is_empty())
+    }
+
+    /// Saves the NodeReal API key. An empty key removes it.
+    pub fn set_nodereal_key(&self, key: &str) -> Result<()> {
+        self.db.set_setting(SETTING_NODEREAL_KEY, key)
     }
 
     /// Re-encrypts the database with a new key. See [`Database::rekey`].
@@ -534,5 +548,18 @@ mod tests {
         assert!(store.visible_wallets().is_empty());
         let reopened = Store::open(store.db).expect("reopens");
         assert_eq!(reopened.wallets[0].portfolio, business);
+    }
+
+    #[test]
+    fn the_nodereal_key_is_kept_apart_from_the_etherscan_key() {
+        let store = store();
+        assert_eq!(store.nodereal_key(), None);
+        store.set_nodereal_key("NODE").expect("save");
+        store.set_etherscan_key("SCAN").expect("save");
+        assert_eq!(store.nodereal_key().as_deref(), Some("NODE"));
+        assert_eq!(store.etherscan_key().as_deref(), Some("SCAN"));
+        store.set_nodereal_key("").expect("clear");
+        assert_eq!(store.nodereal_key(), None);
+        assert_eq!(store.etherscan_key().as_deref(), Some("SCAN"));
     }
 }

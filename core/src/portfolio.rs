@@ -65,6 +65,17 @@ pub struct Portfolio {
 /// The setting that holds the Etherscan API key, if the user entered one.
 pub const SETTING_ETHERSCAN_KEY: &str = "etherscan_api_key";
 
+/// The setting that holds the NodeReal API key, which BNB Smart Chain needs.
+pub const SETTING_NODEREAL_KEY: &str = "nodereal_api_key";
+
+/// An API key the user saved, or `None` if there is none or it is blank.
+fn key_setting(db: &Database, name: &str) -> Result<Option<String>> {
+    Ok(db
+        .setting(name)?
+        .map(|key| key.trim().to_owned())
+        .filter(|key| !key.is_empty()))
+}
+
 /// Blocks this deep can still be replaced by a chain reorganization, so
 /// they are always fetched again.
 const REORG_DEPTH: u64 = 6;
@@ -86,9 +97,8 @@ pub fn fetch(
     let since = refetch_above(&saved);
 
     let options = FetchOptions {
-        etherscan_key: db
-            .setting(SETTING_ETHERSCAN_KEY)?
-            .filter(|key| !key.trim().is_empty()),
+        etherscan_key: key_setting(db, SETTING_ETHERSCAN_KEY)?,
+        nodereal_key: key_setting(db, SETTING_NODEREAL_KEY)?,
     };
     let fresh = wallet
         .chain

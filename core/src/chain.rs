@@ -19,6 +19,7 @@
 
 use crate::backend::bitcoin::BitcoinBackend;
 use crate::backend::ethereum::EthereumBackend;
+use crate::backend::nodereal::BnbBackend;
 use crate::{Error, Result};
 
 /// A blockchain network whose native coin can be tracked.
@@ -28,6 +29,9 @@ pub enum Chain {
     Bitcoin,
     /// Ethereum, with its native coin ether.
     Ethereum,
+    /// BNB Smart Chain, with its native coin BNB. It has the same kind of
+    /// addresses as Ethereum.
+    Bnb,
     /// A second chain with 18 decimals, so tests can cover several chains.
     #[cfg(test)]
     Fake,
@@ -35,13 +39,14 @@ pub enum Chain {
 
 impl Chain {
     /// Every chain the app can track.
-    pub const ALL: &'static [Chain] = &[Chain::Bitcoin, Chain::Ethereum];
+    pub const ALL: &'static [Chain] = &[Chain::Bitcoin, Chain::Ethereum, Chain::Bnb];
 
     /// Stable identifier used when saving data.
     pub fn key(self) -> &'static str {
         match self {
             Chain::Bitcoin => "bitcoin",
             Chain::Ethereum => "ethereum",
+            Chain::Bnb => "bnb",
             #[cfg(test)]
             Chain::Fake => "fake",
         }
@@ -52,6 +57,7 @@ impl Chain {
         match key {
             "bitcoin" => Some(Chain::Bitcoin),
             "ethereum" => Some(Chain::Ethereum),
+            "bnb" => Some(Chain::Bnb),
             #[cfg(test)]
             "fake" => Some(Chain::Fake),
             _ => None,
@@ -63,6 +69,7 @@ impl Chain {
         match self {
             Chain::Bitcoin => "Bitcoin",
             Chain::Ethereum => "Ethereum",
+            Chain::Bnb => "BNB Smart Chain",
             #[cfg(test)]
             Chain::Fake => "Fake Chain",
         }
@@ -73,6 +80,7 @@ impl Chain {
         match self {
             Chain::Bitcoin => "BTC",
             Chain::Ethereum => "ETH",
+            Chain::Bnb => "BNB",
             #[cfg(test)]
             Chain::Fake => "FAKE",
         }
@@ -83,7 +91,7 @@ impl Chain {
     pub fn decimals(self) -> u8 {
         match self {
             Chain::Bitcoin => 8,
-            Chain::Ethereum => 18,
+            Chain::Ethereum | Chain::Bnb => 18,
             #[cfg(test)]
             Chain::Fake => 18,
         }
@@ -102,11 +110,7 @@ impl Chain {
     pub fn check_address(self, address: &str) -> Result<()> {
         let plausible = match self {
             Chain::Bitcoin => looks_like_bitcoin(address),
-            Chain::Ethereum => {
-                address.len() == 42
-                    && address.starts_with("0x")
-                    && address[2..].chars().all(|c| c.is_ascii_hexdigit())
-            }
+            Chain::Ethereum | Chain::Bnb => looks_like_evm(address),
             #[cfg(test)]
             Chain::Fake => !address.is_empty(),
         };
@@ -115,6 +119,12 @@ impl Chain {
         } else {
             Err(Error::InvalidAddress)
         }
+    }
+
+    /// Whether the chain works like Ethereum: `0x` addresses, written the
+    /// same on every such chain.
+    pub fn is_evm(self) -> bool {
+        matches!(self, Chain::Ethereum | Chain::Bnb)
     }
 
     /// The chains whose addresses look like `address`, ignoring spaces around
@@ -135,6 +145,7 @@ impl Chain {
         match self {
             Chain::Bitcoin => format!("https://mempool.space/tx/{txid}"),
             Chain::Ethereum => format!("https://etherscan.io/tx/{txid}"),
+            Chain::Bnb => format!("https://bscscan.com/tx/{txid}"),
             #[cfg(test)]
             Chain::Fake => format!("https://fake.example/tx/{txid}"),
         }
@@ -145,10 +156,20 @@ impl Chain {
         match self {
             Chain::Bitcoin => &BitcoinBackend,
             Chain::Ethereum => &EthereumBackend,
+            Chain::Bnb => &BnbBackend,
             #[cfg(test)]
             Chain::Fake => &FakeBackend,
         }
     }
+}
+
+/// Whether `address` has the shape of an Ethereum-style address: `0x` and 40
+/// hex digits. Only the shape is checked, not the capitals that carry a
+/// checksum.
+fn looks_like_evm(address: &str) -> bool {
+    address.len() == 42
+        && address.starts_with("0x")
+        && address[2..].chars().all(|c| c.is_ascii_hexdigit())
 }
 
 /// Whether `address` has the shape of a Bitcoin mainnet address: bech32
@@ -180,13 +201,14 @@ pub struct WalletId {
 }
 
 impl WalletId {
-    /// Creates an id. Ethereum addresses are written in lowercase, so the same
-    /// address typed in two ways is one wallet.
+    /// Creates an id. Addresses of Ethereum-style chains are written in
+    /// lowercase, so the same address typed in two ways is one wallet.
     pub fn new(chain: Chain, address: impl Into<String>) -> Self {
         let address = address.into();
-        let address = match chain {
-            Chain::Ethereum => address.to_ascii_lowercase(),
-            _ => address,
+        let address = if chain.is_evm() {
+            address.to_ascii_lowercase()
+        } else {
+            address
         };
         Self { chain, address }
     }
@@ -223,6 +245,9 @@ pub struct FetchOptions {
     /// An Etherscan API key. With one, Ethereum is read from Etherscan, which
     /// is faster for busy addresses than the keyless service used otherwise.
     pub etherscan_key: Option<String>,
+    /// A NodeReal API key. BNB Smart Chain is read through NodeReal, so BNB
+    /// wallets cannot be loaded without one.
+    pub nodereal_key: Option<String>,
 }
 
 /// Reads one chain's history.
@@ -271,7 +296,7 @@ mod tests {
 
     #[test]
     fn keys_round_trip_for_every_chain() {
-        for chain in [Chain::Bitcoin, Chain::Ethereum, Chain::Fake] {
+        for chain in [Chain::Bitcoin, Chain::Ethereum, Chain::Bnb, Chain::Fake] {
             assert_eq!(Chain::from_key(chain.key()), Some(chain));
         }
         assert_eq!(Chain::from_key("dogecoin"), None);
@@ -382,19 +407,51 @@ mod tests {
     }
 
     #[test]
-    fn ethereum_addresses_are_detected_as_ethereum_only() {
-        assert_eq!(Chain::detect(ETHEREUM), [Chain::Ethereum]);
+    fn an_ethereum_style_address_fits_every_ethereum_style_chain_and_no_other() {
+        // The same format on both chains, so the user has to choose.
+        assert_eq!(Chain::detect(ETHEREUM), [Chain::Ethereum, Chain::Bnb]);
         assert_eq!(
             Chain::detect(&ETHEREUM.to_ascii_lowercase()),
-            [Chain::Ethereum]
+            [Chain::Ethereum, Chain::Bnb]
         );
-        // Bitcoin's check no longer lets an Ethereum address through.
+        // Bitcoin's check no longer lets an Ethereum-style address through.
         assert!(Chain::Bitcoin.check_address(ETHEREUM).is_err());
     }
 
     #[test]
+    fn bnb_smart_chain_basics() {
+        let bnb = Chain::Bnb;
+        assert_eq!(
+            (bnb.key(), bnb.symbol(), bnb.decimals()),
+            ("bnb", "BNB", 18)
+        );
+        assert_eq!(bnb.name(), "BNB Smart Chain");
+        assert_eq!(bnb.explorer_tx_url("0xabc"), "https://bscscan.com/tx/0xabc");
+        assert!(bnb.check_address(ETHEREUM).is_ok());
+        assert!(bnb.check_address(BECH32).is_err());
+        assert!(bnb.is_evm() && Chain::Ethereum.is_evm() && !Chain::Bitcoin.is_evm());
+        // Bitcoin is still first, so it stays the default network.
+        assert_eq!(Chain::ALL[0], Chain::Bitcoin);
+    }
+
+    #[test]
+    fn the_same_address_on_ethereum_and_bnb_is_two_wallets() {
+        let eth = WalletId::new(Chain::Ethereum, ETHEREUM);
+        let bnb = WalletId::new(
+            Chain::Bnb,
+            ETHEREUM.to_ascii_uppercase().replace("0X", "0x"),
+        );
+        assert_ne!(eth, bnb);
+        // Both are kept in lowercase.
+        assert_eq!(bnb.address, ETHEREUM.to_ascii_lowercase());
+    }
+
+    #[test]
     fn spaces_around_a_pasted_address_are_ignored() {
-        assert_eq!(Chain::detect(&format!("  {ETHEREUM}\n")), [Chain::Ethereum]);
+        assert_eq!(
+            Chain::detect(&format!("  {ETHEREUM}\n")),
+            [Chain::Ethereum, Chain::Bnb]
+        );
         assert_eq!(Chain::detect(&format!("\t{BECH32} ")), [Chain::Bitcoin]);
     }
 

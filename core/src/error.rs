@@ -10,6 +10,16 @@ pub enum Error {
     /// The request failed or the response could not be decoded.
     #[error("request failed: {0}")]
     Http(Box<ureq::Error>),
+    /// A network can only be read with an API key the user has not entered.
+    #[error(
+        "{network} needs a {provider} API key. Add one under Data Providers… in the main menu."
+    )]
+    KeyNeeded {
+        /// The network that cannot be read, for example "BNB Smart Chain".
+        network: &'static str,
+        /// Whose key is needed, for example "NodeReal".
+        provider: &'static str,
+    },
     /// A data provider refused the request and said why, for example that
     /// the API key is wrong.
     #[error("the data provider said: {0}")]

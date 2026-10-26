@@ -14,6 +14,8 @@ your coins arrived, and shows your estimated gain or loss.
 
 ## What you get
 
+- Bitcoin, Ethereum and BNB Smart Chain wallets. Paste an address and Morlaco
+  picks the network.
 - Your balance and what it's worth in US dollars.
 - Your gain or loss, for each wallet and for all of them together.
 - Portfolios, to group your wallets (personal, business, …). Switch between
@@ -113,6 +115,11 @@ Just want to try it? `cargo run` works from the checkout, no install needed.
   you have a free [Etherscan](https://etherscan.io/apis) API key, enter it
   under **Data Providers…** in the main menu and Morlaco uses Etherscan
   instead. The key is kept in your encrypted data.
+- BNB Smart Chain has no free keyless history service, so BNB wallets need a
+  free [NodeReal](https://nodereal.io) API key, entered in the same place. The
+  first load of a BNB wallet reads the whole history and can take a few
+  minutes. BNB prices come from Binance and are in USDT, which stands in for
+  US dollars.
 
 ## Development
 

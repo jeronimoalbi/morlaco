@@ -4,3 +4,4 @@
 pub mod bitcoin;
 pub mod ethereum;
 pub mod etherscan;
+pub mod nodereal;

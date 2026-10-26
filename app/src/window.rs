@@ -872,16 +872,20 @@ impl Ui {
                 }
             }
         };
-        // Say the network was detected only while the one chosen fits.
+        // Say the network was detected only while the one chosen fits, and ask
+        // for a choice when the address fits several.
         let sync_subtitle = {
             let (network, address, chosen_chain) =
                 (network.clone(), address.clone(), chosen_chain.clone());
             Rc::new(move || {
-                let fits = Chain::detect(address.text().as_str()).contains(&chosen_chain());
-                network.set_subtitle(if fits {
-                    "Detected from the address"
-                } else {
+                let candidates = Chain::detect(address.text().as_str());
+                network.set_subtitle(if !candidates.contains(&chosen_chain()) {
                     ""
+                } else if candidates.len() > 1 {
+                    // The address looks the same on these networks.
+                    "This address format is used on several networks. Choose yours."
+                } else {
+                    "Detected from the address"
                 });
             })
         };
@@ -1072,20 +1076,23 @@ impl Ui {
     /// Lets the user enter an Etherscan API key, which makes Ethereum wallets
     /// load from Etherscan instead of the keyless service.
     fn show_data_providers_dialog(self: &Rc<Self>) {
-        let current = self
-            .state
-            .borrow()
-            .store
-            .etherscan_key()
-            .unwrap_or_default();
+        let (etherscan, nodereal) = {
+            let state = self.state.borrow();
+            (
+                state.store.etherscan_key().unwrap_or_default(),
+                state.store.nodereal_key().unwrap_or_default(),
+            )
+        };
         let dialog = adw::AlertDialog::new(
             Some("Data Providers"),
             Some(
                 "Ethereum history comes from Blockscout, which needs no key but can be slow \
                  for busy addresses. With an Etherscan API key (free at etherscan.io/apis), \
-                 Morlaco uses Etherscan instead, and Etherscan then sees your key and the \
-                 addresses you look up. The key is saved in your encrypted data. Leave it \
-                 empty to use Blockscout.",
+                 Morlaco uses Etherscan instead.\n\n\
+                 BNB Smart Chain history needs a NodeReal API key (free at nodereal.io). \
+                 Without one, BNB wallets can’t be loaded.\n\n\
+                 These services then see your key and the addresses you look up. The keys \
+                 are saved in your encrypted data.",
             ),
         );
         dialog.add_responses(&[("cancel", "_Cancel"), ("save", "_Save")]);
@@ -1093,12 +1100,17 @@ impl Ui {
         dialog.set_default_response(Some("save"));
         dialog.set_close_response("cancel");
 
-        let entry = adw::PasswordEntryRow::builder()
-            .title("Etherscan API key")
-            .text(&current)
+        let etherscan_entry = adw::PasswordEntryRow::builder()
+            .title("Etherscan API key (Ethereum, optional)")
+            .text(&etherscan)
+            .build();
+        let nodereal_entry = adw::PasswordEntryRow::builder()
+            .title("NodeReal API key (BNB Smart Chain)")
+            .text(&nodereal)
             .build();
         let fields = boxed_list();
-        fields.append(&entry);
+        fields.append(&etherscan_entry);
+        fields.append(&nodereal_entry);
         dialog.set_extra_child(Some(&fields));
 
         let ui = self.clone();
@@ -1106,14 +1118,20 @@ impl Ui {
             if response != "save" {
                 return;
             }
-            let key = entry.text().trim().to_owned();
-            let saved = ui.state.borrow().store.set_etherscan_key(&key);
+            let (etherscan_key, nodereal_key) = (
+                etherscan_entry.text().trim().to_owned(),
+                nodereal_entry.text().trim().to_owned(),
+            );
+            let saved = {
+                let state = ui.state.borrow();
+                state
+                    .store
+                    .set_etherscan_key(&etherscan_key)
+                    .and_then(|()| state.store.set_nodereal_key(&nodereal_key))
+            };
             match saved {
-                Ok(()) if key.is_empty() => {
-                    ui.toast("Using Blockscout. Refresh to reload Ethereum wallets.")
-                }
-                Ok(()) => ui.toast("Key saved. Refresh to reload Ethereum wallets with it."),
-                Err(err) => ui.toast(&format!("Could not save the key: {err}")),
+                Ok(()) => ui.toast("Saved. Refresh to reload wallets with these keys."),
+                Err(err) => ui.toast(&format!("Could not save the keys: {err}")),
             }
         });
         dialog.present(Some(&self.window));

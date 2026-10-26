@@ -10,6 +10,13 @@ use crate::{Error, Result};
 const MEMPOOL_URL: &str = "https://mempool.space/api/v1";
 const COINBASE_CANDLES_URL: &str = "https://api.exchange.coinbase.com/products/ETH-USD/candles";
 const COINBASE_SPOT_URL: &str = "https://api.coinbase.com/v2/prices/ETH-USD/spot";
+const BINANCE_KLINES_URL: &str = "https://api.binance.com/api/v3/klines";
+const BINANCE_SPOT_URL: &str = "https://api.binance.com/api/v3/ticker/price";
+/// Binance trades BNB against USDT, a dollar stablecoin, which stands in for
+/// US dollars here.
+const BINANCE_PAIR: &str = "BNBUSDT";
+/// Daily candles Binance returns per request, at most.
+const BINANCE_CANDLES_PER_REQUEST: i64 = 1000;
 const SECONDS_PER_DAY: i64 = 86_400;
 /// Daily candles Coinbase returns per request, at most.
 const CANDLES_PER_REQUEST: i64 = 300;
@@ -159,6 +166,93 @@ fn require_ethereum(chain: Chain) -> Result<()> {
     }
 }
 
+#[derive(Debug, Deserialize)]
+struct BinanceSpot {
+    /// A decimal number written as text.
+    price: String,
+}
+
+/// Live BNB prices from Binance, with no caching. Other chains are not
+/// covered.
+///
+/// A day's price is the middle of its opening and closing price, as for
+/// Ether. Binance is not available in every country; a refusal says so.
+pub struct BinancePrices;
+
+impl PriceSource for BinancePrices {
+    fn usd_at(&self, chain: Chain, time: i64) -> Result<f64> {
+        let day = time.div_euclid(SECONDS_PER_DAY);
+        self.usd_days(chain, day)?
+            .into_iter()
+            .find(|(candle_day, _)| *candle_day == day)
+            .map(|(_, usd)| usd)
+            .ok_or(Error::NoPrice(time))
+    }
+
+    fn usd_now(&self, chain: Chain) -> Result<f64> {
+        require_bnb(chain)?;
+        let spot: BinanceSpot = binance_get(&format!("{BINANCE_SPOT_URL}?symbol={BINANCE_PAIR}"))?;
+        spot.price
+            .parse()
+            .map_err(|_| Error::BadResponse("the price is not a number"))
+    }
+
+    /// Asks for `day` and the following days, up to the most one request
+    /// returns.
+    fn usd_days(&self, chain: Chain, day: i64) -> Result<Vec<(i64, f64)>> {
+        require_bnb(chain)?;
+        let url = format!(
+            "{BINANCE_KLINES_URL}?symbol={BINANCE_PAIR}&interval=1d&startTime={}&limit={BINANCE_CANDLES_PER_REQUEST}",
+            day * SECONDS_PER_DAY * 1000,
+        );
+        let rows: Vec<Vec<serde_json::Value>> = binance_get(&url)?;
+        days_from_klines(&rows)
+    }
+}
+
+/// Asks Binance and reads the answer. A 451 is Binance saying it does not
+/// serve this country.
+fn binance_get<T: serde::de::DeserializeOwned>(url: &str) -> Result<T> {
+    match ureq::get(url).call() {
+        Ok(mut response) => Ok(response.body_mut().read_json()?),
+        Err(ureq::Error::StatusCode(451)) => Err(Error::Provider(
+            "Binance, where BNB prices come from, is not available in your country".to_owned(),
+        )),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// The price of each day in Binance's candles, which are arrays of
+/// `[open time in ms, open, high, low, close, …]` with prices as text. The
+/// price of a day is the middle of open and close.
+fn days_from_klines(rows: &[Vec<serde_json::Value>]) -> Result<Vec<(i64, f64)>> {
+    let bad = || Error::BadResponse("a price candle is malformed");
+    let text = |row: &[serde_json::Value], index: usize| -> Result<f64> {
+        row.get(index)
+            .and_then(serde_json::Value::as_str)
+            .and_then(|t| t.parse().ok())
+            .ok_or_else(bad)
+    };
+    rows.iter()
+        .map(|row| {
+            let opened = row
+                .first()
+                .and_then(serde_json::Value::as_i64)
+                .ok_or_else(bad)?;
+            let day = (opened / 1000).div_euclid(SECONDS_PER_DAY);
+            Ok((day, (text(row, 1)? + text(row, 4)?) / 2.0))
+        })
+        .collect()
+}
+
+fn require_bnb(chain: Chain) -> Result<()> {
+    if chain == Chain::Bnb {
+        Ok(())
+    } else {
+        Err(Error::UnsupportedChain(chain.name()))
+    }
+}
+
 /// Live prices for every chain the app can track: each chain goes to the
 /// service that knows it.
 pub struct LivePrices;
@@ -167,6 +261,7 @@ impl PriceSource for LivePrices {
     fn usd_at(&self, chain: Chain, time: i64) -> Result<f64> {
         match chain {
             Chain::Ethereum => CoinbasePrices.usd_at(chain, time),
+            Chain::Bnb => BinancePrices.usd_at(chain, time),
             _ => MempoolPrices.usd_at(chain, time),
         }
     }
@@ -174,6 +269,7 @@ impl PriceSource for LivePrices {
     fn usd_now(&self, chain: Chain) -> Result<f64> {
         match chain {
             Chain::Ethereum => CoinbasePrices.usd_now(chain),
+            Chain::Bnb => BinancePrices.usd_now(chain),
             _ => MempoolPrices.usd_now(chain),
         }
     }
@@ -181,6 +277,7 @@ impl PriceSource for LivePrices {
     fn usd_days(&self, chain: Chain, day: i64) -> Result<Vec<(i64, f64)>> {
         match chain {
             Chain::Ethereum => CoinbasePrices.usd_days(chain, day),
+            Chain::Bnb => BinancePrices.usd_days(chain, day),
             _ => MempoolPrices.usd_days(chain, day),
         }
     }
@@ -381,6 +478,38 @@ mod tests {
         assert!(matches!(
             LivePrices.usd_now(Chain::Fake),
             Err(Error::UnsupportedChain("Fake Chain"))
+        ));
+    }
+
+    #[test]
+    fn binance_candles_give_the_middle_of_open_and_close() {
+        let rows: Vec<Vec<serde_json::Value>> = serde_json::from_str(
+            r#"[[1510012800000,"1.57100000","1.80000000","1.53890000","1.80000000","134129.73",1510099199999,"x",851,"a","b","0"],
+                [1510099200000,"1.79010000","1.99000000","1.74790000","1.98890000","347290.26",1510185599999,"x",2124,"a","b","0"]]"#,
+        )
+        .expect("klines parse");
+        let days = days_from_klines(&rows).expect("converts");
+        assert_eq!(days[0], (17_477, (1.571 + 1.8) / 2.0));
+        assert_eq!(days[1].0, 17_478);
+        assert!(days_from_klines(&[vec![serde_json::json!("x")]]).is_err());
+    }
+
+    #[test]
+    fn binance_spot_price_is_read_from_text() {
+        let spot: BinanceSpot =
+            serde_json::from_str(r#"{"symbol":"BNBUSDT","price":"742.04000000"}"#).expect("parses");
+        assert_eq!(spot.price.parse::<f64>().ok(), Some(742.04));
+    }
+
+    #[test]
+    fn binance_only_prices_bnb() {
+        assert!(matches!(
+            BinancePrices.usd_now(Chain::Bitcoin),
+            Err(Error::UnsupportedChain("Bitcoin"))
+        ));
+        assert!(matches!(
+            BinancePrices.usd_days(Chain::Ethereum, 0),
+            Err(Error::UnsupportedChain(_))
         ));
     }
 }
