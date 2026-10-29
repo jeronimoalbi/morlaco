@@ -8,7 +8,6 @@ on:
     paths:
       - "src/**"
       - "data/**"
-      - "examples/**"
       - "build.rs"
       - "Cargo.toml"
       - "Cargo.lock"
@@ -20,7 +19,6 @@ on:
     paths:
       - "src/**"
       - "data/**"
-      - "examples/**"
       - "build.rs"
       - "Cargo.toml"
       - "Cargo.lock"
