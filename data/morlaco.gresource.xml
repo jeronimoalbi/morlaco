@@ -9,6 +9,7 @@
     <file alias="scalable/actions/list-add-symbolic.svg">adwaita-icons/actions/list-add-symbolic.svg</file>
     <file alias="scalable/actions/open-menu-symbolic.svg">adwaita-icons/actions/open-menu-symbolic.svg</file>
     <file alias="scalable/actions/sidebar-show-symbolic.svg">adwaita-icons/actions/sidebar-show-symbolic.svg</file>
+    <file alias="scalable/mimetypes/x-office-calendar-symbolic.svg">adwaita-icons/mimetypes/x-office-calendar-symbolic.svg</file>
     <file alias="scalable/places/user-trash-symbolic.svg">adwaita-icons/places/user-trash-symbolic.svg</file>
     <file alias="scalable/actions/view-conceal-symbolic.svg">adwaita-icons/actions/view-conceal-symbolic.svg</file>
     <file alias="scalable/actions/view-list-symbolic.svg">adwaita-icons/actions/view-list-symbolic.svg</file>

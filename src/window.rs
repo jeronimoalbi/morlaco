@@ -2242,12 +2242,14 @@ impl TxRows {
     fn new(symbol: &str) -> Self {
         let names: Vec<&str> = TX_KINDS.iter().map(|k| k.name).collect();
         let entry = |title: String| adw::EntryRow::builder().title(title).build();
+        let date = entry("Date (YYYY-MM-DD)".to_owned());
+        date.add_suffix(&date_picker(&date));
         Self {
             kind: adw::ComboRow::builder()
                 .title("Type")
                 .model(&gtk::StringList::new(&names))
                 .build(),
-            date: entry("Date (YYYY-MM-DD)".to_owned()),
+            date,
             amount: entry(format!("Amount ({symbol})")),
             fee: entry(format!("Fee in {symbol} (optional)")),
             price: entry("Price per coin in USD (empty: market price of that day)".to_owned()),
@@ -3147,6 +3149,76 @@ fn boxed_list() -> gtk::ListBox {
         .selection_mode(gtk::SelectionMode::None)
         .css_classes(["boxed-list"])
         .build()
+}
+
+/// A calendar to pick the date typed in `entry`. It pops up while the entry
+/// has the focus, and from its button. The entry keeps the focus, so typing
+/// still works with the calendar open.
+fn date_picker(entry: &adw::EntryRow) -> gtk::MenuButton {
+    let calendar = gtk::Calendar::builder().focusable(false).build();
+    let popover = gtk::Popover::builder()
+        .autohide(false)
+        .child(&calendar)
+        .build();
+    let button = gtk::MenuButton::builder()
+        .icon_name("x-office-calendar-symbolic")
+        .tooltip_text("Pick a Date")
+        .valign(gtk::Align::Center)
+        .focus_on_click(false)
+        .css_classes(["flat"])
+        .popover(&popover)
+        .build();
+
+    // The month shown. Picking a day keeps it, while browsing to another month
+    // selects a day there too, which is not a choice yet.
+    let year_month = |date: &glib::DateTime| (date.year(), date.month());
+    let shown = Rc::new(Cell::new(year_month(&calendar.date())));
+    {
+        let (entry, calendar, shown) = (entry.clone(), calendar.clone(), shown.clone());
+        popover.connect_show(move |_| {
+            let typed = parse_date_utc(&entry.text())
+                .and_then(|time| glib::DateTime::from_unix_utc(time).ok());
+            if let Some(date) = typed {
+                shown.set((0, 0));
+                calendar.select_day(&date);
+            }
+            shown.set(year_month(&calendar.date()));
+        });
+    }
+    {
+        let (entry, popover) = (entry.clone(), popover.clone());
+        calendar.connect_day_selected(move |calendar| {
+            let date = calendar.date();
+            if shown.replace(year_month(&date)) != year_month(&date) {
+                return;
+            }
+            if let Ok(text) = date.format("%Y-%m-%d") {
+                entry.set_text(&text);
+            }
+            popover.popdown();
+        });
+    }
+
+    let focus = gtk::EventControllerFocus::new();
+    let on_enter = popover.clone();
+    focus.connect_enter(move |_| on_enter.popup());
+    let on_leave = popover.clone();
+    focus.connect_leave(move |_| on_leave.popdown());
+    entry.add_controller(focus);
+
+    // Escape closes the calendar first, and the dialog only after.
+    let keys = gtk::EventControllerKey::new();
+    keys.set_propagation_phase(gtk::PropagationPhase::Capture);
+    keys.connect_key_pressed(move |_, key, _, _| {
+        if key == gtk::gdk::Key::Escape && popover.is_visible() {
+            popover.popdown();
+            glib::Propagation::Stop
+        } else {
+            glib::Propagation::Proceed
+        }
+    });
+    entry.add_controller(keys);
+    button
 }
 
 fn clear(list: &gtk::ListBox) {
