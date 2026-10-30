@@ -39,6 +39,12 @@ pub enum Error {
     /// The database holds a chain this version does not know.
     #[error("the saved data mentions an unknown network: {0}")]
     UnknownChain(String),
+    /// The database holds a wallet mode this version does not know.
+    #[error("the saved data mentions an unknown wallet type: {0}")]
+    UnknownWalletMode(String),
+    /// Transactions can only be edited by hand on a manual wallet.
+    #[error("only manual wallets can have their transactions edited")]
+    NotManual,
     /// A portfolio was given an empty name.
     #[error("a portfolio needs a name")]
     EmptyPortfolioName,

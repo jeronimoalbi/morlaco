@@ -10,7 +10,7 @@ use std::collections::{HashMap, HashSet};
 
 use crate::Result;
 use crate::chain::{Activity, Chain, FetchOptions, WalletId};
-use crate::db::Database;
+use crate::db::{Database, WalletMode};
 use crate::lots::{Ledger, Lot, Move, Summary};
 use crate::price::PriceSource;
 
@@ -87,6 +87,9 @@ const REORG_DEPTH: u64 = 6;
 /// saved in one step, so a failure leaves the earlier state intact.
 ///
 /// `on_progress` receives the number of new transactions found so far.
+///
+/// A manual wallet has nothing to download: its saved transactions are the
+/// history.
 pub fn fetch(
     wallet: &WalletId,
     prices: &impl PriceSource,
@@ -94,6 +97,12 @@ pub fn fetch(
     mut on_progress: impl FnMut(usize),
 ) -> Result<History> {
     let saved = db.history(wallet)?;
+    if db.wallet_mode(wallet)? == Some(WalletMode::Manual) {
+        return Ok(History {
+            wallet: wallet.clone(),
+            txs: saved,
+        });
+    }
     let since = refetch_above(&saved);
 
     let options = FetchOptions {
@@ -159,29 +168,38 @@ struct Group<'a> {
 /// Transactions are ordered by block height, then by position in the block
 /// where the chain reports one. Inside one block, a transaction that spends
 /// another's output comes after it.
+///
+/// A transaction the user entered by hand has no block (height 0), so it is
+/// placed by its time among the others. When it is also seen by a synced
+/// wallet, the synced wallet's block, time and price win.
 fn ordered_groups<'a>(histories: &[&'a History]) -> Vec<Group<'a>> {
     let mut by_txid: HashMap<&str, Group> = HashMap::new();
     for (wallet, history) in histories.iter().enumerate() {
         for tx in &history.txs {
             let a = &tx.activity;
-            by_txid
-                .entry(a.txid.as_str())
-                .or_insert_with(|| Group {
-                    txid: a.txid.as_str(),
-                    height: a.height,
-                    index: a.index.unwrap_or(0),
-                    time: a.time,
-                    price_usd: tx.price_usd,
-                    parents: &a.parents,
-                    touches: Vec::new(),
-                })
-                .touches
-                .push((wallet, a));
+            let group = by_txid.entry(a.txid.as_str()).or_insert_with(|| Group {
+                txid: a.txid.as_str(),
+                height: a.height,
+                index: a.index.unwrap_or(0),
+                time: a.time,
+                price_usd: tx.price_usd,
+                parents: &a.parents,
+                touches: Vec::new(),
+            });
+            if group.height == 0 && a.height > 0 {
+                group.height = a.height;
+                group.index = a.index.unwrap_or(0);
+                group.time = a.time;
+                group.price_usd = tx.price_usd;
+                group.parents = &a.parents;
+            }
+            group.touches.push((wallet, a));
         }
     }
 
     let mut groups: Vec<Group> = by_txid.into_values().collect();
     groups.sort_by_key(|g| (g.height, g.index, g.txid));
+    let groups = by_time(groups);
 
     let mut ordered = Vec::with_capacity(groups.len());
     let mut rest = groups.into_iter().peekable();
@@ -194,6 +212,29 @@ fn ordered_groups<'a>(histories: &[&'a History]) -> Vec<Group<'a>> {
         ordered.extend(spending_order(block));
     }
     ordered
+}
+
+/// Interleaves transactions without a block (height 0) with those in blocks,
+/// which must already be in block order. Block order is kept even where block
+/// times go backwards.
+fn by_time(groups: Vec<Group<'_>>) -> Vec<Group<'_>> {
+    let (manual, mut chain): (Vec<_>, Vec<_>) = groups.into_iter().partition(|g| g.height == 0);
+    if manual.is_empty() {
+        return chain;
+    }
+    let mut latest = i64::MIN;
+    let mut keyed: Vec<(i64, Group)> = chain
+        .drain(..)
+        .map(|g| {
+            latest = latest.max(g.time);
+            (latest, g)
+        })
+        .collect();
+    keyed.extend(manual.into_iter().map(|g| (g.time, g)));
+    // Stable, so groups with equal time keep block order, and manual ones
+    // that were already in txid order.
+    keyed.sort_by_key(|(time, g)| (*time, g.height == 0));
+    keyed.into_iter().map(|(_, g)| g).collect()
 }
 
 /// Puts the transactions of one block in spending order, keeping the
@@ -321,6 +362,22 @@ mod tests {
         }
     }
 
+    /// A transaction entered by hand: no block, so only its time places it.
+    fn typed(txid: &str, time: i64, amount: i128, fee: u128, price_usd: f64) -> PricedTx {
+        PricedTx {
+            activity: Activity {
+                txid: txid.to_owned(),
+                height: 0,
+                index: None,
+                time,
+                amount,
+                fee,
+                parents: Vec::new(),
+            },
+            price_usd,
+        }
+    }
+
     fn history_on(chain: Chain, address: &str, txs: Vec<PricedTx>) -> History {
         History {
             wallet: WalletId::new(chain, address),
@@ -388,6 +445,84 @@ mod tests {
         assert_eq!(sent.internal_units, BTC as u128);
         assert_eq!(received.internal_units, BTC as u128);
         assert_eq!(out[0].history[0].internal_units, 0);
+    }
+
+    #[test]
+    fn coins_bought_on_an_exchange_keep_their_price_when_they_reach_a_synced_wallet() {
+        // Bought on an exchange at 20k, withdrawn in a transaction that the
+        // synced wallet sees as an incoming payment priced at 60k.
+        let exchange = history(
+            "manual:1",
+            vec![
+                typed("buy", 100, BTC, 0, 20_000.0),
+                typed("move", 6 * 600, -BTC, 0, 0.0),
+            ],
+        );
+        let own = history("bc1qown", vec![tx("move", 6, BTC, 0, &[])]);
+
+        let out = assemble(&[&exchange, &own], &prices(60_000.0));
+        assert_eq!(out[0].balance_units, 0);
+        assert_eq!(out[0].summary.realized_usd, 0.0);
+        assert_eq!(out[1].summary.cost_basis_usd, 20_000.0);
+        assert_eq!(out[1].summary.unrealized_usd, 40_000.0);
+        assert_eq!(out[1].history[0].internal_units, BTC as u128);
+        // The synced wallet's price is the one shown for the shared transaction.
+        assert_eq!(out[0].history[1].price_usd, 60_000.0);
+    }
+
+    #[test]
+    fn without_the_transaction_id_the_withdrawal_does_not_match() {
+        let exchange = history(
+            "manual:1",
+            vec![
+                typed("buy", 100, BTC, 0, 20_000.0),
+                typed("typo", 6 * 600, -BTC, 0, 60_000.0),
+            ],
+        );
+        let own = history("bc1qown", vec![tx("move", 6, BTC, 0, &[])]);
+
+        let out = assemble(&[&exchange, &own], &prices(60_000.0));
+        // Booked as a sale on one side and a purchase on the other.
+        assert_eq!(out[0].summary.realized_usd, 40_000.0);
+        assert_eq!(out[1].summary.cost_basis_usd, 60_000.0);
+    }
+
+    #[test]
+    fn typed_transactions_are_placed_among_block_transactions_by_time() {
+        // The synced wallet receives at block 1 (t=600) and sends at block 6
+        // (t=3600). The typed sale is at t=2000, between them.
+        let wallet = history(
+            "manual:1",
+            vec![
+                tx("in", 1, 2 * BTC, 0, &[]),
+                typed("zz-sale", 2_000, -BTC, 0, 30_000.0),
+                tx("out", 6, -BTC, 0, &[]),
+            ],
+        );
+        let out = assemble(&[&wallet], &prices(60_000.0));
+        let order: Vec<&str> = out[0]
+            .history
+            .iter()
+            .map(|e| e.activity.txid.as_str())
+            .collect();
+        assert_eq!(order, ["in", "zz-sale", "out"]);
+        // FIFO: both sales draw from the one lot bought at 10k.
+        assert_eq!(out[0].summary.realized_usd, 20_000.0 + 50_000.0);
+    }
+
+    #[test]
+    fn block_order_survives_block_times_that_go_backwards() {
+        // The child's block is later but carries an earlier timestamp.
+        let mut parent = tx("parent", 5, BTC, 0, &[]);
+        parent.activity.time = 5_000;
+        let mut child = tx("child", 6, -BTC, 0, &["parent"]);
+        child.activity.time = 4_990;
+        let a = history("A", vec![parent]);
+        let b = history("B", vec![child]);
+
+        let out = assemble(&[&a, &b], &prices(60_000.0));
+        assert_eq!(out[0].history[0].activity.txid, "parent");
+        assert_eq!(out[0].balance_units, BTC as u128);
     }
 
     #[test]
@@ -610,6 +745,28 @@ mod tests {
 
         let saved = db.history(&wallet()).expect("saved");
         assert_eq!(ids(&saved), ["a"]);
+    }
+
+    #[test]
+    fn a_manual_wallet_is_never_downloaded_and_keeps_its_edits() {
+        let db = Database::in_memory().expect("db");
+        db.add_wallet(&wallet(), "").expect("add");
+        script(vec![fake_activity("a", 10)]);
+        let prices = Prices {
+            usd: 5.0,
+            fail: false,
+        };
+        fetch(&wallet(), &prices, &db, |_| {}).expect("first");
+
+        db.convert_to_manual(&wallet()).expect("convert");
+        db.replace_manual_tx(&wallet(), "a", &typed("a", 1_000, 7, 0, 123.0))
+            .expect("edit");
+        // The chain now has more, but the wallet no longer asks.
+        script(vec![fake_activity("a", 10), fake_activity("z", 99)]);
+
+        let history = fetch(&wallet(), &prices, &db, |_| {}).expect("manual");
+        assert_eq!(ids(&history.txs), ["a"]);
+        assert_eq!(history.txs[0].price_usd, 123.0);
     }
 
     #[test]

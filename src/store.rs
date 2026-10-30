@@ -5,7 +5,8 @@
 //! showing something that was not saved.
 
 use morlaco::chain::{Chain, WalletId};
-use morlaco::db::Database;
+use morlaco::db::{Database, WalletMode};
+use morlaco::portfolio::PricedTx;
 use morlaco::portfolio::{History, SETTING_ETHERSCAN_KEY, SETTING_NODEREAL_KEY};
 use morlaco::{Error, Result};
 
@@ -21,6 +22,8 @@ pub struct Wallet {
     pub label: String,
     /// The [`Portfolio::id`] of the portfolio the wallet is in.
     pub portfolio: i64,
+    /// Whether the transactions are downloaded or entered by the user.
+    pub mode: WalletMode,
 }
 
 /// A named group of wallets.
@@ -33,12 +36,26 @@ pub struct Portfolio {
 }
 
 impl Wallet {
-    /// The label if there is one, otherwise a shortened address.
+    /// Whether the user enters the transactions of this wallet.
+    pub fn is_manual(&self) -> bool {
+        self.mode == WalletMode::Manual
+    }
+
+    /// Whether the wallet has a real address. A manual wallet created from
+    /// scratch has none.
+    pub fn has_address(&self) -> bool {
+        !morlaco::db::is_made_up(&self.id.address)
+    }
+
+    /// The label if there is one, otherwise a shortened address. A manual
+    /// wallet has no real address to show, so it falls back to the network.
     pub fn display_name(&self) -> String {
-        if self.label.is_empty() {
-            crate::format::short_address(&self.id.address)
-        } else {
+        if !self.label.is_empty() {
             self.label.clone()
+        } else if !self.has_address() {
+            format!("Manual {}", self.id.chain.name())
+        } else {
+            crate::format::short_address(&self.id.address)
         }
     }
 }
@@ -66,6 +83,7 @@ impl Store {
                 id: w.id,
                 label: w.label,
                 portfolio: w.portfolio,
+                mode: w.mode,
             })
             .collect();
         let portfolios: Vec<Portfolio> = db
@@ -198,8 +216,53 @@ impl Store {
             id: id.clone(),
             label,
             portfolio,
+            mode: WalletMode::Synced,
         });
         Ok(self.wallets.len() - 1)
+    }
+
+    /// Adds a wallet whose transactions the user enters, to the portfolio on
+    /// screen, and returns its index.
+    pub fn add_manual(&mut self, chain: Chain, label: &str) -> Result<usize> {
+        let label = clean_label(label);
+        let portfolio = self.active;
+        let id = self.db.add_manual_wallet(chain, &label, portfolio)?;
+        self.wallets.push(Wallet {
+            id,
+            label,
+            portfolio,
+            mode: WalletMode::Manual,
+        });
+        Ok(self.wallets.len() - 1)
+    }
+
+    /// Makes the wallet at `index` manual, keeping its transactions. See
+    /// [`Database::convert_to_manual`].
+    pub fn convert_to_manual(&mut self, index: usize) -> Result<()> {
+        if let Some(wallet) = self.wallets.get_mut(index) {
+            self.db.convert_to_manual(&wallet.id)?;
+            wallet.mode = WalletMode::Manual;
+        }
+        Ok(())
+    }
+
+    /// Saves a transaction of a manual wallet. `replacing` is the id of the
+    /// transaction it edits, if any.
+    pub fn save_manual_tx(
+        &self,
+        wallet: &WalletId,
+        replacing: Option<&str>,
+        tx: &PricedTx,
+    ) -> Result<()> {
+        match replacing {
+            Some(old) => self.db.replace_manual_tx(wallet, old, tx),
+            None => self.db.put_manual_tx(wallet, tx),
+        }
+    }
+
+    /// Removes a transaction of a manual wallet.
+    pub fn delete_manual_tx(&self, wallet: &WalletId, txid: &str) -> Result<()> {
+        self.db.delete_manual_tx(wallet, txid)
     }
 
     /// Changes the label of the wallet at `index`, if it exists. An empty
