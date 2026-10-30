@@ -40,6 +40,7 @@ mod tests {
         for name in [
             "scalable/actions/sidebar-show-symbolic.svg",
             "scalable/actions/go-home-symbolic.svg",
+            "scalable/mimetypes/x-office-calendar-symbolic.svg",
             "scalable/apps/io.github.jeronimoalbi.Morlaco-symbolic.svg",
         ] {
             let path = format!("{RESOURCE_PATH}/{name}");

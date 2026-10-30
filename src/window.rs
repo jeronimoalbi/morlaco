@@ -13,13 +13,13 @@ use gtk4 as gtk;
 use libadwaita as adw;
 
 use adw::prelude::*;
-use morlaco::chain::{Chain, WalletId};
+use morlaco::chain::{Activity, Chain, WalletId};
 use morlaco::db::Database;
 use morlaco::lots::{Lot, Summary};
 use morlaco::paths;
-use morlaco::portfolio::{self, Entry, History, Portfolio};
+use morlaco::portfolio::{self, Entry, History, Portfolio, PricedTx};
 use morlaco::price::{CachedPrices, LivePrices, PriceSource};
-use morlaco::util::date_string;
+use morlaco::util::{date_string, parse_date_utc, parse_units, units_to_text};
 
 use crate::encryption;
 use crate::format;
@@ -113,6 +113,72 @@ impl State {
             }
         }
         self.recompute();
+    }
+
+    /// Reads the saved history of `wallet` again and recomputes the figures.
+    /// Used after the user edits a manual wallet.
+    fn reload_saved(&mut self, wallet: &WalletId) {
+        match self.store.saved_history(wallet) {
+            Ok(Some(history)) => {
+                self.histories.insert(wallet.clone(), history);
+            }
+            Ok(None) => {}
+            Err(err) => glib::g_warning!("morlaco", "could not read saved data: {err}"),
+        }
+        self.recompute();
+    }
+
+    /// Saves a transaction the user typed into a manual wallet. `replacing`
+    /// is the id of the transaction being edited. Refuses an id that another
+    /// transaction of the wallet already has, so nothing is overwritten
+    /// unnoticed.
+    fn save_manual_tx(
+        &mut self,
+        wallet: &WalletId,
+        replacing: Option<&str>,
+        tx: &PricedTx,
+    ) -> Result<(), String> {
+        let taken = self.histories.get(wallet).is_some_and(|h| {
+            h.txs.iter().any(|t| {
+                t.activity.txid == tx.activity.txid && replacing != Some(t.activity.txid.as_str())
+            })
+        });
+        if taken {
+            return Err("this wallet already has a transaction with that ID".to_owned());
+        }
+        self.store
+            .save_manual_tx(wallet, replacing, tx)
+            .map_err(|e| e.to_string())?;
+        self.reload_saved(wallet);
+        Ok(())
+    }
+
+    /// Removes a transaction of a manual wallet.
+    fn delete_manual_tx(&mut self, wallet: &WalletId, txid: &str) -> Result<(), String> {
+        self.store
+            .delete_manual_tx(wallet, txid)
+            .map_err(|e| e.to_string())?;
+        self.reload_saved(wallet);
+        Ok(())
+    }
+
+    /// The manual wallet that is open, if one is.
+    fn open_manual_wallet(&self) -> Option<&Wallet> {
+        let Selection::Wallet(i) = self.selection else {
+            return None;
+        };
+        self.store.wallets.get(i).filter(|w| w.is_manual())
+    }
+
+    /// A transaction of the wallet that is open, by id.
+    fn open_tx(&self, txid: &str) -> Option<PricedTx> {
+        let wallet = self.open_manual_wallet()?;
+        self.histories
+            .get(&wallet.id)?
+            .txs
+            .iter()
+            .find(|t| t.activity.txid == txid)
+            .cloned()
     }
 
     /// Keeps the keys that now open the database.
@@ -362,6 +428,7 @@ pub struct Ui {
     holdings: SummaryView,
     lots: PagedList,
     history: PagedList,
+    history_bar: HistoryBar,
     state: RefCell<State>,
     /// Incremented on every load or selection so late answers are dropped.
     generation: Cell<u64>,
@@ -475,7 +542,7 @@ impl Ui {
 
         let (overview, overview_wallets, overview_warning, overview_box) = overview_page();
 
-        let (holdings, lots, history, view_stack) = wallet_pages();
+        let (holdings, lots, history, history_bar, view_stack) = wallet_pages();
 
         // Page states: empty, loading, error, overview, data
         let empty_page = empty_page();
@@ -570,6 +637,7 @@ impl Ui {
             holdings,
             lots,
             history,
+            history_bar,
             state: RefCell::new(State {
                 store,
                 keys,
@@ -601,6 +669,17 @@ impl Ui {
         self.add_action("recovery-key", |ui| ui.show_recovery_key_dialog());
         self.add_action("data-providers", |ui| ui.show_data_providers_dialog());
         self.add_action("clear-data", |ui| ui.confirm_clear_data());
+        self.add_action("add-manual-tx", |ui| ui.show_tx_dialog(None));
+        self.add_action("convert-to-manual", |ui| ui.show_convert_dialog());
+        self.add_tx_action("edit-manual-tx", |ui, txid| {
+            let tx = ui.state.borrow().open_tx(&txid);
+            if let Some(tx) = tx {
+                ui.show_tx_dialog(Some(tx));
+            }
+        });
+        self.add_tx_action("delete-manual-tx", |ui, txid| {
+            ui.show_delete_tx_dialog(txid)
+        });
 
         // Portfolios. The state of the radio action is the id on screen, so
         // the menu draws a check mark next to it.
@@ -692,6 +771,18 @@ impl Ui {
         self.window.add_action(&action);
     }
 
+    /// An action that takes a transaction id.
+    fn add_tx_action(self: &Rc<Self>, name: &str, f: impl Fn(&Rc<Self>, String) + 'static) {
+        let ui = self.clone();
+        let action = gio::SimpleAction::new(name, Some(glib::VariantTy::STRING));
+        action.connect_activate(move |_, param| {
+            if let Some(txid) = param.and_then(|p| p.get::<String>()) {
+                f(&ui, txid);
+            }
+        });
+        self.window.add_action(&action);
+    }
+
     fn toast(&self, message: &str) {
         self.toasts.add_toast(adw::Toast::new(message));
     }
@@ -737,15 +828,9 @@ impl Ui {
                 .use_markup(false)
                 .activatable(true)
                 .build();
-            let mut subtitle = Vec::new();
-            if show_network {
-                subtitle.push(wallet.id.chain.name().to_owned());
-            }
-            if !wallet.label.is_empty() {
-                subtitle.push(format::short_address(&wallet.id.address));
-            }
+            let subtitle = sidebar_subtitle(wallet, show_network);
             if !subtitle.is_empty() {
-                row.set_subtitle(&subtitle.join(" · "));
+                row.set_subtitle(&subtitle);
             }
 
             let rename = gtk::Button::builder()
@@ -793,10 +878,7 @@ impl Ui {
     }
 
     fn show_add_dialog(self: &Rc<Self>) {
-        let dialog = adw::AlertDialog::new(
-            Some("Add Wallet"),
-            Some("Enter an address to track. Only public blockchain data is read."),
-        );
+        let dialog = adw::AlertDialog::new(Some("Add Wallet"), Some(SYNCED_BODY));
         dialog.add_responses(&[("cancel", "_Cancel"), ("add", "_Add")]);
         dialog.set_response_appearance("add", adw::ResponseAppearance::Suggested);
         dialog.set_response_enabled("add", false);
@@ -813,7 +895,15 @@ impl Ui {
             .build();
         let address = adw::EntryRow::builder().title("Address").build();
         let label = adw::EntryRow::builder().title("Label (optional)").build();
+        let mode = adw::ComboRow::builder()
+            .title("Transactions")
+            .model(&gtk::StringList::new(&[
+                "Synced from an address",
+                "Entered by me",
+            ]))
+            .build();
         let fields = boxed_list();
+        fields.append(&mode);
         fields.append(&network);
         fields.append(&address);
         fields.append(&label);
@@ -829,15 +919,35 @@ impl Ui {
             }
         };
 
-        // Adding is possible once the address looks right for the network.
+        // A manual wallet has no address; the rest of the dialog follows the
+        // choice, so the two kinds are never mixed up.
+        let is_manual = {
+            let mode = mode.clone();
+            move || mode.selected() == MODE_MANUAL
+        };
+
+        // Adding is possible once the address looks right for the network, or
+        // at once for a manual wallet.
         let validate: Rc<dyn Fn()> = {
-            let (address, dialog, chosen_chain) =
-                (address.clone(), dialog.clone(), chosen_chain.clone());
+            let (address, dialog, chosen_chain, is_manual) = (
+                address.clone(),
+                dialog.clone(),
+                chosen_chain.clone(),
+                is_manual.clone(),
+            );
             Rc::new(move || {
-                let valid = chosen_chain().check_address(address.text().trim()).is_ok();
+                let valid =
+                    is_manual() || chosen_chain().check_address(address.text().trim()).is_ok();
                 dialog.set_response_enabled("add", valid);
             })
         };
+        let (mode_dialog, mode_address, mode_validate) =
+            (dialog.clone(), address.clone(), validate.clone());
+        mode.connect_selected_notify(move |row| {
+            apply_wallet_mode(&mode_dialog, row, &mode_address);
+            mode_validate();
+        });
+        apply_wallet_mode(&dialog, &mode, &address);
         // Pasting an address picks its network, unless the one already chosen
         // fits it too (several chains may share an address format).
         let on_address = validate.clone();
@@ -867,9 +977,201 @@ impl Ui {
 
         let ui = self.clone();
         dialog.connect_response(None, move |_, response| {
-            if response == "add" {
+            if response != "add" {
+                return;
+            }
+            if is_manual() {
+                ui.add_manual_wallet(chosen_chain(), label.text().as_str());
+            } else {
                 let wallet = WalletId::new(chosen_chain(), address.text().trim());
                 ui.add_wallet(&wallet, label.text().as_str());
+            }
+        });
+        dialog.present(Some(&self.window));
+    }
+
+    // --- Manual wallets --------------------------------------------------
+
+    /// Asks before a synced wallet becomes manual. It cannot go back.
+    fn show_convert_dialog(self: &Rc<Self>) {
+        if self.running.get() > 0 {
+            self.toast("Wait for the refresh to finish first");
+            return;
+        }
+        let Selection::Wallet(index) = self.state.borrow().selection else {
+            return;
+        };
+        let dialog = adw::AlertDialog::new(
+            Some("Edit This Wallet Manually?"),
+            Some(
+                "It will stop syncing with the blockchain. The transactions it has now are \
+                 kept, and you can edit or delete them and add your own. This can’t be undone.",
+            ),
+        );
+        dialog.add_responses(&[("cancel", "_Cancel"), ("convert", "_Edit Manually")]);
+        dialog.set_response_appearance("convert", adw::ResponseAppearance::Destructive);
+        dialog.set_close_response("cancel");
+        let ui = self.clone();
+        dialog.connect_response(None, move |_, response| {
+            if response == "convert" {
+                ui.convert_to_manual(index);
+            }
+        });
+        dialog.present(Some(&self.window));
+    }
+
+    fn convert_to_manual(self: &Rc<Self>, index: usize) {
+        let converted = self.state.borrow_mut().store.convert_to_manual(index);
+        match converted {
+            Ok(()) => {
+                self.rebuild_sidebar();
+                self.render();
+            }
+            Err(err) => self.toast(&format!("Couldn’t change the wallet: {err}")),
+        }
+    }
+
+    /// The form to add a transaction to the open manual wallet, or to edit
+    /// `editing`.
+    fn show_tx_dialog(self: &Rc<Self>, editing: Option<PricedTx>) {
+        let Some(wallet) = self.state.borrow().open_manual_wallet().cloned() else {
+            return;
+        };
+        let decimals = wallet.id.chain.decimals();
+        let title = if editing.is_some() {
+            "Edit Transaction"
+        } else {
+            "Add Transaction"
+        };
+        let dialog = adw::AlertDialog::new(Some(title), None);
+        dialog.add_responses(&[("cancel", "_Cancel"), ("save", "_Save")]);
+        dialog.set_response_appearance("save", adw::ResponseAppearance::Suggested);
+        dialog.set_close_response("cancel");
+
+        let rows = Rc::new(TxRows::new(wallet.id.chain.symbol()));
+        match &editing {
+            Some(tx) => rows.fill(tx, decimals),
+            None => rows.date.set_text(&date_string(
+                glib::DateTime::now_utc().map_or(0, |t| t.to_unix()),
+            )),
+        }
+        dialog.set_extra_child(Some(&rows.layout()));
+
+        // Saving is possible once the fields make sense; the hint follows the
+        // type chosen.
+        let refresh: Rc<dyn Fn()> = {
+            let (dialog, rows) = (dialog.clone(), rows.clone());
+            Rc::new(move || {
+                let kind = rows.kind();
+                rows.txid.set_visible(kind.is_transfer);
+                rows.hint.set_label(kind.hint);
+                dialog.set_response_enabled("save", rows.read(decimals).is_ok());
+            })
+        };
+        rows.connect_changed(&refresh);
+        refresh();
+
+        let ui = self.clone();
+        dialog.connect_response(None, move |_, response| {
+            if let ("save", Ok(form)) = (response, rows.read(decimals)) {
+                ui.save_tx(&wallet.id, editing.as_ref(), &form);
+            }
+        });
+        dialog.present(Some(&self.window));
+    }
+
+    /// Builds the transaction from the form and saves it. Without a price it
+    /// first looks up the market price of that day.
+    fn save_tx(self: &Rc<Self>, wallet: &WalletId, editing: Option<&PricedTx>, form: &TxForm) {
+        let original = editing.map(|t| &t.activity);
+        let activity = form.activity(original);
+        let replacing = original.map(|a| a.txid.clone());
+        match form.price_usd {
+            Some(price_usd) => {
+                let tx = PricedTx {
+                    activity,
+                    price_usd,
+                };
+                self.store_tx(wallet, replacing.as_deref(), tx);
+            }
+            None => self.save_at_market_price(wallet, replacing, activity),
+        }
+    }
+
+    fn save_at_market_price(
+        self: &Rc<Self>,
+        wallet: &WalletId,
+        replacing: Option<String>,
+        activity: Activity,
+    ) {
+        self.toast("Looking up the market price…");
+        let (ui, wallet) = (self.clone(), wallet.clone());
+        let key = self.state.borrow().keys.database_key();
+        glib::spawn_future_local(async move {
+            let found = market_price(key, wallet.chain, activity.time).await;
+            ui.store_tx_at(&wallet, replacing.as_deref(), activity, found);
+        });
+    }
+
+    /// Saves `activity` at the price that was looked up, or tells the user
+    /// why it could not be.
+    fn store_tx_at(
+        self: &Rc<Self>,
+        wallet: &WalletId,
+        replacing: Option<&str>,
+        activity: Activity,
+        price: Result<f64, String>,
+    ) {
+        match price {
+            Ok(price_usd) => {
+                let tx = PricedTx {
+                    activity,
+                    price_usd,
+                };
+                self.store_tx(wallet, replacing, tx);
+            }
+            Err(message) => self.toast(&format!(
+                "Couldn’t look up the price: {message}. Enter it yourself."
+            )),
+        }
+    }
+
+    fn store_tx(self: &Rc<Self>, wallet: &WalletId, replacing: Option<&str>, tx: PricedTx) {
+        let saved = self
+            .state
+            .borrow_mut()
+            .save_manual_tx(wallet, replacing, &tx);
+        match saved {
+            Ok(()) => self.render(),
+            Err(message) => self.toast(&format!("Couldn’t save the transaction: {message}")),
+        }
+    }
+
+    fn show_delete_tx_dialog(self: &Rc<Self>, txid: String) {
+        let Some(wallet) = self
+            .state
+            .borrow()
+            .open_manual_wallet()
+            .map(|w| w.id.clone())
+        else {
+            return;
+        };
+        let dialog = adw::AlertDialog::new(
+            Some("Delete Transaction?"),
+            Some("The wallet’s balance and cost basis are worked out again without it."),
+        );
+        dialog.add_responses(&[("cancel", "_Cancel"), ("delete", "_Delete")]);
+        dialog.set_response_appearance("delete", adw::ResponseAppearance::Destructive);
+        dialog.set_close_response("cancel");
+        let ui = self.clone();
+        dialog.connect_response(None, move |_, response| {
+            if response != "delete" {
+                return;
+            }
+            let deleted = ui.state.borrow_mut().delete_manual_tx(&wallet, &txid);
+            match deleted {
+                Ok(()) => ui.render(),
+                Err(message) => ui.toast(&format!("Couldn’t delete the transaction: {message}")),
             }
         });
         dialog.present(Some(&self.window));
@@ -1535,6 +1837,17 @@ impl Ui {
         self.select(Selection::Wallet(index));
     }
 
+    fn add_manual_wallet(self: &Rc<Self>, chain: Chain, label: &str) {
+        let added = self.state.borrow_mut().store.add_manual(chain, label);
+        match added {
+            Ok(index) => {
+                self.rebuild_sidebar();
+                self.select(Selection::Wallet(index));
+            }
+            Err(err) => self.toast(&format!("Couldn’t add the wallet: {err}")),
+        }
+    }
+
     fn remove_wallet(self: &Rc<Self>, index: usize) {
         let removed = self.state.borrow_mut().remove_wallet(index);
         match removed {
@@ -1769,7 +2082,7 @@ impl Ui {
         let chain = wallet.id.chain;
         self.holdings.update(
             &wallet.display_name(),
-            &format::short_address(&wallet.id.address),
+            &wallet_subtitle(wallet),
             &p.summary,
             Some(CoinFigures {
                 chain,
@@ -1790,9 +2103,11 @@ impl Ui {
                     .build(),
             );
         }
+        let manual = wallet.is_manual();
+        self.history_bar.show_for(manual);
         self.history
             .fill(p.history.len(), p.history.iter().rev(), |entry| {
-                history_row(entry, chain, hidden)
+                history_row(entry, chain, hidden, manual)
             });
     }
 
@@ -1810,9 +2125,10 @@ impl Ui {
     fn show_more_history(&self) {
         self.with_selected_portfolio(|wallet, p, hidden| {
             let chain = wallet.id.chain;
+            let manual = wallet.is_manual();
             self.history
                 .extend(p.history.len(), p.history.iter().rev(), |entry| {
-                    history_row(entry, chain, hidden)
+                    history_row(entry, chain, hidden, manual)
                 });
         });
     }
@@ -1831,6 +2147,277 @@ impl Ui {
             f(wallet, p, state.store.hidden);
         }
     }
+}
+
+/// What the add dialog says for each kind of wallet.
+const SYNCED_BODY: &str = "Enter an address to track. Only public blockchain data is read.";
+const MANUAL_BODY: &str = "Pick the network and a name, then add the transactions yourself.";
+const SYNCED_HINT: &str = "Downloaded from the blockchain; can’t be edited.";
+const MANUAL_HINT: &str = "For an exchange account, or to correct what a synced wallet got wrong.";
+
+/// Position of "Entered by me" in the add dialog.
+const MODE_MANUAL: u32 = 1;
+
+/// Makes the add dialog say and ask what fits the kind of wallet chosen.
+fn apply_wallet_mode(dialog: &adw::AlertDialog, mode: &adw::ComboRow, address: &adw::EntryRow) {
+    let manual = mode.selected() == MODE_MANUAL;
+    address.set_visible(!manual);
+    mode.set_subtitle(if manual { MANUAL_HINT } else { SYNCED_HINT });
+    dialog.set_body(if manual { MANUAL_BODY } else { SYNCED_BODY });
+}
+
+/// One choice in the transaction form.
+#[derive(Clone, Copy)]
+struct TxKind {
+    name: &'static str,
+    /// Whether coins come in.
+    incoming: bool,
+    /// Whether it moves coins to or from a place that is tracked on a chain.
+    is_transfer: bool,
+    hint: &'static str,
+}
+
+const TX_KINDS: [TxKind; 4] = [
+    TxKind {
+        name: "Buy",
+        incoming: true,
+        is_transfer: false,
+        hint: "Coins you bought. The price is what one coin cost you.",
+    },
+    TxKind {
+        name: "Sell",
+        incoming: false,
+        is_transfer: false,
+        hint: "Coins you sold. The price is what one coin sold for.",
+    },
+    TxKind {
+        name: "Transfer in",
+        incoming: true,
+        is_transfer: true,
+        hint: "Coins that arrived from another wallet. With its transaction ID, it keeps \
+               the cost basis of the wallet it came from if you track that one.",
+    },
+    TxKind {
+        name: "Transfer out",
+        incoming: false,
+        is_transfer: true,
+        hint: "Coins sent to another wallet. Enter the transaction ID the blockchain shows \
+               so the other wallet is linked to it and keeps the cost basis. Put the network \
+               fee in Fee, not in Amount.",
+    },
+];
+
+impl TxKind {
+    /// The row of [`TX_KINDS`] for a stored transaction.
+    fn position_of(incoming: bool, is_transfer: bool) -> u32 {
+        TX_KINDS
+            .iter()
+            .position(|k| k.incoming == incoming && k.is_transfer == is_transfer)
+            .and_then(|i| u32::try_from(i).ok())
+            .unwrap_or(0)
+    }
+}
+
+/// The fields of the transaction form.
+struct TxRows {
+    kind: adw::ComboRow,
+    date: adw::EntryRow,
+    amount: adw::EntryRow,
+    fee: adw::EntryRow,
+    price: adw::EntryRow,
+    txid: adw::EntryRow,
+    hint: gtk::Label,
+}
+
+impl TxRows {
+    fn new(symbol: &str) -> Self {
+        let names: Vec<&str> = TX_KINDS.iter().map(|k| k.name).collect();
+        let entry = |title: String| adw::EntryRow::builder().title(title).build();
+        let date = entry("Date (YYYY-MM-DD)".to_owned());
+        date.add_suffix(&date_picker(&date));
+        Self {
+            kind: adw::ComboRow::builder()
+                .title("Type")
+                .model(&gtk::StringList::new(&names))
+                .build(),
+            date,
+            amount: entry(format!("Amount ({symbol})")),
+            fee: entry(format!("Fee in {symbol} (optional)")),
+            price: entry("Price per coin in USD (empty: market price of that day)".to_owned()),
+            txid: entry("Transaction ID on the blockchain".to_owned()),
+            hint: gtk::Label::builder()
+                .css_classes(["dim-label", "caption"])
+                .wrap(true)
+                .xalign(0.0)
+                .build(),
+        }
+    }
+
+    /// The fields and the hint, stacked.
+    fn layout(&self) -> gtk::Box {
+        let fields = boxed_list();
+        fields.append(&self.kind);
+        for row in self.entries() {
+            fields.append(row);
+        }
+        let content = gtk::Box::builder()
+            .orientation(gtk::Orientation::Vertical)
+            .spacing(12)
+            .build();
+        content.append(&fields);
+        content.append(&self.hint);
+        content
+    }
+
+    fn entries(&self) -> [&adw::EntryRow; 5] {
+        [&self.date, &self.amount, &self.fee, &self.price, &self.txid]
+    }
+
+    fn kind(&self) -> TxKind {
+        TX_KINDS[(self.kind.selected() as usize).min(TX_KINDS.len() - 1)]
+    }
+
+    /// Calls `refresh` whenever a field changes.
+    fn connect_changed(&self, refresh: &Rc<dyn Fn()>) {
+        for row in self.entries() {
+            let refresh = refresh.clone();
+            row.connect_changed(move |_| refresh());
+        }
+        let refresh = refresh.clone();
+        self.kind.connect_selected_notify(move |_| refresh());
+    }
+
+    /// Shows the transaction being edited.
+    fn fill(&self, tx: &PricedTx, decimals: u8) {
+        let a = &tx.activity;
+        let made_up = morlaco::db::is_made_up(&a.txid);
+        self.kind
+            .set_selected(TxKind::position_of(a.amount > 0, !made_up));
+        self.date.set_text(&date_string(a.time));
+        self.amount
+            .set_text(&units_to_text(a.amount.unsigned_abs(), decimals));
+        if a.fee > 0 {
+            self.fee.set_text(&units_to_text(a.fee, decimals));
+        }
+        self.price.set_text(&tx.price_usd.to_string());
+        if !made_up {
+            self.txid.set_text(&a.txid);
+        }
+    }
+
+    fn read(&self, decimals: u8) -> Result<TxForm, &'static str> {
+        TxForm::read(
+            self.kind(),
+            &self.date.text(),
+            &self.amount.text(),
+            &self.fee.text(),
+            &self.price.text(),
+            &self.txid.text(),
+            decimals,
+        )
+    }
+}
+
+/// The market price of `chain`'s coin at `time`, looked up on a worker thread.
+async fn market_price(key: String, chain: Chain, time: i64) -> Result<f64, String> {
+    gio::spawn_blocking(move || {
+        let cache = open_database(&key)?;
+        CachedPrices::new(LivePrices, &cache)
+            .usd_at(chain, time)
+            .map_err(|e| e.to_string())
+    })
+    .await
+    .unwrap_or_else(|_| Err("the worker thread crashed".to_owned()))
+}
+
+/// What the user typed in the transaction form, checked.
+struct TxForm {
+    kind: TxKind,
+    time: i64,
+    /// Date as typed, to tell whether an edit moved the transaction.
+    date: String,
+    units: u128,
+    fee: u128,
+    price_usd: Option<f64>,
+    txid: Option<String>,
+}
+
+impl TxForm {
+    /// Checks the fields. The error says what is wrong, for the form to show.
+    fn read(
+        kind: TxKind,
+        date: &str,
+        amount: &str,
+        fee: &str,
+        price: &str,
+        txid: &str,
+        decimals: u8,
+    ) -> Result<Self, &'static str> {
+        let time = parse_date_utc(date).ok_or("The date must look like 2024-03-31.")?;
+        let units = parse_units(amount, decimals)
+            .filter(|u| *u > 0)
+            .ok_or("The amount must be a number above zero.")?;
+        let fee = match fee.trim() {
+            "" => 0,
+            text => parse_units(text, decimals).ok_or("The fee must be a number.")?,
+        };
+        let price_usd = match price.trim() {
+            "" => None,
+            text => Some(
+                text.replace(',', ".")
+                    .parse::<f64>()
+                    .ok()
+                    .filter(|p| p.is_finite() && *p >= 0.0)
+                    .ok_or("The price must be a number.")?,
+            ),
+        };
+        let txid = Some(txid.trim().to_owned()).filter(|t| kind.is_transfer && !t.is_empty());
+        Ok(Self {
+            kind,
+            time,
+            date: date.trim().to_owned(),
+            units,
+            fee,
+            price_usd,
+            txid,
+        })
+    }
+
+    /// The transaction this form describes. `original` is the one being
+    /// edited: if the date did not change it keeps its block and exact time,
+    /// so it stays where it was among the synced ones.
+    fn activity(&self, original: Option<&Activity>) -> Activity {
+        let amount = i128::try_from(self.units).unwrap_or(i128::MAX);
+        let amount = if self.kind.incoming { amount } else { -amount };
+        let same_day = original.is_some_and(|a| date_string(a.time) == self.date);
+        let kept = original.filter(|_| same_day);
+        let txid = self
+            .txid
+            .clone()
+            .or_else(|| {
+                original
+                    .filter(|a| morlaco::db::is_made_up(&a.txid))
+                    .map(|a| a.txid.clone())
+            })
+            .unwrap_or_else(new_manual_txid);
+        Activity {
+            txid,
+            height: kept.map_or(0, |a| a.height),
+            index: kept.and_then(|a| a.index),
+            time: kept.map_or(self.time, |a| a.time),
+            amount,
+            fee: self.fee,
+            parents: kept.map(|a| a.parents.clone()).unwrap_or_default(),
+        }
+    }
+}
+
+/// An id for a transaction the user typed without one.
+fn new_manual_txid() -> String {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos());
+    format!("{}{nanos}", morlaco::db::MANUAL_PREFIX)
 }
 
 /// A dialog with a single name field.
@@ -1968,22 +2555,13 @@ fn lot_row(lot: &Lot, price_now_usd: f64, chain: Chain, hidden: bool) -> adw::Ac
     row
 }
 
-/// One transaction as a row that opens it in the block explorer.
-fn history_row(entry: &Entry, chain: Chain, hidden: bool) -> adw::ActionRow {
+/// One transaction as a row. On a synced wallet it opens the block explorer;
+/// on a manual one it opens the editor and has a button to delete it.
+fn history_row(entry: &Entry, chain: Chain, hidden: bool, manual: bool) -> adw::ActionRow {
     let activity = &entry.activity;
-    let kind = if entry.internal_units > 0 {
-        "Transfer between your wallets · "
-    } else {
-        ""
-    };
     let row = adw::ActionRow::builder()
         .title(date_string(activity.time))
-        .subtitle(format!(
-            "{kind}{} · {} at {}",
-            format::short_address(&activity.txid),
-            chain.symbol(),
-            format::usd(entry.price_usd, false)
-        ))
+        .subtitle(history_subtitle(entry, chain))
         .use_markup(false)
         .activatable(true)
         .build();
@@ -1994,12 +2572,126 @@ fn history_row(entry: &Entry, chain: Chain, hidden: bool) -> adw::ActionRow {
     tone(&label, change as f64, hidden);
     row.add_suffix(&label);
 
+    if manual {
+        row.set_action_name(Some("win.edit-manual-tx"));
+        row.set_action_target_value(Some(&activity.txid.to_variant()));
+        let delete = gtk::Button::builder()
+            .icon_name("user-trash-symbolic")
+            .tooltip_text("Delete Transaction")
+            .valign(gtk::Align::Center)
+            .css_classes(["flat"])
+            .action_name("win.delete-manual-tx")
+            .action_target(&activity.txid.to_variant())
+            .build();
+        row.add_suffix(&delete);
+        return row;
+    }
+
     let uri = chain.explorer_tx_url(&activity.txid);
     row.connect_activated(move |_| {
         // Opening a browser can fail on a headless system; nothing to recover.
         let _ = gio::AppInfo::launch_default_for_uri(&uri, None::<&gio::AppLaunchContext>);
     });
     row
+}
+
+/// What goes under a transaction's date: whether it moved between the
+/// user's wallets, where it came from and the price it was valued at.
+fn history_subtitle(entry: &Entry, chain: Chain) -> String {
+    let kind = if entry.internal_units > 0 {
+        "Transfer between your wallets · "
+    } else {
+        ""
+    };
+    let id = if morlaco::db::is_made_up(&entry.activity.txid) {
+        "Entered by you".to_owned()
+    } else {
+        format::short_address(&entry.activity.txid)
+    };
+    format!(
+        "{kind}{id} · {} at {}",
+        chain.symbol(),
+        format::usd(entry.price_usd, false)
+    )
+}
+
+/// What goes under a wallet's name in the sidebar, empty when nothing does.
+/// The network is named only when `show_network`.
+fn sidebar_subtitle(wallet: &Wallet, show_network: bool) -> String {
+    let mut parts = Vec::new();
+    if show_network {
+        parts.push(wallet.id.chain.name().to_owned());
+    }
+    if wallet.is_manual() {
+        parts.push("Manual".to_owned());
+    }
+    // Without a label the address is already the title.
+    if !wallet.label.is_empty() && wallet.has_address() {
+        parts.push(format::short_address(&wallet.id.address));
+    }
+    parts.join(" · ")
+}
+
+/// What goes under a wallet's name on its page.
+fn wallet_subtitle(wallet: &Wallet) -> String {
+    let address = if wallet.has_address() {
+        format::short_address(&wallet.id.address)
+    } else {
+        wallet.id.chain.name().to_owned()
+    };
+    if wallet.is_manual() {
+        format!("Manual · {address}")
+    } else {
+        address
+    }
+}
+
+/// The strip above a wallet's transactions. It says where they come from and
+/// offers the one action that fits: add one, or take over a synced wallet.
+struct HistoryBar {
+    root: gtk::Box,
+    note: gtk::Label,
+    button: gtk::Button,
+}
+
+impl HistoryBar {
+    fn new() -> Self {
+        let note = gtk::Label::builder()
+            .css_classes(["dim-label"])
+            .wrap(true)
+            .xalign(0.0)
+            .hexpand(true)
+            .build();
+        let button = gtk::Button::builder().valign(gtk::Align::Center).build();
+        let root = gtk::Box::builder()
+            .orientation(gtk::Orientation::Horizontal)
+            .spacing(12)
+            .build();
+        root.append(&note);
+        root.append(&button);
+        Self { root, note, button }
+    }
+
+    fn show_for(&self, manual: bool) {
+        if manual {
+            self.note
+                .set_label("You enter this wallet’s transactions yourself.");
+            self.button.set_label("Add Transaction");
+            self.button.set_action_name(Some("win.add-manual-tx"));
+            self.button.add_css_class("suggested-action");
+            self.button
+                .set_tooltip_text(Some("Record a purchase, sale or transfer"));
+        } else {
+            self.note
+                .set_label("Synced from the blockchain. These can’t be edited.");
+            self.button.set_label("Edit Manually…");
+            self.button.set_action_name(Some("win.convert-to-manual"));
+            self.button.remove_css_class("suggested-action");
+            self.button.set_tooltip_text(Some(
+                "Stop syncing and take over this wallet’s transactions",
+            ));
+        }
+    }
 }
 
 /// The sidebar: portfolio switcher, add button and the wallet list.
@@ -2055,7 +2747,13 @@ fn overview_page() -> (SummaryView, gtk::ListBox, gtk::Label, gtk::Box) {
 }
 
 /// The two tabs of a wallet: holdings with lots, and transactions.
-fn wallet_pages() -> (SummaryView, PagedList, PagedList, adw::ViewStack) {
+fn wallet_pages() -> (
+    SummaryView,
+    PagedList,
+    PagedList,
+    HistoryBar,
+    adw::ViewStack,
+) {
     let holdings = SummaryView::new();
     let lots = PagedList::new("lots");
     let lots_group = adw::PreferencesGroup::builder()
@@ -2073,7 +2771,9 @@ fn wallet_pages() -> (SummaryView, PagedList, PagedList, adw::ViewStack) {
     ));
 
     let history = PagedList::new("transactions");
+    let history_bar = HistoryBar::new();
     let history_box = page_box();
+    history_box.append(&history_bar.root);
     history_box.append(&history.list);
     history_box.append(&history.footer);
 
@@ -2091,7 +2791,7 @@ fn wallet_pages() -> (SummaryView, PagedList, PagedList, adw::ViewStack) {
         "view-sort-descending-symbolic",
     );
 
-    (holdings, lots, history, view_stack)
+    (holdings, lots, history, history_bar, view_stack)
 }
 
 /// Shown when no wallet is tracked.
@@ -2275,6 +2975,22 @@ fn overview_row(state: &State, wallet: &Wallet, hidden: bool) -> adw::ActionRow 
         .use_markup(false)
         .activatable(true)
         .build();
+    show_overview_figures(&row, state, wallet, hidden);
+    if wallet.is_manual() {
+        row.add_suffix(
+            &gtk::Label::builder()
+                .label("Manual")
+                .css_classes(["dim-label", "caption"])
+                .build(),
+        );
+    }
+    row.add_suffix(&gtk::Image::from_icon_name("go-next-symbolic"));
+    row
+}
+
+/// Shows the balance and gain of a wallet on its overview row, or why they
+/// are missing.
+fn show_overview_figures(row: &adw::ActionRow, state: &State, wallet: &Wallet, hidden: bool) {
     match state.portfolios.get(&wallet.id) {
         Some(p) => {
             row.set_subtitle(&format::amount(p.balance_units, wallet.id.chain, hidden));
@@ -2293,8 +3009,6 @@ fn overview_row(state: &State, wallet: &Wallet, hidden: bool) -> adw::ActionRow 
             row.add_css_class("error");
         }
     }
-    row.add_suffix(&gtk::Image::from_icon_name("go-next-symbolic"));
-    row
 }
 
 /// The selection once the wallet at `removed` is gone.
@@ -2457,6 +3171,76 @@ fn boxed_list() -> gtk::ListBox {
         .build()
 }
 
+/// A calendar to pick the date typed in `entry`. It pops up while the entry
+/// has the focus, and from its button. The entry keeps the focus, so typing
+/// still works with the calendar open.
+fn date_picker(entry: &adw::EntryRow) -> gtk::MenuButton {
+    let calendar = gtk::Calendar::builder().focusable(false).build();
+    let popover = gtk::Popover::builder()
+        .autohide(false)
+        .child(&calendar)
+        .build();
+    let button = gtk::MenuButton::builder()
+        .icon_name("x-office-calendar-symbolic")
+        .tooltip_text("Pick a Date")
+        .valign(gtk::Align::Center)
+        .focus_on_click(false)
+        .css_classes(["flat"])
+        .popover(&popover)
+        .build();
+
+    // The month shown. Picking a day keeps it, while browsing to another month
+    // selects a day there too, which is not a choice yet.
+    let year_month = |date: &glib::DateTime| (date.year(), date.month());
+    let shown = Rc::new(Cell::new(year_month(&calendar.date())));
+    {
+        let (entry, calendar, shown) = (entry.clone(), calendar.clone(), shown.clone());
+        popover.connect_show(move |_| {
+            let typed = parse_date_utc(&entry.text())
+                .and_then(|time| glib::DateTime::from_unix_utc(time).ok());
+            if let Some(date) = typed {
+                shown.set((0, 0));
+                calendar.select_day(&date);
+            }
+            shown.set(year_month(&calendar.date()));
+        });
+    }
+    {
+        let (entry, popover) = (entry.clone(), popover.clone());
+        calendar.connect_day_selected(move |calendar| {
+            let date = calendar.date();
+            if shown.replace(year_month(&date)) != year_month(&date) {
+                return;
+            }
+            if let Ok(text) = date.format("%Y-%m-%d") {
+                entry.set_text(&text);
+            }
+            popover.popdown();
+        });
+    }
+
+    let focus = gtk::EventControllerFocus::new();
+    let on_enter = popover.clone();
+    focus.connect_enter(move |_| on_enter.popup());
+    let on_leave = popover.clone();
+    focus.connect_leave(move |_| on_leave.popdown());
+    entry.add_controller(focus);
+
+    // Escape closes the calendar first, and the dialog only after.
+    let keys = gtk::EventControllerKey::new();
+    keys.set_propagation_phase(gtk::PropagationPhase::Capture);
+    keys.connect_key_pressed(move |_, key, _, _| {
+        if key == gtk::gdk::Key::Escape && popover.is_visible() {
+            popover.popdown();
+            glib::Propagation::Stop
+        } else {
+            glib::Propagation::Proceed
+        }
+    });
+    entry.add_controller(keys);
+    button
+}
+
 fn clear(list: &gtk::ListBox) {
     while let Some(child) = list.first_child() {
         list.remove(&child);
@@ -2528,6 +3312,7 @@ fn show_about(parent: &adw::ApplicationWindow) {
 mod tests {
     use super::*;
     use morlaco::chain::Activity;
+    use morlaco::db::WalletMode;
     use morlaco::portfolio::PricedTx;
 
     fn state() -> State {
@@ -2639,6 +3424,161 @@ mod tests {
         );
         assert_eq!(state.prices_now[&Chain::Bitcoin], 30.0);
         assert!(state.portfolios.contains_key(&wallet()));
+    }
+
+    fn typed_tx(txid: &str, time: i64, amount: i128) -> PricedTx {
+        PricedTx {
+            activity: Activity {
+                txid: txid.to_owned(),
+                height: 0,
+                index: None,
+                time,
+                amount,
+                fee: 0,
+                parents: Vec::new(),
+            },
+            price_usd: 20.0,
+        }
+    }
+
+    /// A state with one open manual wallet and the price of its coin.
+    fn manual_state() -> (State, WalletId) {
+        let mut state = state();
+        let index = state
+            .store
+            .add_manual(Chain::Bitcoin, "Exchange")
+            .expect("add");
+        let id = state.store.wallets[index].id.clone();
+        state.selection = Selection::Wallet(index);
+        state.prices_now.insert(Chain::Bitcoin, 50.0);
+        state.reload_saved(&id);
+        (state, id)
+    }
+
+    #[test]
+    fn typed_transactions_change_the_figures_at_once() {
+        let (mut state, id) = manual_state();
+        state
+            .save_manual_tx(&id, None, &typed_tx("buy", 1_000, 100_000_000))
+            .expect("save");
+
+        let p = &state.portfolios[&id];
+        assert_eq!(p.balance_units, 100_000_000);
+        assert_eq!(p.summary.cost_basis_usd, 20.0);
+
+        state.delete_manual_tx(&id, "buy").expect("delete");
+        assert_eq!(state.portfolios[&id].balance_units, 0);
+    }
+
+    #[test]
+    fn only_transactions_of_the_open_manual_wallet_can_be_edited() {
+        let (mut state, id) = manual_state();
+        state
+            .save_manual_tx(&id, None, &typed_tx("buy", 1_000, 100_000_000))
+            .expect("save");
+
+        let found = state.open_tx("buy").map(|t| t.activity.txid);
+        assert_eq!(found.as_deref(), Some("buy"));
+        assert!(state.open_tx("other").is_none());
+
+        state.selection = Selection::Overview;
+        assert!(state.open_tx("buy").is_none());
+    }
+
+    #[test]
+    fn a_new_transaction_cannot_take_the_id_of_another() {
+        let (mut state, id) = manual_state();
+        state
+            .save_manual_tx(&id, None, &typed_tx("t", 1_000, 100_000_000))
+            .expect("save");
+
+        let again = state.save_manual_tx(&id, None, &typed_tx("t", 2_000, 5));
+        assert!(again.is_err());
+        // Editing a transaction under its own id is not a clash.
+        state
+            .save_manual_tx(&id, Some("t"), &typed_tx("t", 2_000, 5))
+            .expect("edit");
+        assert_eq!(state.portfolios[&id].balance_units, 5);
+    }
+
+    #[test]
+    fn only_a_manual_wallet_is_open_for_editing() {
+        let mut state = state();
+        state.store.add(&wallet(), "").expect("add");
+        state.selection = Selection::Wallet(0);
+        assert!(state.open_manual_wallet().is_none());
+
+        state.store.convert_to_manual(0).expect("convert");
+        assert!(state.open_manual_wallet().is_some());
+    }
+
+    #[test]
+    fn a_converted_wallet_keeps_its_history_and_can_be_corrected() {
+        let mut state = state();
+        state.store.add(&wallet(), "").expect("add");
+        state.merge(fetched(Ok(history())));
+        state.selection = Selection::Wallet(0);
+        state.store.convert_to_manual(0).expect("convert");
+        // Converting has to be allowed to save what is on screen.
+        state
+            .store
+            .database()
+            .replace_history_above(&wallet(), 0, &history().txs)
+            .expect("saved");
+
+        let mut fixed = history().txs[0].clone();
+        fixed.price_usd = 4.0;
+        state
+            .save_manual_tx(&wallet(), Some("a"), &fixed)
+            .expect("fix");
+
+        assert_eq!(state.portfolios[&wallet()].summary.cost_basis_usd, 4.0);
+    }
+
+    fn form(kind: usize, date: &str, txid: &str) -> TxForm {
+        TxForm::read(TX_KINDS[kind], date, "0.5", "0.0001", "", txid, 8).expect("valid")
+    }
+
+    #[test]
+    fn the_form_turns_text_into_a_transaction() {
+        let sell = form(1, "2024-03-31", "ignored").activity(None);
+        assert_eq!(sell.amount, -50_000_000);
+        assert_eq!(sell.fee, 10_000);
+        assert_eq!(sell.height, 0);
+        // Buys and sells get an id of their own, whatever was typed.
+        assert!(morlaco::db::is_made_up(&sell.txid));
+
+        let moved = form(3, "2024-03-31", " abc ").activity(None);
+        assert_eq!(moved.txid, "abc");
+    }
+
+    #[test]
+    fn the_form_rejects_what_it_cannot_read() {
+        let bad = |amount: &str, date: &str, price: &str| {
+            TxForm::read(TX_KINDS[0], date, amount, "", price, "", 8).is_err()
+        };
+        assert!(bad("0", "2024-03-31", ""));
+        assert!(bad("abc", "2024-03-31", ""));
+        assert!(bad("1", "31/03/2024", ""));
+        assert!(bad("1", "2024-03-31", "-5"));
+        assert!(bad("1", "2024-03-31", "free"));
+        assert!(!bad("1", "2024-03-31", "5,5"));
+    }
+
+    #[test]
+    fn editing_without_moving_the_date_keeps_the_block() {
+        let mut original = history().txs[0].activity.clone();
+        original.time = 1_700_000_123;
+
+        let same_day =
+            form(2, &date_string(original.time), &original.txid).activity(Some(&original));
+        assert_eq!(same_day.height, original.height);
+        assert_eq!(same_day.time, original.time);
+        assert_eq!(same_day.txid, original.txid);
+
+        let moved = form(2, "2000-01-01", &original.txid).activity(Some(&original));
+        assert_eq!(moved.height, 0);
+        assert_eq!(date_string(moved.time), "2000-01-01");
     }
 
     #[test]
@@ -2840,5 +3780,83 @@ mod tests {
     fn the_set_aside_message_names_the_file() {
         let message = set_aside_message(Path::new("/data/morlaco.db.old"));
         assert!(message.contains("morlaco.db.old"));
+    }
+
+    fn tracked(address: &str, label: &str, mode: WalletMode) -> Wallet {
+        Wallet {
+            id: WalletId::new(Chain::Bitcoin, address),
+            label: label.to_owned(),
+            portfolio: 1,
+            mode,
+        }
+    }
+
+    fn made_up() -> String {
+        format!("{}1", morlaco::db::MANUAL_PREFIX)
+    }
+
+    #[test]
+    fn the_sidebar_names_what_the_title_does_not() {
+        let address = "bc1qaaaaaaaaaaaaaaaaaaaa";
+        let unlabeled = tracked(address, "", WalletMode::Synced);
+        assert_eq!(sidebar_subtitle(&unlabeled, false), "");
+        assert_eq!(sidebar_subtitle(&unlabeled, true), "Bitcoin");
+
+        let labeled = tracked(address, "Cold", WalletMode::Synced);
+        assert_eq!(
+            sidebar_subtitle(&labeled, true),
+            format!("Bitcoin · {}", format::short_address(address))
+        );
+
+        let converted = tracked(address, "Cold", WalletMode::Manual);
+        assert_eq!(
+            sidebar_subtitle(&converted, false),
+            format!("Manual · {}", format::short_address(address))
+        );
+
+        let typed = tracked(&made_up(), "Exchange", WalletMode::Manual);
+        assert_eq!(sidebar_subtitle(&typed, true), "Bitcoin · Manual");
+    }
+
+    #[test]
+    fn a_wallet_page_shows_the_address_or_the_network() {
+        let address = "bc1qaaaaaaaaaaaaaaaaaaaa";
+        let synced = tracked(address, "", WalletMode::Synced);
+        assert_eq!(wallet_subtitle(&synced), format::short_address(address));
+
+        let converted = tracked(address, "", WalletMode::Manual);
+        assert_eq!(
+            wallet_subtitle(&converted),
+            format!("Manual · {}", format::short_address(address))
+        );
+
+        let typed = tracked(&made_up(), "", WalletMode::Manual);
+        assert_eq!(wallet_subtitle(&typed), "Manual · Bitcoin");
+    }
+
+    fn entry(txid: &str, internal_units: u128) -> Entry {
+        Entry {
+            activity: typed_tx(txid, 1_000, 5).activity,
+            price_usd: 20.0,
+            internal_units,
+        }
+    }
+
+    #[test]
+    fn a_history_row_says_where_the_transaction_came_from() {
+        let txid = "f00dbabef00dbabef00dbabef00dbabe";
+        let price = format::usd(20.0, false);
+        assert_eq!(
+            history_subtitle(&entry(txid, 0), Chain::Bitcoin),
+            format!("{} · BTC at {price}", format::short_address(txid))
+        );
+        assert_eq!(
+            history_subtitle(&entry(&made_up(), 0), Chain::Bitcoin),
+            format!("Entered by you · BTC at {price}")
+        );
+        assert!(
+            history_subtitle(&entry(txid, 5), Chain::Bitcoin)
+                .starts_with("Transfer between your wallets · ")
+        );
     }
 }

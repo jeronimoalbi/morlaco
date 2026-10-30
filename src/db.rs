@@ -20,13 +20,30 @@ use crate::{Error, Result};
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// The layout this version reads and writes.
-const SCHEMA_VERSION: i64 = 3;
+const SCHEMA_VERSION: i64 = 4;
+
+/// What the made-up address of a manual wallet starts with.
+pub const MANUAL_PREFIX: &str = "manual:";
+
+/// Whether `id` was made up for a manual wallet or transaction and is not a
+/// real address or transaction id.
+pub fn is_made_up(id: &str) -> bool {
+    id.starts_with(MANUAL_PREFIX)
+}
 
 /// The name of the portfolio every database starts with.
 pub const DEFAULT_PORTFOLIO_NAME: &str = "Main";
 
 /// Layout version 2 had no portfolios. Opening such a file adds them.
 const VERSION_WITHOUT_PORTFOLIOS: i64 = 2;
+
+/// Layout version 3 had no wallet modes. Opening such a file adds them.
+const VERSION_WITHOUT_MODES: i64 = 3;
+
+/// Whether a file of layout `version` is upgraded in place when opened.
+fn is_upgradable(version: i64) -> bool {
+    matches!(version, VERSION_WITHOUT_PORTFOLIOS | VERSION_WITHOUT_MODES)
+}
 
 /// Tables of the current layout.
 ///
@@ -49,6 +66,7 @@ const SCHEMA: &str = "
         address TEXT NOT NULL,
         label TEXT NOT NULL,
         portfolio_id INTEGER NOT NULL DEFAULT 1,
+        mode TEXT NOT NULL DEFAULT 'synced',
         UNIQUE (chain, address)
     );
     CREATE TABLE settings (
@@ -84,6 +102,11 @@ const ADD_PORTFOLIOS: &str = "
         name TEXT NOT NULL UNIQUE COLLATE NOCASE
     );
     ALTER TABLE wallets ADD COLUMN portfolio_id INTEGER NOT NULL DEFAULT 1;";
+
+/// What turns a version 3 file into version 4: every existing wallet stays
+/// synced.
+const ADD_MODES: &str = "
+    ALTER TABLE wallets ADD COLUMN mode TEXT NOT NULL DEFAULT 'synced';";
 
 /// SQLite stores signed 64-bit integers. Heights never get near that limit,
 /// so saturating is only a formality.
@@ -147,15 +170,15 @@ fn check_readable(conn: &Connection) -> Result<()> {
     }
 }
 
-/// Where a copy of a version 2 file is kept before it is upgraded.
-fn upgrade_copy_path(path: &Path) -> PathBuf {
-    path.with_extension("db.v2-backup")
+/// Where a copy of a file of layout `version` is kept before it is upgraded.
+fn upgrade_copy_path(path: &Path, version: i64) -> PathBuf {
+    path.with_extension(format!("db.v{version}-backup"))
 }
 
 /// Copies the file next to itself before its layout is upgraded, so the
 /// upgrade can be undone by hand. An earlier copy is never overwritten.
-fn keep_copy_before_upgrade(path: &Path) -> Result<()> {
-    let copy = upgrade_copy_path(path);
+fn keep_copy_before_upgrade(path: &Path, version: i64) -> Result<()> {
+    let copy = upgrade_copy_path(path, version);
     if !copy.exists() {
         std::fs::copy(path, &copy)?;
         std::fs::set_permissions(&copy, std::fs::Permissions::from_mode(0o600))?;
@@ -174,6 +197,42 @@ fn table_exists(conn: &Connection, name: &str) -> Result<bool> {
     Ok(found.is_some())
 }
 
+/// Brings a file of layout `version` to the current one. All or nothing: a
+/// failure leaves the file as it was.
+fn upgrade(conn: &Connection, version: i64) -> Result<()> {
+    let tx = conn.unchecked_transaction()?;
+    if version == VERSION_WITHOUT_PORTFOLIOS {
+        tx.execute_batch(ADD_PORTFOLIOS)?;
+        tx.execute(
+            "INSERT INTO portfolios (name) VALUES (?1)",
+            params![DEFAULT_PORTFOLIO_NAME],
+        )?;
+    }
+    tx.execute_batch(ADD_MODES)?;
+    tx.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION};"))?;
+    tx.commit()?;
+    Ok(())
+}
+
+/// Where the transactions of a wallet come from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WalletMode {
+    /// Downloaded from the blockchain; the user cannot change them.
+    Synced,
+    /// Entered by the user.
+    Manual,
+}
+
+impl WalletMode {
+    fn from_key(key: &str) -> Option<Self> {
+        match key {
+            "synced" => Some(Self::Synced),
+            "manual" => Some(Self::Manual),
+            _ => None,
+        }
+    }
+}
+
 /// A wallet as stored: where it is and the user's label for it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WalletRecord {
@@ -183,6 +242,8 @@ pub struct WalletRecord {
     pub label: String,
     /// The [`PortfolioRecord::id`] of the portfolio the wallet is in.
     pub portfolio: i64,
+    /// Whether the transactions are downloaded or entered by the user.
+    pub mode: WalletMode,
 }
 
 /// A named group of wallets.
@@ -221,8 +282,8 @@ impl Database {
         set_pragma_text(&conn, "key", key)?;
         check_readable(&conn)?;
         let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-        if version == VERSION_WITHOUT_PORTFOLIOS {
-            keep_copy_before_upgrade(path)?;
+        if is_upgradable(version) {
+            keep_copy_before_upgrade(path, version)?;
         }
         let db = Self::init(conn)?;
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
@@ -320,16 +381,8 @@ impl Database {
             )?;
             tx.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION};"))?;
             tx.commit()?;
-        } else if version == VERSION_WITHOUT_PORTFOLIOS {
-            // All or nothing: a failure leaves the file as it was.
-            let tx = conn.unchecked_transaction()?;
-            tx.execute_batch(ADD_PORTFOLIOS)?;
-            tx.execute(
-                "INSERT INTO portfolios (name) VALUES (?1)",
-                params![DEFAULT_PORTFOLIO_NAME],
-            )?;
-            tx.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION};"))?;
-            tx.commit()?;
+        } else if is_upgradable(version) {
+            upgrade(&conn, version)?;
         } else {
             // Version 1 never set `user_version`, so it reads as 0 with tables.
             return Err(Error::OldFormat);
@@ -367,9 +420,9 @@ impl Database {
 
     /// All wallets in the order they were added.
     pub fn wallets(&self) -> Result<Vec<WalletRecord>> {
-        let mut stmt = self
-            .conn
-            .prepare("SELECT chain, address, label, portfolio_id FROM wallets ORDER BY position")?;
+        let mut stmt = self.conn.prepare(
+            "SELECT chain, address, label, portfolio_id, mode FROM wallets ORDER BY position",
+        )?;
         let rows = stmt
             .query_map([], |r| {
                 Ok((
@@ -377,17 +430,20 @@ impl Database {
                     r.get::<_, String>(1)?,
                     r.get::<_, String>(2)?,
                     r.get::<_, i64>(3)?,
+                    r.get::<_, String>(4)?,
                 ))
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
 
         rows.into_iter()
-            .map(|(key, address, label, portfolio)| {
+            .map(|(key, address, label, portfolio, mode)| {
                 let chain = Chain::from_key(&key).ok_or(Error::UnknownChain(key))?;
+                let mode = WalletMode::from_key(&mode).ok_or(Error::UnknownWalletMode(mode))?;
                 Ok(WalletRecord {
                     id: WalletId::new(chain, address),
                     label,
                     portfolio,
+                    mode,
                 })
             })
             .collect()
@@ -407,6 +463,108 @@ impl Database {
         self.conn.execute(
             "INSERT INTO wallets (chain, address, label, portfolio_id) VALUES (?1, ?2, ?3, ?4)",
             params![wallet.chain.key(), wallet.address, label, portfolio],
+        )?;
+        Ok(())
+    }
+
+    /// Adds a wallet whose transactions the user enters, in `portfolio`.
+    /// It has no address on the chain, so it gets a made-up one, which is
+    /// returned.
+    pub fn add_manual_wallet(&self, chain: Chain, label: &str, portfolio: i64) -> Result<WalletId> {
+        self.require_portfolio(portfolio)?;
+        let tx = self.conn.unchecked_transaction()?;
+        let next: i64 = tx.query_row(
+            "SELECT coalesce(max(position), 0) + 1 FROM wallets",
+            [],
+            |r| r.get(0),
+        )?;
+        let wallet = WalletId::new(chain, format!("{MANUAL_PREFIX}{next}"));
+        tx.execute(
+            "INSERT INTO wallets (chain, address, label, portfolio_id, mode)
+             VALUES (?1, ?2, ?3, ?4, 'manual')",
+            params![chain.key(), wallet.address, label, portfolio],
+        )?;
+        // Nothing to download, so its saved history is complete from the start.
+        tx.execute(
+            "INSERT INTO synced (chain, address) VALUES (?1, ?2)",
+            params![chain.key(), wallet.address],
+        )?;
+        tx.commit()?;
+        Ok(wallet)
+    }
+
+    /// Makes a synced wallet manual: it stops downloading and its saved
+    /// transactions become the user's to edit. There is no way back.
+    pub fn convert_to_manual(&self, wallet: &WalletId) -> Result<()> {
+        let tx = self.conn.unchecked_transaction()?;
+        let args = params![wallet.chain.key(), wallet.address];
+        tx.execute(
+            "UPDATE wallets SET mode = 'manual' WHERE chain = ?1 AND address = ?2",
+            args,
+        )?;
+        tx.execute(
+            "INSERT OR IGNORE INTO synced (chain, address) VALUES (?1, ?2)",
+            args,
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// How the transactions of `wallet` come about, or `None` if it is not
+    /// tracked.
+    pub fn wallet_mode(&self, wallet: &WalletId) -> Result<Option<WalletMode>> {
+        let mode: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT mode FROM wallets WHERE chain = ?1 AND address = ?2",
+                params![wallet.chain.key(), wallet.address],
+                |r| r.get(0),
+            )
+            .optional()?;
+        mode.map(|key| WalletMode::from_key(&key).ok_or(Error::UnknownWalletMode(key)))
+            .transpose()
+    }
+
+    fn require_manual(&self, wallet: &WalletId) -> Result<()> {
+        match self.wallet_mode(wallet)? {
+            Some(WalletMode::Manual) => Ok(()),
+            _ => Err(Error::NotManual),
+        }
+    }
+
+    /// Saves a transaction of a manual wallet, replacing the one with the same
+    /// id. Fails if the wallet is not manual.
+    pub fn put_manual_tx(&self, wallet: &WalletId, tx: &PricedTx) -> Result<()> {
+        self.require_manual(wallet)?;
+        self.insert_tx(&self.conn, wallet, tx)
+    }
+
+    /// Replaces the transaction `old_txid` of a manual wallet with `tx`, which
+    /// may have another id, all or nothing.
+    pub fn replace_manual_tx(
+        &self,
+        wallet: &WalletId,
+        old_txid: &str,
+        tx: &PricedTx,
+    ) -> Result<()> {
+        self.require_manual(wallet)?;
+        let guard = self.conn.unchecked_transaction()?;
+        guard.execute(
+            "DELETE FROM txs WHERE chain = ?1 AND address = ?2 AND txid = ?3",
+            params![wallet.chain.key(), wallet.address, old_txid],
+        )?;
+        self.insert_tx(&guard, wallet, tx)?;
+        guard.commit()?;
+        Ok(())
+    }
+
+    /// Removes a transaction of a manual wallet. An unknown id is not an
+    /// error.
+    pub fn delete_manual_tx(&self, wallet: &WalletId, txid: &str) -> Result<()> {
+        self.require_manual(wallet)?;
+        self.conn.execute(
+            "DELETE FROM txs WHERE chain = ?1 AND address = ?2 AND txid = ?3",
+            params![wallet.chain.key(), wallet.address, txid],
         )?;
         Ok(())
     }
@@ -610,25 +768,8 @@ impl Database {
             params![chain, wallet.address, to_sql_int(height)],
         )?;
         {
-            let mut insert = tx.prepare(
-                "INSERT OR REPLACE INTO txs
-                 (chain, address, txid, height, idx, time, amount, fee, parents, price_usd)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
-            )?;
             for t in fresh {
-                let a = &t.activity;
-                insert.execute(params![
-                    chain,
-                    wallet.address,
-                    a.txid,
-                    to_sql_int(a.height),
-                    a.index.map(i64::from),
-                    a.time,
-                    a.amount.to_string(),
-                    a.fee.to_string(),
-                    a.parents.join(","),
-                    t.price_usd,
-                ])?;
+                self.insert_tx(&tx, wallet, t)?;
             }
         }
         tx.execute(
@@ -636,6 +777,28 @@ impl Database {
             params![chain, wallet.address],
         )?;
         tx.commit()?;
+        Ok(())
+    }
+
+    fn insert_tx(&self, conn: &Connection, wallet: &WalletId, t: &PricedTx) -> Result<()> {
+        let a = &t.activity;
+        conn.prepare_cached(
+            "INSERT OR REPLACE INTO txs
+             (chain, address, txid, height, idx, time, amount, fee, parents, price_usd)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+        )?
+        .execute(params![
+            wallet.chain.key(),
+            wallet.address,
+            a.txid,
+            to_sql_int(a.height),
+            a.index.map(i64::from),
+            a.time,
+            a.amount.to_string(),
+            a.fee.to_string(),
+            a.parents.join(","),
+            t.price_usd,
+        ])?;
         Ok(())
     }
 
@@ -1222,7 +1385,7 @@ mod tests {
         write_v2_file(&path, "key");
         let before = std::fs::read(&path).expect("read");
         let copy = dir.path().join("morlaco.db.v2-backup");
-        assert_eq!(copy, upgrade_copy_path(&path));
+        assert_eq!(copy, upgrade_copy_path(&path, VERSION_WITHOUT_PORTFOLIOS));
 
         drop(Database::open(&path, "key").expect("upgrades"));
         assert_eq!(std::fs::read(&copy).expect("copy exists"), before);
@@ -1251,6 +1414,149 @@ mod tests {
             Err(Error::WrongKey)
         ));
         assert!(!dir.path().join("morlaco.db.v2-backup").exists());
+    }
+
+    /// The layout version 3 used: portfolios, but no wallet modes.
+    const V3_SCHEMA: &str = "
+        CREATE TABLE prices (chain TEXT NOT NULL, day INTEGER NOT NULL, usd REAL NOT NULL,
+            PRIMARY KEY (chain, day));
+        CREATE TABLE portfolios (id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL UNIQUE COLLATE NOCASE);
+        CREATE TABLE wallets (position INTEGER PRIMARY KEY AUTOINCREMENT, chain TEXT NOT NULL,
+            address TEXT NOT NULL, label TEXT NOT NULL, portfolio_id INTEGER NOT NULL DEFAULT 1,
+            UNIQUE (chain, address));
+        CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+        CREATE TABLE txs (chain TEXT NOT NULL, address TEXT NOT NULL, txid TEXT NOT NULL,
+            height INTEGER NOT NULL, idx INTEGER, time INTEGER NOT NULL, amount TEXT NOT NULL,
+            fee TEXT NOT NULL, parents TEXT NOT NULL, price_usd REAL NOT NULL,
+            PRIMARY KEY (chain, address, txid));
+        CREATE TABLE synced (chain TEXT NOT NULL, address TEXT NOT NULL,
+            PRIMARY KEY (chain, address));
+        INSERT INTO portfolios (name) VALUES ('Main');
+        INSERT INTO wallets (chain, address, label) VALUES ('bitcoin', 'bc1qa', 'First');
+        INSERT INTO txs VALUES ('bitcoin', 'bc1qa', 'tx1', 10, NULL, 1700000000, '1000', '0', '', 30000.0);
+        INSERT INTO synced VALUES ('bitcoin', 'bc1qa');
+        PRAGMA user_version = 3;";
+
+    #[test]
+    fn a_version_3_file_gets_synced_wallets_and_keeps_a_copy() {
+        let dir = TempDir::new("v3");
+        let path = dir.path().join("morlaco.db");
+        {
+            let conn = Connection::open(&path).expect("create");
+            set_pragma_text(&conn, "key", "key").expect("key");
+            conn.execute_batch(V3_SCHEMA).expect("v3 schema");
+        }
+
+        let db = Database::open(&path, "key").expect("upgrades");
+        let wallets = db.wallets().expect("list");
+        assert_eq!(wallets.len(), 1);
+        assert_eq!(wallets[0].mode, WalletMode::Synced);
+        assert_eq!(db.history(&btc("bc1qa")).expect("history").len(), 1);
+        assert!(dir.path().join("morlaco.db.v3-backup").exists());
+    }
+
+    fn manual_tx(txid: &str, time: i64, amount: i128) -> PricedTx {
+        PricedTx {
+            activity: Activity {
+                txid: txid.to_owned(),
+                height: 0,
+                index: None,
+                time,
+                amount,
+                fee: 0,
+                parents: Vec::new(),
+            },
+            price_usd: 20_000.0,
+        }
+    }
+
+    #[test]
+    fn a_manual_wallet_gets_its_own_address_and_counts_as_synced() {
+        let db = db();
+        let portfolio = db.portfolios().expect("list")[0].id;
+        let a = db
+            .add_manual_wallet(Chain::Bitcoin, "Coinbase", portfolio)
+            .expect("add");
+        let b = db
+            .add_manual_wallet(Chain::Bitcoin, "Kraken", portfolio)
+            .expect("add");
+        assert_ne!(a, b);
+        assert!(a.address.starts_with(MANUAL_PREFIX));
+        assert!(db.is_synced(&a).expect("synced"));
+
+        let wallets = db.wallets().expect("list");
+        assert!(wallets.iter().all(|w| w.mode == WalletMode::Manual));
+    }
+
+    #[test]
+    fn manual_transactions_can_be_added_edited_and_removed() {
+        let db = db();
+        let portfolio = db.portfolios().expect("list")[0].id;
+        let w = db
+            .add_manual_wallet(Chain::Bitcoin, "Coinbase", portfolio)
+            .expect("add");
+
+        db.put_manual_tx(&w, &manual_tx("a", 100, 5)).expect("put");
+        db.put_manual_tx(&w, &manual_tx("b", 200, 6)).expect("put");
+        db.replace_manual_tx(&w, "a", &manual_tx("c", 150, 7))
+            .expect("replace");
+        db.delete_manual_tx(&w, "b").expect("delete");
+        db.delete_manual_tx(&w, "missing").expect("unknown is fine");
+
+        let ids: Vec<String> = db
+            .history(&w)
+            .expect("history")
+            .into_iter()
+            .map(|t| t.activity.txid)
+            .collect();
+        assert_eq!(ids, ["c"]);
+    }
+
+    #[test]
+    fn a_synced_wallet_rejects_manual_edits() {
+        let db = db();
+        db.add_wallet(&btc("bc1qa"), "").expect("add");
+        let tx = manual_tx("a", 100, 5);
+        assert!(matches!(
+            db.put_manual_tx(&btc("bc1qa"), &tx),
+            Err(Error::NotManual)
+        ));
+        assert!(matches!(
+            db.replace_manual_tx(&btc("bc1qa"), "a", &tx),
+            Err(Error::NotManual)
+        ));
+        assert!(matches!(
+            db.delete_manual_tx(&btc("bc1qa"), "a"),
+            Err(Error::NotManual)
+        ));
+    }
+
+    #[test]
+    fn converting_keeps_the_transactions_and_unlocks_editing() {
+        let db = db();
+        let w = btc("bc1qa");
+        db.add_wallet(&w, "Own").expect("add");
+        db.replace_history_above(&w, 0, &[manual_tx("chain-tx", 100, 5)])
+            .expect("save");
+
+        db.convert_to_manual(&w).expect("convert");
+        assert_eq!(db.wallets().expect("list")[0].mode, WalletMode::Manual);
+        assert_eq!(db.history(&w).expect("history").len(), 1);
+
+        db.replace_manual_tx(&w, "chain-tx", &manual_tx("chain-tx", 100, 9))
+            .expect("edit");
+        assert_eq!(db.history(&w).expect("history")[0].activity.amount, 9);
+    }
+
+    #[test]
+    fn converting_a_wallet_that_never_synced_still_shows_its_history() {
+        let db = db();
+        let w = btc("bc1qa");
+        db.add_wallet(&w, "").expect("add");
+        assert!(!db.is_synced(&w).expect("synced"));
+        db.convert_to_manual(&w).expect("convert");
+        assert!(db.is_synced(&w).expect("synced"));
     }
 
     /// A directory under the system temp dir that is removed on drop.

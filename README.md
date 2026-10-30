@@ -26,6 +26,14 @@ your coins arrived, and shows your estimated gain or loss.
   shoulder.
 - Moves between your own wallets aren't treated as selling, so they don't mess
   up your numbers, even when the wallets are in different portfolios.
+- Two kinds of wallet. A synced wallet downloads its transactions from an
+  address. A manual wallet is one where you enter the purchases, sales and
+  transfers yourself, for example an exchange account. Bought coins on an
+  exchange and withdrew them to your own wallet? Record the withdrawal in the
+  manual wallet with the blockchain transaction ID and the synced wallet keeps
+  the price you paid instead of the price on the day the coins arrived. A synced
+  wallet can be switched to manual with "Edit Manually…" on its Transactions
+  tab; this keeps its transactions and can't be undone.
 - Your saved data is encrypted on your computer.
 
 ## Install
