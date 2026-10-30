@@ -104,15 +104,31 @@ pub fn fetch(
         });
     }
     let since = refetch_above(&saved);
+    let fresh = download(wallet, since, prices, db, &mut on_progress)?;
+    db.replace_history_above(wallet, since, &fresh)?;
+    Ok(History {
+        wallet: wallet.clone(),
+        txs: merge(saved, since, fresh),
+    })
+}
 
+/// Downloads the transactions of `wallet` above block `since` and prices
+/// them.
+fn download(
+    wallet: &WalletId,
+    since: u64,
+    prices: &impl PriceSource,
+    db: &Database,
+    on_progress: &mut impl FnMut(usize),
+) -> Result<Vec<PricedTx>> {
     let options = FetchOptions {
         etherscan_key: key_setting(db, SETTING_ETHERSCAN_KEY)?,
         nodereal_key: key_setting(db, SETTING_NODEREAL_KEY)?,
     };
-    let fresh = wallet
+    wallet
         .chain
         .backend()
-        .fetch(&wallet.address, since, &options, &mut on_progress)?
+        .fetch(&wallet.address, since, &options, on_progress)?
         .into_iter()
         .map(|activity| {
             prices
@@ -122,13 +138,7 @@ pub fn fetch(
                     price_usd,
                 })
         })
-        .collect::<Result<Vec<_>>>()?;
-
-    db.replace_history_above(wallet, since, &fresh)?;
-    Ok(History {
-        wallet: wallet.clone(),
-        txs: merge(saved, since, fresh),
-    })
+        .collect()
 }
 
 /// Height above which saved transactions must be fetched again. 0 when
@@ -163,6 +173,22 @@ struct Group<'a> {
     touches: Vec<(usize, &'a Activity)>,
 }
 
+impl<'a> Group<'a> {
+    /// A group placed and priced as `tx`, touching no wallet yet.
+    fn new(tx: &'a PricedTx) -> Self {
+        let a = &tx.activity;
+        Self {
+            txid: a.txid.as_str(),
+            height: a.height,
+            index: a.index.unwrap_or(0),
+            time: a.time,
+            price_usd: tx.price_usd,
+            parents: &a.parents,
+            touches: Vec::new(),
+        }
+    }
+}
+
 /// Merges the histories of one chain into transactions, oldest first.
 ///
 /// Transactions are ordered by block height, then by position in the block
@@ -173,31 +199,7 @@ struct Group<'a> {
 /// placed by its time among the others. When it is also seen by a synced
 /// wallet, the synced wallet's block, time and price win.
 fn ordered_groups<'a>(histories: &[&'a History]) -> Vec<Group<'a>> {
-    let mut by_txid: HashMap<&str, Group> = HashMap::new();
-    for (wallet, history) in histories.iter().enumerate() {
-        for tx in &history.txs {
-            let a = &tx.activity;
-            let group = by_txid.entry(a.txid.as_str()).or_insert_with(|| Group {
-                txid: a.txid.as_str(),
-                height: a.height,
-                index: a.index.unwrap_or(0),
-                time: a.time,
-                price_usd: tx.price_usd,
-                parents: &a.parents,
-                touches: Vec::new(),
-            });
-            if group.height == 0 && a.height > 0 {
-                group.height = a.height;
-                group.index = a.index.unwrap_or(0);
-                group.time = a.time;
-                group.price_usd = tx.price_usd;
-                group.parents = &a.parents;
-            }
-            group.touches.push((wallet, a));
-        }
-    }
-
-    let mut groups: Vec<Group> = by_txid.into_values().collect();
+    let mut groups = group_by_txid(histories);
     groups.sort_by_key(|g| (g.height, g.index, g.txid));
     let groups = by_time(groups);
 
@@ -212,6 +214,29 @@ fn ordered_groups<'a>(histories: &[&'a History]) -> Vec<Group<'a>> {
         ordered.extend(spending_order(block));
     }
     ordered
+}
+
+/// One group per transaction id, with what it did to each wallet, in no
+/// particular order.
+fn group_by_txid<'a>(histories: &[&'a History]) -> Vec<Group<'a>> {
+    let mut by_txid: HashMap<&str, Group> = HashMap::new();
+    for (wallet, history) in histories.iter().enumerate() {
+        for tx in &history.txs {
+            let a = &tx.activity;
+            let group = by_txid
+                .entry(a.txid.as_str())
+                .or_insert_with(|| Group::new(tx));
+            if group.height == 0 && a.height > 0 {
+                // Seen by a synced wallet: its block wins over a typed entry.
+                *group = Group {
+                    touches: std::mem::take(&mut group.touches),
+                    ..Group::new(tx)
+                };
+            }
+            group.touches.push((wallet, a));
+        }
+    }
+    by_txid.into_values().collect()
 }
 
 /// Interleaves transactions without a block (height 0) with those in blocks,

@@ -40,6 +40,11 @@ const VERSION_WITHOUT_PORTFOLIOS: i64 = 2;
 /// Layout version 3 had no wallet modes. Opening such a file adds them.
 const VERSION_WITHOUT_MODES: i64 = 3;
 
+/// Whether a file of layout `version` is upgraded in place when opened.
+fn is_upgradable(version: i64) -> bool {
+    matches!(version, VERSION_WITHOUT_PORTFOLIOS | VERSION_WITHOUT_MODES)
+}
+
 /// Tables of the current layout.
 ///
 /// Amounts are stored as text because SQLite integers are 64-bit, which is
@@ -192,6 +197,23 @@ fn table_exists(conn: &Connection, name: &str) -> Result<bool> {
     Ok(found.is_some())
 }
 
+/// Brings a file of layout `version` to the current one. All or nothing: a
+/// failure leaves the file as it was.
+fn upgrade(conn: &Connection, version: i64) -> Result<()> {
+    let tx = conn.unchecked_transaction()?;
+    if version == VERSION_WITHOUT_PORTFOLIOS {
+        tx.execute_batch(ADD_PORTFOLIOS)?;
+        tx.execute(
+            "INSERT INTO portfolios (name) VALUES (?1)",
+            params![DEFAULT_PORTFOLIO_NAME],
+        )?;
+    }
+    tx.execute_batch(ADD_MODES)?;
+    tx.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION};"))?;
+    tx.commit()?;
+    Ok(())
+}
+
 /// Where the transactions of a wallet come from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WalletMode {
@@ -260,7 +282,7 @@ impl Database {
         set_pragma_text(&conn, "key", key)?;
         check_readable(&conn)?;
         let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-        if version == VERSION_WITHOUT_PORTFOLIOS || version == VERSION_WITHOUT_MODES {
+        if is_upgradable(version) {
             keep_copy_before_upgrade(path, version)?;
         }
         let db = Self::init(conn)?;
@@ -359,19 +381,8 @@ impl Database {
             )?;
             tx.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION};"))?;
             tx.commit()?;
-        } else if version == VERSION_WITHOUT_PORTFOLIOS || version == VERSION_WITHOUT_MODES {
-            // All or nothing: a failure leaves the file as it was.
-            let tx = conn.unchecked_transaction()?;
-            if version == VERSION_WITHOUT_PORTFOLIOS {
-                tx.execute_batch(ADD_PORTFOLIOS)?;
-                tx.execute(
-                    "INSERT INTO portfolios (name) VALUES (?1)",
-                    params![DEFAULT_PORTFOLIO_NAME],
-                )?;
-            }
-            tx.execute_batch(ADD_MODES)?;
-            tx.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION};"))?;
-            tx.commit()?;
+        } else if is_upgradable(version) {
+            upgrade(&conn, version)?;
         } else {
             // Version 1 never set `user_version`, so it reads as 0 with tables.
             return Err(Error::OldFormat);

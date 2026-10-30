@@ -50,12 +50,19 @@ impl Wallet {
     /// The label if there is one, otherwise a shortened address. A manual
     /// wallet has no real address to show, so it falls back to the network.
     pub fn display_name(&self) -> String {
-        if !self.label.is_empty() {
-            self.label.clone()
-        } else if !self.has_address() {
-            format!("Manual {}", self.id.chain.name())
+        if self.label.is_empty() {
+            self.unlabeled_name()
         } else {
+            self.label.clone()
+        }
+    }
+
+    /// The name of a wallet without a label.
+    fn unlabeled_name(&self) -> String {
+        if self.has_address() {
             crate::format::short_address(&self.id.address)
+        } else {
+            format!("Manual {}", self.id.chain.name())
         }
     }
 }
@@ -398,6 +405,24 @@ mod tests {
             store.database().setting("hidden").expect("read"),
             Some("1".into())
         );
+    }
+
+    #[test]
+    fn a_wallet_is_named_by_its_label_address_or_network() {
+        let mut store = store();
+        let address = "bc1qaaaaaaaaaaaaaaaaaaaa";
+        store.add(&btc(address), "").expect("add");
+        store
+            .add(&btc("bc1qbbbbbbbbbbbbbbbb"), "Cold")
+            .expect("add");
+        let typed = store.add_manual(Chain::Bitcoin, "").expect("add");
+
+        assert_eq!(
+            store.wallets[0].display_name(),
+            crate::format::short_address(address)
+        );
+        assert_eq!(store.wallets[1].display_name(), "Cold");
+        assert_eq!(store.wallets[typed].display_name(), "Manual Bitcoin");
     }
 
     #[test]

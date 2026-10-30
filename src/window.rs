@@ -828,18 +828,9 @@ impl Ui {
                 .use_markup(false)
                 .activatable(true)
                 .build();
-            let mut subtitle = Vec::new();
-            if show_network {
-                subtitle.push(wallet.id.chain.name().to_owned());
-            }
-            if wallet.is_manual() {
-                subtitle.push("Manual".to_owned());
-            }
-            if !wallet.label.is_empty() && wallet.has_address() {
-                subtitle.push(format::short_address(&wallet.id.address));
-            }
+            let subtitle = sidebar_subtitle(wallet, show_network);
             if !subtitle.is_empty() {
-                row.set_subtitle(&subtitle.join(" · "));
+                row.set_subtitle(&subtitle);
             }
 
             let rename = gtk::Button::builder()
@@ -2568,23 +2559,9 @@ fn lot_row(lot: &Lot, price_now_usd: f64, chain: Chain, hidden: bool) -> adw::Ac
 /// on a manual one it opens the editor and has a button to delete it.
 fn history_row(entry: &Entry, chain: Chain, hidden: bool, manual: bool) -> adw::ActionRow {
     let activity = &entry.activity;
-    let kind = if entry.internal_units > 0 {
-        "Transfer between your wallets · "
-    } else {
-        ""
-    };
-    let id = if morlaco::db::is_made_up(&activity.txid) {
-        "Entered by you".to_owned()
-    } else {
-        format::short_address(&activity.txid)
-    };
     let row = adw::ActionRow::builder()
         .title(date_string(activity.time))
-        .subtitle(format!(
-            "{kind}{id} · {} at {}",
-            chain.symbol(),
-            format::usd(entry.price_usd, false)
-        ))
+        .subtitle(history_subtitle(entry, chain))
         .use_markup(false)
         .activatable(true)
         .build();
@@ -2616,6 +2593,43 @@ fn history_row(entry: &Entry, chain: Chain, hidden: bool, manual: bool) -> adw::
         let _ = gio::AppInfo::launch_default_for_uri(&uri, None::<&gio::AppLaunchContext>);
     });
     row
+}
+
+/// What goes under a transaction's date: whether it moved between the
+/// user's wallets, where it came from and the price it was valued at.
+fn history_subtitle(entry: &Entry, chain: Chain) -> String {
+    let kind = if entry.internal_units > 0 {
+        "Transfer between your wallets · "
+    } else {
+        ""
+    };
+    let id = if morlaco::db::is_made_up(&entry.activity.txid) {
+        "Entered by you".to_owned()
+    } else {
+        format::short_address(&entry.activity.txid)
+    };
+    format!(
+        "{kind}{id} · {} at {}",
+        chain.symbol(),
+        format::usd(entry.price_usd, false)
+    )
+}
+
+/// What goes under a wallet's name in the sidebar, empty when nothing does.
+/// The network is named only when `show_network`.
+fn sidebar_subtitle(wallet: &Wallet, show_network: bool) -> String {
+    let mut parts = Vec::new();
+    if show_network {
+        parts.push(wallet.id.chain.name().to_owned());
+    }
+    if wallet.is_manual() {
+        parts.push("Manual".to_owned());
+    }
+    // Without a label the address is already the title.
+    if !wallet.label.is_empty() && wallet.has_address() {
+        parts.push(format::short_address(&wallet.id.address));
+    }
+    parts.join(" · ")
 }
 
 /// What goes under a wallet's name on its page.
@@ -2961,6 +2975,22 @@ fn overview_row(state: &State, wallet: &Wallet, hidden: bool) -> adw::ActionRow 
         .use_markup(false)
         .activatable(true)
         .build();
+    show_overview_figures(&row, state, wallet, hidden);
+    if wallet.is_manual() {
+        row.add_suffix(
+            &gtk::Label::builder()
+                .label("Manual")
+                .css_classes(["dim-label", "caption"])
+                .build(),
+        );
+    }
+    row.add_suffix(&gtk::Image::from_icon_name("go-next-symbolic"));
+    row
+}
+
+/// Shows the balance and gain of a wallet on its overview row, or why they
+/// are missing.
+fn show_overview_figures(row: &adw::ActionRow, state: &State, wallet: &Wallet, hidden: bool) {
     match state.portfolios.get(&wallet.id) {
         Some(p) => {
             row.set_subtitle(&format::amount(p.balance_units, wallet.id.chain, hidden));
@@ -2979,16 +3009,6 @@ fn overview_row(state: &State, wallet: &Wallet, hidden: bool) -> adw::ActionRow 
             row.add_css_class("error");
         }
     }
-    if wallet.is_manual() {
-        row.add_suffix(
-            &gtk::Label::builder()
-                .label("Manual")
-                .css_classes(["dim-label", "caption"])
-                .build(),
-        );
-    }
-    row.add_suffix(&gtk::Image::from_icon_name("go-next-symbolic"));
-    row
 }
 
 /// The selection once the wallet at `removed` is gone.
@@ -3292,6 +3312,7 @@ fn show_about(parent: &adw::ApplicationWindow) {
 mod tests {
     use super::*;
     use morlaco::chain::Activity;
+    use morlaco::db::WalletMode;
     use morlaco::portfolio::PricedTx;
 
     fn state() -> State {
@@ -3447,6 +3468,21 @@ mod tests {
 
         state.delete_manual_tx(&id, "buy").expect("delete");
         assert_eq!(state.portfolios[&id].balance_units, 0);
+    }
+
+    #[test]
+    fn only_transactions_of_the_open_manual_wallet_can_be_edited() {
+        let (mut state, id) = manual_state();
+        state
+            .save_manual_tx(&id, None, &typed_tx("buy", 1_000, 100_000_000))
+            .expect("save");
+
+        let found = state.open_tx("buy").map(|t| t.activity.txid);
+        assert_eq!(found.as_deref(), Some("buy"));
+        assert!(state.open_tx("other").is_none());
+
+        state.selection = Selection::Overview;
+        assert!(state.open_tx("buy").is_none());
     }
 
     #[test]
@@ -3744,5 +3780,83 @@ mod tests {
     fn the_set_aside_message_names_the_file() {
         let message = set_aside_message(Path::new("/data/morlaco.db.old"));
         assert!(message.contains("morlaco.db.old"));
+    }
+
+    fn tracked(address: &str, label: &str, mode: WalletMode) -> Wallet {
+        Wallet {
+            id: WalletId::new(Chain::Bitcoin, address),
+            label: label.to_owned(),
+            portfolio: 1,
+            mode,
+        }
+    }
+
+    fn made_up() -> String {
+        format!("{}1", morlaco::db::MANUAL_PREFIX)
+    }
+
+    #[test]
+    fn the_sidebar_names_what_the_title_does_not() {
+        let address = "bc1qaaaaaaaaaaaaaaaaaaaa";
+        let unlabeled = tracked(address, "", WalletMode::Synced);
+        assert_eq!(sidebar_subtitle(&unlabeled, false), "");
+        assert_eq!(sidebar_subtitle(&unlabeled, true), "Bitcoin");
+
+        let labeled = tracked(address, "Cold", WalletMode::Synced);
+        assert_eq!(
+            sidebar_subtitle(&labeled, true),
+            format!("Bitcoin · {}", format::short_address(address))
+        );
+
+        let converted = tracked(address, "Cold", WalletMode::Manual);
+        assert_eq!(
+            sidebar_subtitle(&converted, false),
+            format!("Manual · {}", format::short_address(address))
+        );
+
+        let typed = tracked(&made_up(), "Exchange", WalletMode::Manual);
+        assert_eq!(sidebar_subtitle(&typed, true), "Bitcoin · Manual");
+    }
+
+    #[test]
+    fn a_wallet_page_shows_the_address_or_the_network() {
+        let address = "bc1qaaaaaaaaaaaaaaaaaaaa";
+        let synced = tracked(address, "", WalletMode::Synced);
+        assert_eq!(wallet_subtitle(&synced), format::short_address(address));
+
+        let converted = tracked(address, "", WalletMode::Manual);
+        assert_eq!(
+            wallet_subtitle(&converted),
+            format!("Manual · {}", format::short_address(address))
+        );
+
+        let typed = tracked(&made_up(), "", WalletMode::Manual);
+        assert_eq!(wallet_subtitle(&typed), "Manual · Bitcoin");
+    }
+
+    fn entry(txid: &str, internal_units: u128) -> Entry {
+        Entry {
+            activity: typed_tx(txid, 1_000, 5).activity,
+            price_usd: 20.0,
+            internal_units,
+        }
+    }
+
+    #[test]
+    fn a_history_row_says_where_the_transaction_came_from() {
+        let txid = "f00dbabef00dbabef00dbabef00dbabe";
+        let price = format::usd(20.0, false);
+        assert_eq!(
+            history_subtitle(&entry(txid, 0), Chain::Bitcoin),
+            format!("{} · BTC at {price}", format::short_address(txid))
+        );
+        assert_eq!(
+            history_subtitle(&entry(&made_up(), 0), Chain::Bitcoin),
+            format!("Entered by you · BTC at {price}")
+        );
+        assert!(
+            history_subtitle(&entry(txid, 5), Chain::Bitcoin)
+                .starts_with("Transfer between your wallets · ")
+        );
     }
 }
